@@ -15,3 +15,6 @@ config.json
 xiaoke.exe
 xiaoke
 *.tmp
+
+# 编辑器/构建备份
+*~
