@@ -108,6 +108,8 @@ type chatRequest struct {
 	AgentID   string `json:"agentId"` // 选用的智能体（空 = 默认小柯）
 	// Reasoning 请求级思考程度：minimal/low/medium/high/none（前端右下角选择）
 	Reasoning string `json:"reasoning"`
+	// Mode 工作模式：plan（只读调研+出计划）| build（开发，默认）
+	Mode string `json:"mode"`
 }
 
 // chat 处理一次问答（含工具调用循环）。
@@ -200,6 +202,19 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	defs := tools.Defs(tools.Builtin())
 	defs = append(defs, h.mcp.Tools()...)
 
+	// 计划模式：只保留只读工具（list/read/search + MCP），禁写文件、禁执行命令
+	planMode := strings.EqualFold(req.Mode, "plan")
+	if planMode {
+		readOnly := make([]tools.ToolDef, 0, len(defs))
+		for _, d := range defs {
+			if isPlanModeBlocked(d.Function.Name) {
+				continue
+			}
+			readOnly = append(readOnly, d)
+		}
+		defs = readOnly
+	}
+
 	agentName, agentBase, agentTools := persona.Name, "", false
 	if agent != nil {
 		agentName, agentBase, agentTools = agent.Name, agent.SystemPrompt, agent.Tools
@@ -213,6 +228,7 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		ReadDirs:       sset.ReadDirs,
 		ToolsAvailable: len(defs) > 0,
 		SkillsAssembly: h.skills.Assembly(),
+		Instructions:   prompt.PlanGuideFor(planMode),
 	})
 	convo := []ChatMessage{{Role: "system", Content: sysPrompt}}
 	history := full.Messages
@@ -382,6 +398,22 @@ func toWire(msgs []store.Message) []ChatMessage {
 		out = append(out, cm)
 	}
 	return out
+}
+
+// isPlanModeBlocked 判断工具在计划模式下是否禁用：
+// 内置写/执行工具按精确名，MCP 工具按名字模式（write/edit/create/move/delete/write_text…）。
+func isPlanModeBlocked(name string) bool {
+	switch name {
+	case "write_file", "run_command":
+		return true
+	}
+	lower := strings.ToLower(name)
+	for _, kw := range []string{"write", "edit", "create_dir", "createdir", "move", "delete", "remove", "rename", "apply_patch", "exec", "run_"} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 func effAsConfig(e settings.LLMSettings) config.LLMConfig {

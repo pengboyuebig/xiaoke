@@ -44,6 +44,19 @@ const projectModalOpen = ref(false)
 // 思考程度（右下角选择，浏览器本地记住，下一条消息生效）
 const REASONING_KEY = 'xiaoke.reasoning'
 const reasoning = ref(localStorage.getItem(REASONING_KEY) || 'none')
+
+// 工作模式：plan（先调研出计划，只读）⇄ build（开发，完整能力）
+const MODE_KEY = 'xiaoke.mode'
+type WorkMode = 'plan' | 'build'
+const workMode = ref<WorkMode>((localStorage.getItem(MODE_KEY) as WorkMode) || 'build')
+function setWorkMode(m: WorkMode) {
+  workMode.value = m
+  try {
+    localStorage.setItem(MODE_KEY, m)
+  } catch {
+    /* 隐私模式忽略 */
+  }
+}
 // 当前会话 ID（刷新后恢复到上次的会话）
 const CURRENT_SESSION_KEY = 'xiaoke.currentSession'
 function rememberSession(id: string) {
@@ -280,6 +293,7 @@ async function handleSend(content: string) {
       projectId: currentProjectId.value,
       agentId: currentAgent.value?.id || '',
       reasoning: reasoning.value,
+      mode: workMode.value,
       signal: controller.signal,
       onDelta: (t) => {
         streamingText.value += t
@@ -441,6 +455,7 @@ function onSettingsClosed() {
       :current-agent-id="currentAgentId"
       :mode="mode"
       :model="model"
+      :work-mode="workMode"
       @select="handleSelect"
       @new-chat="handleNewChat"
       @remove="handleRemove"
@@ -448,6 +463,7 @@ function onSettingsClosed() {
       @new-project="projectModalOpen = true"
       @remove-project="handleDeleteProject"
       @select-agent="handleSelectAgent"
+      @set-work-mode="setWorkMode"
       @open-settings="settingsOpen = true"
     />
     <main class="main">
@@ -471,6 +487,7 @@ function onSettingsClosed() {
       <Composer
         :busy="streaming"
         :reasoning="reasoning"
+        :mode="workMode"
         @send="handleSend"
         @stop="handleStop"
         @update:reasoning="setReasoning"

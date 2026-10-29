@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 
-const props = defineProps<{ busy: boolean; reasoning: string }>()
+const props = defineProps<{ busy: boolean; reasoning: string; mode?: string }>()
 const emit = defineEmits<{ send: [content: string]; stop: []; 'update:reasoning': [v: string] }>()
 
 const text = ref('')
@@ -51,7 +51,9 @@ function onLevelChange(e: Event) {
         ref="ta"
         v-model="text"
         rows="1"
-        placeholder="问问小柯…（Enter 发送，Shift+Enter 换行）"
+        :placeholder="props.mode === 'plan'
+          ? '计划模式：告诉小柯要调研什么，先出计划再开发…（Enter 发送）'
+          : '问问小柯…（Enter 发送，Shift+Enter 换行）'"
         @keydown="onKeydown"
       ></textarea>
       <button v-if="props.busy" class="btn stop" title="停止生成" @click="emit('stop')">

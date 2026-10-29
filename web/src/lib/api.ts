@@ -37,6 +37,8 @@ export interface ChatOptions {
   agentId?: string
   /** 思考程度：none/minimal/low/medium/high（空=none，不注入请求体） */
   reasoning?: string
+  /** 工作模式：plan（只读调研+计划）| build（开发） */
+  mode?: string
   signal?: AbortSignal
   onDelta: (text: string) => void
   onToolStart?: (name: string, args: string) => void
@@ -154,6 +156,7 @@ export const api = {
           projectId: opts.projectId || '',
           agentId: opts.agentId || '',
           reasoning: opts.reasoning || '',
+          mode: opts.mode || 'build',
         }),
         signal: opts.signal,
       })

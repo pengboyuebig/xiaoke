@@ -22,6 +22,42 @@ const pinned = ref(true)
 // 头像由 Go 后端的 /assets 提供，动态绑定避免 Vite 构建期解析
 const AVATAR = '/assets/avatar.png'
 
+// ---- 跳转到「我」最近一条消息 ----
+const questionEls = ref<HTMLElement[]>([])
+function setQuestionRef(el: unknown, i: number) {
+  if (el instanceof HTMLElement) questionEls.value[i] = el
+}
+// 最后一条「我的问题」是否已滚出视口（在下方或上方都算）
+const lastQuestionHidden = ref(false)
+
+function checkLastQuestion() {
+  const el = scroller.value
+  const list = questionEls.value.filter(Boolean)
+  const last = list[list.length - 1]
+  if (!el || !last) {
+    lastQuestionHidden.value = false
+    return
+  }
+  const r = last.getBoundingClientRect()
+  const c = el.getBoundingClientRect()
+  lastQuestionHidden.value = r.top > c.bottom - 20 || r.bottom < c.top + 20
+}
+
+async function jumpToMyLast() {
+  const list = questionEls.value.filter(Boolean)
+  const last = list[list.length - 1]
+  const el = scroller.value
+  if (!last || !el) return
+  // behavior:'instant' 显式瞬时——'auto' 会被 CSS scroll-behavior:smooth 覆盖成动画
+  last.scrollIntoView({ block: 'center', behavior: 'instant' })
+  // 到位后短暂高亮，方便定位
+  last.classList.add('jump-flash')
+  setTimeout(() => last.classList.remove('jump-flash'), 1400)
+  // 滚动后重算按钮可见性（scroll 事件可能未触发）
+  await nextTick()
+  checkLastQuestion()
+}
+
 const agentName = () => props.agent?.name || '小柯'
 const agentAvatar = () => props.agent?.avatar || AVATAR
 const isImg = (v?: string) => !!v && (v.startsWith('/assets/') || v.startsWith('http'))
@@ -36,6 +72,7 @@ function onScroll() {
   const el = scroller.value
   if (!el) return
   pinned.value = el.scrollHeight - el.scrollTop - el.clientHeight < 90
+  checkLastQuestion()
 }
 
 async function stick() {
@@ -61,11 +98,22 @@ watch(
   { flush: 'post' },
 )
 
+// 消息变化后重算「我的消息」是否在视口内（含 DOM 更新后）
+watch(
+  () => props.turns.length,
+  async () => {
+    await nextTick()
+    checkLastQuestion()
+  },
+  { flush: 'post' },
+)
+
 const isEmpty = computed(() => !props.turns.length && !props.streaming)
 </script>
 
 <template>
-  <div ref="scroller" class="chat-view" @scroll="onScroll">
+  <div class="chat-shell">
+    <div ref="scroller" class="chat-view" @scroll="onScroll">
     <!-- 空状态欢迎页 -->
     <div v-if="isEmpty" class="hero">
       <img v-if="isImg(agentAvatar())" class="hero-avatar" :src="agentAvatar()" :alt="agentName()" />
@@ -83,7 +131,7 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
     <div v-else class="thread">
       <div v-for="(t, i) in props.turns" :key="i" class="turn-item">
         <!-- 我的问题 -->
-        <div v-if="t.question" class="msg user">
+        <div v-if="t.question" :ref="(el) => setQuestionRef(el, i)" class="msg user">
           <div class="body">
             <div class="meta"><span class="name">我</span></div>
             <div class="content user-bubble">{{ t.question }}</div>
@@ -102,14 +150,76 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
       </div>
       <div class="thread-end"></div>
     </div>
+    </div>
+
+    <!-- 快速跳转：回到「我」最近一条消息 -->
+    <button
+      v-if="!isEmpty && lastQuestionHidden"
+      class="jump-my"
+      title="跳到我最近说的消息"
+      @click="jumpToMyLast"
+    >
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 5v14M5 12l7-7 7 7" />
+      </svg>
+      我的消息
+    </button>
   </div>
 </template>
 
 <style scoped>
+.chat-shell {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .chat-view {
   flex: 1;
   overflow-y: auto;
   scroll-behavior: smooth;
+}
+
+/* 快速跳转按钮：浮在聊天区右下 */
+.jump-my {
+  position: absolute;
+  right: 28px;
+  bottom: 18px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--bg-surface-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  font-size: 12.5px;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  transition: all 0.15s ease;
+  z-index: 5;
+}
+
+.jump-my:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+
+/* 跳转定位后的短暂高亮 */
+.msg.user.jump-flash .user-bubble {
+  animation: jumpGlow 1.4s ease;
+}
+
+@keyframes jumpGlow {
+  0% {
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
 }
 
 .hero {

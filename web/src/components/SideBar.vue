@@ -12,6 +12,8 @@ const props = defineProps<{
   currentAgentId: string
   mode: string
   model: string
+  /** 工作模式：plan | build */
+  workMode: 'plan' | 'build'
 }>()
 
 const emit = defineEmits<{
@@ -23,7 +25,11 @@ const emit = defineEmits<{
   removeProject: [id: string]
   selectAgent: [id: string]
   openSettings: []
+  setWorkMode: [m: 'plan' | 'build']
 }>()
+
+// 左下角模式切换弹层
+const modeMenuOpen = ref(false)
 
 // 智能体切换下拉
 const expanding = ref(false)
@@ -127,6 +133,33 @@ function projectName(projects: Project[], id?: string): string {
         </button>
       </div>
       <div v-if="!sessions.length" class="empty">还没有会话。</div>
+    </div>
+
+    <!-- 左下角：工作模式标识（点击切换 计划⇄开发） -->
+    <div class="workmode-wrap">
+      <div v-if="modeMenuOpen" class="wm-menu">
+        <button class="wm-opt" :class="{ active: workMode === 'plan' }" @click="emit('setWorkMode', 'plan'); modeMenuOpen = false">
+          <span class="wm-opt-icon">📋</span>
+          <span class="wm-opt-text">
+            <b>计划模式</b>
+            <i>先调研出计划，只读不改，确认后才开发</i>
+          </span>
+          <span v-if="workMode === 'plan'" class="wm-check">✓</span>
+        </button>
+        <button class="wm-opt" :class="{ active: workMode === 'build' }" @click="emit('setWorkMode', 'build'); modeMenuOpen = false">
+          <span class="wm-opt-icon">🛠️</span>
+          <span class="wm-opt-text">
+            <b>开发模式</b>
+            <i>完整能力：读写文件、执行命令</i>
+          </span>
+          <span v-if="workMode === 'build'" class="wm-check">✓</span>
+        </button>
+      </div>
+      <button class="wm-badge" :class="workMode" :title="workMode === 'plan' ? '计划模式：先调研再开发，点击切换' : '开发模式：完整能力，点击切换'" @click="modeMenuOpen = !modeMenuOpen">
+        <span class="wm-icon">{{ workMode === 'plan' ? '📋' : '🛠️' }}</span>
+        <span class="wm-label">{{ workMode === 'plan' ? '计划模式' : '开发模式' }}</span>
+        <span class="wm-caret">{{ modeMenuOpen ? '▾' : '▴' }}</span>
+      </button>
     </div>
 
     <div class="foot">
@@ -404,6 +437,127 @@ function projectName(projects: Project[], id?: string): string {
   gap: 7px;
   padding: 8px 6px 2px;
   border-top: 1px solid var(--border);
+}
+
+/* ---------- 左下角工作模式标识 ---------- */
+.workmode-wrap {
+  position: relative;
+  margin-top: auto;
+}
+
+.wm-badge {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-muted);
+  transition: all 0.15s ease;
+}
+
+.wm-badge:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.wm-badge.plan {
+  border-color: color-mix(in srgb, #56c2e6 45%, transparent);
+  background: rgba(86, 194, 230, 0.08);
+  color: #56c2e6;
+}
+
+.wm-badge.build {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.wm-icon {
+  font-size: 15px;
+}
+
+.wm-label {
+  flex: 1;
+  text-align: left;
+  font-weight: 600;
+}
+
+.wm-caret {
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.wm-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 30;
+}
+
+.wm-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+
+.wm-opt:hover {
+  background: var(--bg-surface-2);
+}
+
+.wm-opt.active {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.wm-opt-icon {
+  font-size: 15px;
+  margin-top: 1px;
+}
+
+.wm-opt-text {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.wm-opt-text b {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.wm-opt-text i {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-faint);
+  line-height: 1.45;
+  margin-top: 2px;
+}
+
+.wm-check {
+  color: var(--accent);
+  font-size: 13px;
 }
 
 .gear {
