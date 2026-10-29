@@ -1,18 +1,16 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import type { MsgGroup, ToolPair } from '../types'
 import { renderMarkdown } from '../lib/markdown'
 
 const props = defineProps<{
-  /** 回合内的分组（assistant 工具块 + 正文） */
+  /** 回合内的分组（assistant 工具块 + 正文；流式实时组已由 App 并入） */
   groups: MsgGroup[]
   /** 回合开始时间（首条消息） */
   startTime?: string
   /** 回合结束时间（末条消息）；流式中为空表示进行中 */
   endTime?: string
   streaming?: boolean
-  /** 流式中的实时工具与正文（并入本回合展示） */
-  liveGroups?: MsgGroup[]
   agentName?: string
   avatar?: string
 }>()
@@ -45,10 +43,10 @@ function toggle() {
   expanded.value = !expanded.value
 }
 
-const allGroups = computed<MsgGroup[]>(() => [
-  ...(props.groups || []),
-  ...(props.streaming ? props.liveGroups || [] : []),
-])
+const allGroups = computed<MsgGroup[]>(() => props.groups || [])
+
+// 出错时顶栏常显错误（否则错误藏在收起的明细里，用户只看到「已工作 0 秒」）
+const turnError = computed(() => allGroups.value.find((g) => g.error)?.error || '')
 
 // 工具调用（跨分组合并）
 const allTools = computed<ToolPair[]>(() => allGroups.value.flatMap((g) => g.tools || []))
@@ -70,6 +68,13 @@ watch(
   },
   { immediate: true },
 )
+// 组件销毁（删会话/切会话）时必须停表，否则定时器泄漏到已卸载组件
+onUnmounted(() => {
+  if (timer !== undefined) {
+    window.clearInterval(timer)
+    timer = undefined
+  }
+})
 
 function durMs(): number {
   const start = props.startTime ? Date.parse(props.startTime) : NaN
@@ -138,10 +143,14 @@ function render(md: string): string {
         <span class="live-dot"></span>
         工作中 · {{ durText }}
       </span>
+      <span v-else-if="turnError" class="th-err">⚠ 出错了 · 点击查看详情</span>
       <span v-else class="th-done">已工作 {{ durText }}</span>
       <span class="th-meta" v-if="toolCount">{{ toolRounds }} 轮 · {{ toolCount }} 次工具</span>
       <span class="th-chevron">{{ expanded ? '▲' : '▼' }}</span>
     </button>
+
+    <!-- 错误全文常显（不随明细收起） -->
+    <div v-if="turnError && !expanded" class="err-inline">⚠ {{ turnError }}</div>
 
     <!-- 明细：实时时间线（工作中）+ 完整参数与结果 -->
     <div v-if="expanded" class="turn-detail">
@@ -244,6 +253,21 @@ function render(md: string): string {
 .th-done {
   color: var(--text-muted);
   font-weight: 500;
+}
+
+.th-err {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.err-inline {
+  margin-top: 6px;
+  padding: 8px 14px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  color: var(--danger);
+  background: rgba(255, 107, 107, 0.08);
+  font-size: 13px;
 }
 
 .th-meta {
