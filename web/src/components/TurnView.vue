@@ -48,6 +48,9 @@ const allGroups = computed<MsgGroup[]>(() => props.groups || [])
 // 出错时顶栏常显错误（否则错误藏在收起的明细里，用户只看到「已工作 0 秒」）
 const turnError = computed(() => allGroups.value.find((g) => g.error)?.error || '')
 
+// 有可折叠内容（工具调用或错误）才显示时长行；纯问答回合直接展示回答
+const hasWork = computed(() => toolCount.value > 0 || !!turnError.value)
+
 // 工具调用（跨分组合并）
 const allTools = computed<ToolPair[]>(() => allGroups.value.flatMap((g) => g.tools || []))
 const toolCount = computed(() => allTools.value.length)
@@ -137,8 +140,8 @@ function render(md: string): string {
 
 <template>
   <div class="turn">
-    <!-- 顶栏：工作时长，点击展开/收起工作明细 -->
-    <button class="turn-head" type="button" @click="toggle()">
+    <!-- 顶栏：工作时长，点击展开/收起工作过程（纯问答回合无此项） -->
+    <button v-if="hasWork" class="turn-head" type="button" @click="toggle()">
       <span v-if="props.streaming" class="th-live">
         <span class="live-dot"></span>
         工作中 · {{ durText }}
@@ -152,7 +155,7 @@ function render(md: string): string {
     <!-- 错误全文常显（不随明细收起） -->
     <div v-if="turnError && !expanded" class="err-inline">⚠ {{ turnError }}</div>
 
-    <!-- 明细：实时时间线（工作中）+ 完整参数与结果 -->
+    <!-- 工作过程（可折叠）：工具时间线 + 完整参数结果 + 错误 -->
     <div v-if="expanded" class="turn-detail">
       <!-- 工具时间线 -->
       <div v-if="toolCount" class="tl">
@@ -168,12 +171,7 @@ function render(md: string): string {
         </div>
       </div>
 
-      <!-- 每轮的过渡说明与正文 -->
-      <div v-for="(g, gi) in allGroups" :key="'g' + gi">
-        <div v-for="(s, si) in g.sections || []" :key="'s' + si" class="turn-text md" v-html="render(s)"></div>
-      </div>
-
-      <!-- 展开态完整参数/结果（与收起时间线互补：这里是可复制的原文） -->
+      <!-- 完整参数/结果（可复制原文） -->
       <details v-if="toolCount" class="raw">
         <summary>查看完整参数与结果</summary>
         <div v-for="(t, i) in allTools" :key="'r' + i" class="raw-item">
@@ -188,9 +186,16 @@ function render(md: string): string {
         </div>
       </details>
 
-      <!-- 错误 -->
+      <!-- 错误（展开态内） -->
       <div v-for="(g, gi) in allGroups" :key="'e' + gi">
         <div v-if="g.error" class="error-box">⚠ {{ g.error }}</div>
+      </div>
+    </div>
+
+    <!-- 最终回答正文：始终展示，不折叠 -->
+    <div class="turn-answer">
+      <div v-for="(g, gi) in allGroups" :key="'a' + gi">
+        <div v-for="(s, si) in g.sections || []" :key="'s' + si" class="turn-text md" v-html="render(s)"></div>
       </div>
     </div>
   </div>
@@ -199,6 +204,15 @@ function render(md: string): string {
 <style scoped>
 .turn {
   margin: 6px 0 14px;
+}
+
+/* 回答正文区（始终可见） */
+.turn-answer:empty {
+  display: none;
+}
+
+.turn-answer:not(:first-child) {
+  margin-top: 10px;
 }
 
 /* ---------- 顶栏 ---------- */
