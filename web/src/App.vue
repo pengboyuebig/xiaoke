@@ -44,6 +44,16 @@ const projectModalOpen = ref(false)
 // 思考程度（右下角选择，浏览器本地记住，下一条消息生效）
 const REASONING_KEY = 'xiaoke.reasoning'
 const reasoning = ref(localStorage.getItem(REASONING_KEY) || 'none')
+// 当前会话 ID（刷新后恢复到上次的会话）
+const CURRENT_SESSION_KEY = 'xiaoke.currentSession'
+function rememberSession(id: string) {
+  try {
+    if (id) localStorage.setItem(CURRENT_SESSION_KEY, id)
+    else localStorage.removeItem(CURRENT_SESSION_KEY)
+  } catch {
+    /* 隐私模式下可能禁用，忽略 */
+  }
+}
 function setReasoning(v: string) {
   reasoning.value = v
   try {
@@ -106,11 +116,26 @@ async function refreshHealth() {
   }
 }
 
-onMounted(() => {
-  refreshSessions()
+onMounted(async () => {
   refreshProjects()
   refreshAgents()
   refreshHealth()
+  await refreshSessions()
+  // 恢复上次的会话（刷新后不丢）
+  try {
+    const last = localStorage.getItem(CURRENT_SESSION_KEY)
+    if (last && sessions.value.some((s) => s.id === last)) {
+      const s = await api.getSession(last)
+      currentId.value = s.id
+      currentProjectId.value = s.projectId || ''
+      if (s.agentId) currentAgentId.value = s.agentId
+      messages.value = s.messages
+    } else if (last) {
+      localStorage.removeItem(CURRENT_SESSION_KEY)
+    }
+  } catch {
+    /* 恢复失败则回到欢迎页 */
+  }
 })
 
 // 切换智能体 = 开新对话（当前会话已绑定旧智能体，不混用）
@@ -119,26 +144,42 @@ function handleSelectAgent(id: string) {
   if (streaming.value) handleStop()
   currentAgentId.value = id
   currentId.value = ''
+  rememberSession('')
   messages.value = []
   error.value = ''
 }
 
 /**
  * 把落库消息合并为渲染分组：
- * - 每轮工具调用（assistant 含 toolCalls）自成一个工具块
- * - 该轮的过渡正文与随后的工具结果合并到同一个块（上下文连贯）
- * - 最终答复（无 toolCalls 的 assistant）自成一个纯正文块
+ * - 每轮工具调用（assistant 含 toolCalls）自成工具块；一轮内再按 14 次/块分块，
+ *   避免 36 次调用堆一个块导致展开超高、点开无感
+ * - 该轮的过渡正文与第一批工具结果合并（上下文连贯）
+ * - 最终答复（无 toolCalls 的 assistant）自成纯正文块
  * - user 消息打断分组
- * 避免一屏散落的头像与逐条工具记录。
  */
 const groups = computed<MsgGroup[]>(() => {
   const out: MsgGroup[] = []
   let cur: { sections: string[]; tools: ToolPair[] } | null = null
+  const PER_BLOCK = 14
 
   const flush = () => {
     if (!cur) return
-    if (cur.sections.length || cur.tools.length) {
-      out.push({ kind: 'assistant', sections: cur.sections, tools: cur.tools })
+    if (cur.tools.length === 0) {
+      if (cur.sections.length) out.push({ kind: 'assistant', sections: cur.sections, tools: [] })
+    } else {
+      const total = Math.ceil(cur.tools.length / PER_BLOCK)
+      let n = 0
+      for (let i = 0; i < cur.tools.length; i += PER_BLOCK) {
+        n++
+        const chunk = cur.tools.slice(i, i + PER_BLOCK)
+        // 打分块序号标记（ToolBlock 用于头部「第 n/总 组」展示）
+        for (const t of chunk) t.id = `blk-${n}/${total}|${t.id}`
+        out.push({
+          kind: 'assistant',
+          sections: i === 0 ? cur.sections : [],
+          tools: chunk,
+        })
+      }
     }
     cur = null
   }
@@ -220,6 +261,7 @@ async function handleSend(content: string) {
     if (!sessionId) {
       const s = await api.createSession(currentProjectId.value, currentAgent.value?.id)
       sessionId = s.id
+      rememberSession(s.id)
     }
     const r = await api.chat({
       sessionId,
@@ -253,6 +295,7 @@ async function handleSend(content: string) {
     let serverHadThis = false
     if (r.sessionId === currentId.value || !currentId.value) {
       currentId.value = r.sessionId
+      rememberSession(r.sessionId)
       try {
         const s = await api.getSession(r.sessionId)
         if (r.sessionId === currentId.value) {
@@ -274,7 +317,6 @@ async function handleSend(content: string) {
     }
     streamingText.value = ''
     liveTools.value = []
-    refreshSessions()
   } catch (e) {
     error.value = (e as Error).message || '出错了，请稍后再试'
   } finally {
@@ -282,6 +324,8 @@ async function handleSend(content: string) {
     streamingText.value = ''
     liveTools.value = []
     controller = null
+    // 无论成功/停止/出错都刷新会话列表：会话已落库，必须出现在侧栏（持久化可见）
+    refreshSessions()
   }
 }
 
@@ -293,6 +337,7 @@ function handleStop() {
 function handleNewChat() {
   if (streaming.value) handleStop()
   currentId.value = ''
+  rememberSession('')
   messages.value = []
   liveTools.value = []
   error.value = ''
@@ -304,6 +349,7 @@ async function handleSelect(id: string) {
   try {
     const s = await api.getSession(id)
     currentId.value = s.id
+    rememberSession(s.id)
     currentProjectId.value = s.projectId || ''
     if (s.agentId) currentAgentId.value = s.agentId
     messages.value = s.messages
@@ -314,6 +360,8 @@ async function handleSelect(id: string) {
 }
 
 async function handleRemove(id: string) {
+  const s = sessions.value.find((x) => x.id === id)
+  if (!confirm(`删除会话「${s?.title || '新对话'}」？删除后不可恢复。`)) return
   try {
     await api.deleteSession(id)
   } catch {
@@ -322,6 +370,11 @@ async function handleRemove(id: string) {
   if (id === currentId.value) {
     currentId.value = ''
     messages.value = []
+    try {
+      localStorage.removeItem(CURRENT_SESSION_KEY)
+    } catch {
+      /* 忽略 */
+    }
   }
   refreshSessions()
 }

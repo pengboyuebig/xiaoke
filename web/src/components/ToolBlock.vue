@@ -46,6 +46,14 @@ const sections = computed(() => props.group.sections || [])
 // 正文若已以「**名字**」开头，渲染内已含名，避免与头部名字重复
 const headerNameHidden = computed(() => /^\*\*[^*]+\*\*\s*/.test(sections.value[0] || ''))
 const toolCount = computed(() => props.group.tools.length)
+// 分块序号（App.vue 按 14 次/块切分并打 blk-n/total 标记）
+const blockIdx = computed(() => {
+  const id = props.group.tools[0]?.id || ''
+  const m = id.match(/^blk-(\d+\/\d+)\|/)
+  return m ? m[1] : ''
+})
+// 收起态只展示首行，保持一行摘要（大块全量渲染会把 header 顶出视口）
+const compactRows = computed(() => expanded.value ? props.group.tools : props.group.tools.slice(0, 1))
 
 function render(md: string): string {
   return renderMarkdown(md)
@@ -76,30 +84,35 @@ function render(md: string): string {
         <span class="name">{{ agentNameLabel() }}</span>
       </div>
 
-      <!-- 工具调用：默认一行一个的紧凑摘要，点「N 次工具调用」展开/收起 -->
+      <!-- 工具调用：默认收起一行摘要，点头部展开/收起 -->
       <div v-if="toolCount" class="tool-block" :class="{ open: expanded }">
         <button class="tb-head" type="button" @click="expanded = !expanded">
-          <span class="tb-count">⚙ {{ toolCount }} 次工具调用</span>
+          <span class="tb-count">
+            ⚙ {{ toolCount }} 次工具调用
+            <span v-if="blockIdx" class="tb-seq">{{ blockIdx }}</span>
+          </span>
+          <span class="tb-more" v-if="!expanded && toolCount > 1">共 {{ toolCount }} 条</span>
           <span class="tb-toggle">{{ expanded ? '收起 ▲' : '展开 ▼' }}</span>
         </button>
 
-        <!-- 收起态：紧凑摘要行 -->
+        <!-- 收起态：一行摘要（首条） -->
         <div v-if="!expanded" class="tb-compact">
-          <div v-for="(t, i) in props.group.tools" :key="i" class="tc-row">
-            <span class="tc-tool">{{ t.name }}</span>
-            <span v-if="argLabel(t)" class="tc-arg">{{ argLabel(t) }}</span>
-            <span v-if="t.result !== undefined" class="tc-arrow">→</span>
-            <span v-if="t.result !== undefined" class="tc-res" :class="t.ok ? 'ok' : 'bad'">
-              {{ resultLabel(t) }}
+          <div class="tc-row">
+            <span class="tc-tool">{{ compactRows[0].name }}</span>
+            <span v-if="argLabel(compactRows[0])" class="tc-arg">{{ argLabel(compactRows[0]) }}</span>
+            <span v-if="compactRows[0].result !== undefined" class="tc-arrow">→</span>
+            <span v-if="compactRows[0].result !== undefined" class="tc-res" :class="compactRows[0].ok ? 'ok' : 'bad'">
+              {{ resultLabel(compactRows[0]) }}
             </span>
           </div>
         </div>
 
-        <!-- 展开态：完整参数与结果 -->
+        <!-- 展开态：完整参数与结果（限高滚动，避免撑爆视口） -->
         <div v-else class="tb-detail">
           <div v-for="(t, i) in props.group.tools" :key="i" class="detail-item">
             <div class="di-head">
               <span class="di-tool">⚙ {{ t.name }}</span>
+              <span class="di-arg" v-if="argLabel(t)">{{ argLabel(t) }}</span>
               <span class="di-status" :class="t.ok === false ? 'bad' : t.ok === true ? 'ok' : ''">
                 {{ t.result === undefined ? '执行中…' : t.ok ? '✓ 成功' : '✗ 失败' }}
               </span>
@@ -229,6 +242,20 @@ function render(md: string): string {
   font-weight: 600;
 }
 
+.tb-seq {
+  color: var(--text-faint);
+  font-weight: 400;
+  font-size: 11px;
+  margin-left: 6px;
+}
+
+.tb-more {
+  color: var(--text-faint);
+  font-size: 11px;
+  flex: 1;
+  text-align: center;
+}
+
 .tb-toggle {
   color: var(--text-faint);
   font-size: 11px;
@@ -286,14 +313,14 @@ function render(md: string): string {
   color: var(--danger);
 }
 
-/* 展开态详情 */
+/* 展开态详情（限高滚动：大块展开不会把 header 顶出视口） */
 .tb-detail {
   border-top: 1px solid var(--border);
   padding: 8px 12px 10px;
   display: flex;
   flex-direction: column;
   gap: 9px;
-  max-height: 400px;
+  max-height: 320px;
   overflow-y: auto;
 }
 
@@ -313,6 +340,18 @@ function render(md: string): string {
   font-size: 12px;
   color: var(--accent);
   font-weight: 600;
+  flex-shrink: 0;
+}
+
+.di-arg {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-family: 'Cascadia Code', Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
 }
 
 .di-status {
