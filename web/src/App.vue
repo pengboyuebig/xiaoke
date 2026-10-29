@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api } from './lib/api'
-import type { Agent, Message, MsgGroup, Project, SessionMeta, Skill, ToolActivity, ToolPair } from './types'
+import type { Agent, Message, MsgGroup, Project, SessionMeta, Skill, ToolActivity, ToolPair, Turn } from './types'
 import SideBar from './components/SideBar.vue'
 import ChatView from './components/ChatView.vue'
 import Composer from './components/Composer.vue'
@@ -150,83 +150,96 @@ function handleSelectAgent(id: string) {
 }
 
 /**
- * 把落库消息合并为渲染分组：
- * - 每轮工具调用（assistant 含 toolCalls）自成工具块；一轮内再按 14 次/块分块，
- *   避免 36 次调用堆一个块导致展开超高、点开无感
- * - 该轮的过渡正文与第一批工具结果合并（上下文连贯）
- * - 最终答复（无 toolCalls 的 assistant）自成纯正文块
- * - user 消息打断分组
+ * 回合模型（TurnView 渲染）：
+ * - 一条 user 消息开启一个回合，回合内所有 assistant/tool 消息归入该回合
+ * - 回合内再按「轮」切分组：每轮工具调用自成一块（>14 次再分块），过渡正文与首批结果同块，
+ *   最终答复独立成纯正文块
+ * - 回合带首末消息时间（工作时长），流式中末时间为空 → TurnView 实时走秒
  */
-const groups = computed<MsgGroup[]>(() => {
-  const out: MsgGroup[] = []
-  let cur: { sections: string[]; tools: ToolPair[] } | null = null
+const turns = computed<Turn[]>(() => {
+  const out: Turn[] = []
+  let cur: Turn | null = null
+  let round: { sections: string[]; tools: ToolPair[] } | null = null
   const PER_BLOCK = 14
 
-  const flush = () => {
-    if (!cur) return
-    if (cur.tools.length === 0) {
-      if (cur.sections.length) out.push({ kind: 'assistant', sections: cur.sections, tools: [] })
+  const flushRound = () => {
+    if (!cur || !round) return
+    if (round.tools.length === 0) {
+      if (round.sections.length) cur.groups.push({ kind: 'assistant', sections: round.sections, tools: [] })
     } else {
-      const total = Math.ceil(cur.tools.length / PER_BLOCK)
+      const total = Math.ceil(round.tools.length / PER_BLOCK)
       let n = 0
-      for (let i = 0; i < cur.tools.length; i += PER_BLOCK) {
+      for (let i = 0; i < round.tools.length; i += PER_BLOCK) {
         n++
-        const chunk = cur.tools.slice(i, i + PER_BLOCK)
-        // 打分块序号标记（ToolBlock 用于头部「第 n/总 组」展示）
+        const chunk = round.tools.slice(i, i + PER_BLOCK)
         for (const t of chunk) t.id = `blk-${n}/${total}|${t.id}`
-        out.push({
-          kind: 'assistant',
-          sections: i === 0 ? cur.sections : [],
-          tools: chunk,
-        })
+        cur.groups.push({ kind: 'assistant', sections: i === 0 ? round.sections : [], tools: chunk })
       }
     }
-    cur = null
+    round = null
+  }
+
+  const touchTime = (t: Turn, iso?: string) => {
+    if (!iso) return
+    if (!t.startTime) t.startTime = iso
+    t.endTime = iso
   }
 
   for (const m of messages.value) {
     if (m.role === 'user') {
-      flush()
-      out.push({ kind: 'user', sections: [], tools: [], content: m.content })
+      flushRound()
+      cur = { question: m.content, groups: [], startTime: m.createdAt }
+      out.push(cur)
       continue
     }
     if (!cur) {
-      cur = { sections: [], tools: [] }
+      // 历史数据可能缺 user 头：兜底建空回合
+      cur = { question: '', groups: [] }
+      out.push(cur)
+    }
+    touchTime(cur, m.createdAt)
+    if (!round) {
+      round = { sections: [], tools: [] }
     }
     if (m.role === 'assistant') {
       const hasCalls = (m.toolCalls?.length ?? 0) > 0
       const hasText = !!m.content && m.content.trim() !== ''
-      if (hasCalls && hasText && cur.tools.length > 0) {
-        // 上一轮已收过工具：这是新一轮，先落块
-        flush()
-        cur = { sections: [], tools: [] }
-      } else if (!hasCalls && hasText && cur.tools.length > 0) {
-        // 最终答复：另起一块纯正文
-        flush()
-        cur = { sections: [], tools: [] }
+      if (hasCalls && hasText && round.tools.length > 0) {
+        flushRound()
+        round = { sections: [], tools: [] }
+      } else if (!hasCalls && hasText && round.tools.length > 0) {
+        flushRound()
+        round = { sections: [], tools: [] }
       }
       if (hasCalls) {
         for (const c of m.toolCalls!) {
-          cur.tools.push({ id: c.id, name: c.name, arguments: c.arguments })
+          round.tools.push({ id: c.id, name: c.name, arguments: c.arguments })
         }
       }
       if (hasText) {
-        cur.sections.push(m.content)
+        round.sections.push(m.content)
       }
     } else if (m.role === 'tool') {
-      const pair = cur.tools.find((t) => t.id === m.toolCallId)
+      const pair = round.tools.find((t) => t.id === m.toolCallId)
       if (pair) {
         pair.result = m.content
         pair.ok = !/工具执行出错|路径不在|路径不能为空|不在白名单|尚未选择项目/.test(m.content)
       } else {
-        cur.tools.push({ id: m.toolCallId || '', name: m.name || 'tool', arguments: '', result: m.content, ok: true })
+        round.tools.push({ id: m.toolCallId || '', name: m.name || 'tool', arguments: '', result: m.content, ok: true })
       }
     }
   }
-  flush()
+  flushRound()
 
-  // 流式中的实时组：正在执行的工具 + 已流出的正文
-  if (streaming.value) {
+  // 流式：实时进度并入最后一个回合（无回合则自建），结束时间留空 → TurnView 实时走秒
+  if (streaming.value || error.value) {
+    if (!cur) {
+      cur = { question: '', groups: [] }
+      out.push(cur)
+    }
+    cur.streaming = streaming.value
+    if (!cur.startTime) cur.startTime = new Date().toISOString()
+    cur.endTime = undefined
     const tools: ToolPair[] = liveTools.value.map((t, i) => ({
       id: `live-${i}`,
       name: t.name,
@@ -234,15 +247,13 @@ const groups = computed<MsgGroup[]>(() => {
       result: t.done ? [t.error, t.preview].filter(Boolean).join(' | ') : undefined,
       ok: t.done ? t.ok : undefined,
     }))
-    out.push({
+    cur.groups.push({
       kind: 'live',
       sections: streamingText.value ? [streamingText.value] : [],
       tools,
       streaming: true,
-      error: error.value || undefined,
+      error: streaming.value ? undefined : error.value || undefined,
     })
-  } else if (error.value) {
-    out.push({ kind: 'live', sections: [], tools: [], error: error.value })
   }
   return out
 })
@@ -446,7 +457,7 @@ function onSettingsClosed() {
         <button class="pb-x" title="退出项目（回到通用对话）" @click="unbindProject">✕</button>
       </div>
       <ChatView
-        :groups="groups"
+        :turns="turns"
         :streaming="streaming"
         :streaming-text="streamingText"
         :live-tools="liveTools"

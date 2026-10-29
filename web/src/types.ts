@@ -55,6 +55,19 @@ export interface MsgGroup {
   content?: string
 }
 
+/** 一个「回合」：从用户提问到本轮答复结束的工作过程（TurnView 渲染） */
+export interface Turn {
+  /** 用户问题 */
+  question: string
+  /** 回合内的 assistant 分组（工具块 + 正文段落） */
+  groups: MsgGroup[]
+  /** 首条消息时间（回合开始） */
+  startTime?: string
+  /** 末条消息时间（回合结束）；流式中为空 */
+  endTime?: string
+  streaming?: boolean
+}
+
 export interface SessionMeta {
   id: string
   title: string

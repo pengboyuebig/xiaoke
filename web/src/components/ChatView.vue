@@ -1,15 +1,15 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import type { Agent, Message, MsgGroup, Project, ToolActivity } from '../types'
-import ToolBlock from './ToolBlock.vue'
+import type { Agent, Message, Project, Turn } from '../types'
+import TurnView from './TurnView.vue'
 import { renderMarkdown } from '../lib/markdown'
 
 const props = defineProps<{
-  groups: MsgGroup[]
+  turns: Turn[]
   messages: Message[]
   streaming: boolean
   streamingText: string
-  liveTools: ToolActivity[]
+  liveTools: unknown[]
   error: string
   greeting: string
   emptyProjectHint?: string
@@ -48,7 +48,7 @@ async function stick() {
 // 依赖均为基本类型，避免返回新数组导致监听器永不触发
 watch(
   () =>
-    props.groups.length +
+    props.turns.length +
     ':' +
     props.streamingText.length +
     ':' +
@@ -56,12 +56,12 @@ watch(
     ':' +
     props.liveTools.length +
     ':' +
-    props.groups.reduce((n, g) => n + (g.tools?.length || 0) + (g.sections?.length || 0), 0),
+    props.turns.reduce((n, t) => n + (t.groups?.length || 0), 0),
   stick,
   { flush: 'post' },
 )
 
-const isEmpty = computed(() => !props.groups.length && !props.streaming)
+const isEmpty = computed(() => !props.turns.length && !props.streaming)
 </script>
 
 <template>
@@ -79,15 +79,27 @@ const isEmpty = computed(() => !props.groups.length && !props.streaming)
       <p v-if="!props.currentProject && props.emptyProjectHint" class="hero-hint">{{ props.emptyProjectHint }}</p>
     </div>
 
-    <!-- 分组消息流 -->
+    <!-- 回合流：每个回合 = 问题气泡 + 工作容器 -->
     <div v-else class="thread">
-      <ToolBlock
-        v-for="(g, i) in props.groups"
-        :key="i"
-        :group="g"
-        :agent-name="g.kind === 'user' ? undefined : agentName()"
-        :avatar="g.kind === 'user' ? undefined : agentAvatar()"
-      />
+      <div v-for="(t, i) in props.turns" :key="i" class="turn-item">
+        <!-- 我的问题 -->
+        <div v-if="t.question" class="msg user">
+          <div class="body">
+            <div class="meta"><span class="name">我</span></div>
+            <div class="content user-bubble">{{ t.question }}</div>
+          </div>
+        </div>
+
+        <!-- 小柯的工作回合 -->
+        <TurnView
+          :groups="t.groups"
+          :start-time="t.startTime"
+          :end-time="t.endTime"
+          :streaming="t.streaming"
+          :agent-name="agentName()"
+          :avatar="agentAvatar()"
+        />
+      </div>
       <div class="thread-end"></div>
     </div>
   </div>
@@ -161,6 +173,47 @@ const isEmpty = computed(() => !props.groups.length && !props.streaming)
   max-width: var(--content-w);
   margin: 0 auto;
   padding: 16px 24px 8px;
+}
+
+.turn-item {
+  margin-bottom: 8px;
+}
+
+/* 用户问题气泡（右对齐） */
+.msg.user {
+  display: flex;
+  justify-content: flex-end;
+  padding: 10px 0 4px;
+}
+
+.msg.user .body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  max-width: 72%;
+}
+
+.msg.user .meta {
+  text-align: right;
+  margin-bottom: 2px;
+}
+
+.msg.user .name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.user-bubble {
+  display: inline-block;
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-surface));
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
+  color: var(--text);
+  border-radius: var(--radius-lg);
+  border-top-right-radius: var(--radius-sm);
+  padding: 8px 14px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .thread-end {
