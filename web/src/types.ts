@@ -32,6 +32,29 @@ export interface ToolActivity {
   ms?: number
 }
 
+/** 同一回合的工具调用与结果（按 toolCallId 配对） */
+export interface ToolPair {
+  id: string
+  name: string
+  arguments: string
+  result?: string
+  ok?: boolean
+}
+
+/** 前端把连续的 assistant/tool 消息合并后的渲染分组 */
+export interface MsgGroup {
+  /** assistant | live：带头像与工具区块；user：右对齐气泡 */
+  kind: 'assistant' | 'user' | 'live'
+  /** assistant 分组的正文章节（一条 assistant 消息一段） */
+  sections: string[]
+  /** 工具调用配对（assistant / live 分组用） */
+  tools: ToolPair[]
+  error?: string
+  streaming?: boolean
+  /** user 内容 */
+  content?: string
+}
+
 export interface SessionMeta {
   id: string
   title: string

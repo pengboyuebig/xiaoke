@@ -286,7 +286,8 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		convo = append(convo, ChatMessage{Role: "assistant", Content: content, ToolCalls: calls})
 
 		for _, call := range calls {
-			send(map[string]any{"type": "tool", "name": call.Function.Name, "args": truncateRunes(call.Function.Arguments, 400)})
+			// args 不再按 400 字符截断：前端合并成工具区块后只展示摘要行
+			send(map[string]any{"type": "tool", "name": call.Function.Name, "args": call.Function.Arguments})
 			start := time.Now()
 			text, execErr := h.execTool(r.Context(), env, defs, call)
 			ms := time.Since(start).Milliseconds()

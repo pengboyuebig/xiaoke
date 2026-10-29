@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api } from './lib/api'
-import type { Agent, Message, Project, SessionMeta, Skill, ToolActivity } from './types'
+import type { Agent, Message, MsgGroup, Project, SessionMeta, Skill, ToolActivity, ToolPair } from './types'
 import SideBar from './components/SideBar.vue'
 import ChatView from './components/ChatView.vue'
 import Composer from './components/Composer.vue'
@@ -122,6 +122,89 @@ function handleSelectAgent(id: string) {
   messages.value = []
   error.value = ''
 }
+
+/**
+ * 把落库消息合并为渲染分组：
+ * - 每轮工具调用（assistant 含 toolCalls）自成一个工具块
+ * - 该轮的过渡正文与随后的工具结果合并到同一个块（上下文连贯）
+ * - 最终答复（无 toolCalls 的 assistant）自成一个纯正文块
+ * - user 消息打断分组
+ * 避免一屏散落的头像与逐条工具记录。
+ */
+const groups = computed<MsgGroup[]>(() => {
+  const out: MsgGroup[] = []
+  let cur: { sections: string[]; tools: ToolPair[] } | null = null
+
+  const flush = () => {
+    if (!cur) return
+    if (cur.sections.length || cur.tools.length) {
+      out.push({ kind: 'assistant', sections: cur.sections, tools: cur.tools })
+    }
+    cur = null
+  }
+
+  for (const m of messages.value) {
+    if (m.role === 'user') {
+      flush()
+      out.push({ kind: 'user', sections: [], tools: [], content: m.content })
+      continue
+    }
+    if (!cur) {
+      cur = { sections: [], tools: [] }
+    }
+    if (m.role === 'assistant') {
+      const hasCalls = (m.toolCalls?.length ?? 0) > 0
+      const hasText = !!m.content && m.content.trim() !== ''
+      if (hasCalls && hasText && cur.tools.length > 0) {
+        // 上一轮已收过工具：这是新一轮，先落块
+        flush()
+        cur = { sections: [], tools: [] }
+      } else if (!hasCalls && hasText && cur.tools.length > 0) {
+        // 最终答复：另起一块纯正文
+        flush()
+        cur = { sections: [], tools: [] }
+      }
+      if (hasCalls) {
+        for (const c of m.toolCalls!) {
+          cur.tools.push({ id: c.id, name: c.name, arguments: c.arguments })
+        }
+      }
+      if (hasText) {
+        cur.sections.push(m.content)
+      }
+    } else if (m.role === 'tool') {
+      const pair = cur.tools.find((t) => t.id === m.toolCallId)
+      if (pair) {
+        pair.result = m.content
+        pair.ok = !/工具执行出错|路径不在|路径不能为空|不在白名单|尚未选择项目/.test(m.content)
+      } else {
+        cur.tools.push({ id: m.toolCallId || '', name: m.name || 'tool', arguments: '', result: m.content, ok: true })
+      }
+    }
+  }
+  flush()
+
+  // 流式中的实时组：正在执行的工具 + 已流出的正文
+  if (streaming.value) {
+    const tools: ToolPair[] = liveTools.value.map((t, i) => ({
+      id: `live-${i}`,
+      name: t.name,
+      arguments: t.args || '',
+      result: t.done ? [t.error, t.preview].filter(Boolean).join(' | ') : undefined,
+      ok: t.done ? t.ok : undefined,
+    }))
+    out.push({
+      kind: 'live',
+      sections: streamingText.value ? [streamingText.value] : [],
+      tools,
+      streaming: true,
+      error: error.value || undefined,
+    })
+  } else if (error.value) {
+    out.push({ kind: 'live', sections: [], tools: [], error: error.value })
+  }
+  return out
+})
 
 async function handleSend(content: string) {
   if (streaming.value) return
@@ -310,7 +393,7 @@ function onSettingsClosed() {
         <button class="pb-x" title="退出项目（回到通用对话）" @click="unbindProject">✕</button>
       </div>
       <ChatView
-        :messages="messages"
+        :groups="groups"
         :streaming="streaming"
         :streaming-text="streamingText"
         :live-tools="liveTools"
@@ -319,6 +402,7 @@ function onSettingsClosed() {
         :empty-project-hint="emptyProjectHint"
         :current-project="currentProject"
         :agent="currentAgent"
+        :messages="messages"
       />
       <Composer
         :busy="streaming"

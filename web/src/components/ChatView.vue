@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { nextTick, ref, watch } from 'vue'
-import type { Agent, Message, Project, ToolActivity } from '../types'
-import MessageItem from './MessageItem.vue'
+import { computed, nextTick, ref, watch } from 'vue'
+import type { Agent, Message, MsgGroup, Project, ToolActivity } from '../types'
+import ToolBlock from './ToolBlock.vue'
 import { renderMarkdown } from '../lib/markdown'
 
 const props = defineProps<{
+  groups: MsgGroup[]
   messages: Message[]
   streaming: boolean
   streamingText: string
@@ -44,25 +45,29 @@ async function stick() {
   if (el) el.scrollTop = el.scrollHeight
 }
 
-// 依赖均为基本类型（长度/文本/布尔），避免返回新数组导致监听器永不触发
+// 依赖均为基本类型，避免返回新数组导致监听器永不触发
 watch(
   () =>
-    props.messages.length +
+    props.groups.length +
     ':' +
     props.streamingText.length +
     ':' +
     props.streaming +
     ':' +
-    props.liveTools.length,
+    props.liveTools.length +
+    ':' +
+    props.groups.reduce((n, g) => n + (g.tools?.length || 0) + (g.sections?.length || 0), 0),
   stick,
   { flush: 'post' },
 )
+
+const isEmpty = computed(() => !props.groups.length && !props.streaming)
 </script>
 
 <template>
   <div ref="scroller" class="chat-view" @scroll="onScroll">
     <!-- 空状态欢迎页 -->
-    <div v-if="!props.messages.length && !props.streaming && !props.liveTools.length" class="hero">
+    <div v-if="isEmpty" class="hero">
       <img v-if="isImg(agentAvatar())" class="hero-avatar" :src="agentAvatar()" :alt="agentName()" />
       <span v-else class="hero-avatar emoji-hero">{{ agentAvatar() }}</span>
       <h1 class="hero-title">{{ agentName() }}</h1>
@@ -74,38 +79,15 @@ watch(
       <p v-if="!props.currentProject && props.emptyProjectHint" class="hero-hint">{{ props.emptyProjectHint }}</p>
     </div>
 
-    <!-- 消息流 -->
+    <!-- 分组消息流 -->
     <div v-else class="thread">
-      <template v-for="(m, i) in props.messages" :key="i">
-        <MessageItem
-          :role="m.role"
-          :content="m.content"
-          :tool-calls="m.toolCalls"
-          :name="m.name"
-          :avatar="m.role === 'assistant' ? agentAvatar() : undefined"
-          :agent-name="m.role === 'assistant' ? agentName() : undefined"
-        />
-      </template>
-
-      <!-- 流式进行中：已落定的工具结果 + 正在进行的工具 + 流式文本 -->
-      <template v-if="props.streaming">
-        <MessageItem
-          v-for="(t, i) in props.liveTools"
-          :key="'lt' + i"
-          role="tool"
-          :name="t.name"
-          :content="t.done ? (t.preview || t.error || '(无输出)') : '正在调用…'"
-        />
-        <MessageItem
-          role="assistant"
-          :content="props.streamingText"
-          :error="props.error"
-          :avatar="agentAvatar()"
-          :agent-name="agentName()"
-          streaming
-        />
-      </template>
-      <MessageItem v-else-if="props.error" role="assistant" content="" :error="props.error" :avatar="agentAvatar()" :agent-name="agentName()" />
+      <ToolBlock
+        v-for="(g, i) in props.groups"
+        :key="i"
+        :group="g"
+        :agent-name="g.kind === 'user' ? undefined : agentName()"
+        :avatar="g.kind === 'user' ? undefined : agentAvatar()"
+      />
       <div class="thread-end"></div>
     </div>
   </div>

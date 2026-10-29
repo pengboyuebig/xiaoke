@@ -115,6 +115,7 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	req.Header.Set("User-Agent", "xiaoke")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
