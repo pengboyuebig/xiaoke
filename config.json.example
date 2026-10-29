@@ -1,0 +1,14 @@
+{
+  "server": { "addr": "127.0.0.1:18790" },
+  "llm": {
+    "mode": "mock",
+    "baseURL": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "apiKey": "",
+    "temperature": 0.7,
+    "maxHistory": 20
+  },
+  "dataDir": "data",
+  "assetsDir": "assets",
+  "webDist": "web/dist"
+}

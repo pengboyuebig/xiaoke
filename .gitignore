@@ -1,0 +1,17 @@
+# 运行时数据与会话记录
+data/
+
+# 用户上传的智能体头像（个人数据）
+assets/avatars/
+
+# 前端依赖与构建产物
+web/node_modules/
+web/dist/
+
+# 真实配置（含 Key，勿提交/外传）
+config.json
+
+# Go 构建产物
+xiaoke.exe
+xiaoke
+*.tmp
