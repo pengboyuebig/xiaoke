@@ -110,3 +110,18 @@ func genTestID() string {
 }
 
 var seq atomic.Int64
+
+// 索引残留但目录已删除时，Tree 应明确报错而不是返回空树。
+func TestTreeMissingDirErrors(t *testing.T) {
+	m, _ := newMgr(t)
+	p, err := m.Create("tree-missing", "", "", genTestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(p.Path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Tree(p.ID); err == nil {
+		t.Fatal("目录不存在时 Tree 应返回 error")
+	}
+}

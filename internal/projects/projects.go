@@ -199,6 +199,10 @@ func (m *Manager) Tree(id string) ([]TreeItem, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 索引可能残留已删除的目录：明确报错，避免返回空树让人误以为项目是空的
+	if info, err := os.Stat(p.Path); err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("项目目录不存在：%s", p.Path)
+	}
 	items := []TreeItem{}
 	root := p.Path
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {

@@ -15,7 +15,11 @@ const props = defineProps<{
   emptyProjectHint?: string
   currentProject?: Project | null
   agent?: Agent | null
+  /** 计划模式下计划已生成，等待用户批准 */
+  awaitingApproval?: boolean
 }>()
+
+const emit = defineEmits<{ approve: []; adjustPlan: [] }>()
 
 const scroller = ref<HTMLElement | null>(null)
 const threadEl = ref<HTMLElement | null>(null)
@@ -152,6 +156,23 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
           :avatar="agentAvatar()"
         />
       </div>
+      <!-- 计划已生成：批准后切开发模式并立即按计划开工 -->
+      <div v-if="props.awaitingApproval" class="approve-bar">
+        <div class="ab-main">
+          <span class="ab-icon">📋</span>
+          <span class="ab-text">计划已生成。批准后我会切到<b>开发模式</b>并立即按计划开工。</span>
+        </div>
+        <div class="ab-actions">
+          <button class="ab-btn primary" @click="emit('approve')">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20 6L9 17l-5-5" />
+            </svg>
+            批准并开始开发
+          </button>
+          <button class="ab-btn ghost" @click="emit('adjustPlan')">继续调整计划</button>
+        </div>
+      </div>
+
       <div class="thread-end"></div>
     </div>
     </div>
@@ -435,5 +456,79 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
 
 .thread-end {
   height: 12px;
+}
+
+/* ---------- 计划批准条 ---------- */
+.approve-bar {
+  margin: 6px 0 10px;
+  padding: 13px 16px;
+  border: 1px solid color-mix(in srgb, #56c2e6 45%, var(--border));
+  border-radius: var(--radius-lg);
+  background: linear-gradient(180deg, rgba(86, 194, 230, 0.12), rgba(86, 194, 230, 0.04));
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.ab-main {
+  flex: 1;
+  min-width: 220px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.ab-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.ab-text b {
+  color: #56c2e6;
+}
+
+.ab-actions {
+  display: flex;
+  gap: 9px;
+  flex-shrink: 0;
+}
+
+.ab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--radius-sm);
+  padding: 8px 16px;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.ab-btn.primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+  color: var(--accent-text);
+  font-weight: 600;
+  box-shadow: 0 2px 10px rgba(242, 106, 27, 0.3);
+}
+
+.ab-btn.primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(242, 106, 27, 0.42);
+}
+
+.ab-btn.ghost {
+  background: var(--bg-surface-2);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
+.ab-btn.ghost:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
 }
 </style>

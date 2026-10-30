@@ -57,6 +57,28 @@ function setWorkMode(m: WorkMode) {
     /* 隐私模式忽略 */
   }
 }
+
+// 计划模式产出计划后，等待用户批准（在最后一个回合末尾显示批准条）
+const planAwaitingApproval = ref(false)
+
+function clearApproval() {
+  planAwaitingApproval.value = false
+}
+
+/** 批准计划：切开发模式 → 自动发送「开始」按计划开工 */
+function handleApprove() {
+  if (streaming.value) return
+  clearApproval()
+  setWorkMode('build')
+  handleSend('开始')
+}
+
+/** 继续调整计划：收起批准条并聚焦输入框 */
+function handleAdjustPlan() {
+  clearApproval()
+  const ta = document.querySelector<HTMLTextAreaElement>('.composer textarea')
+  ta?.focus()
+}
 // 当前会话 ID（刷新后恢复到上次的会话）
 const CURRENT_SESSION_KEY = 'xiaoke.currentSession'
 function rememberSession(id: string) {
@@ -155,6 +177,7 @@ onMounted(async () => {
 function handleSelectAgent(id: string) {
   if (currentAgentId.value === id && !currentId.value) return
   if (streaming.value) handleStop()
+  clearApproval()
   currentAgentId.value = id
   currentId.value = ''
   rememberSession('')
@@ -274,6 +297,9 @@ const turns = computed<Turn[]>(() => {
 async function handleSend(content: string) {
   if (streaming.value) return
   error.value = ''
+  // 新一轮开始：旧的批准条作废；记录本次发送的模式
+  clearApproval()
+  const sentMode = workMode.value
   messages.value.push({ role: 'user', content })
   streaming.value = true
   streamingText.value = ''
@@ -340,6 +366,10 @@ async function handleSend(content: string) {
     if (abortedByUser && !serverHadThis && r.sessionId === currentId.value && streamingText.value) {
       messages.value.push({ role: 'assistant', content: streamingText.value, stopped: true })
     }
+    // 计划模式下正常完成：在回合末尾给出「批准并开始开发」
+    if (sentMode === 'plan' && !abortedByUser && !error.value) {
+      planAwaitingApproval.value = true
+    }
     streamingText.value = ''
     liveTools.value = []
   } catch (e) {
@@ -356,11 +386,13 @@ async function handleSend(content: string) {
 
 function handleStop() {
   abortedByUser = true
+  clearApproval()
   controller?.abort()
 }
 
 function handleNewChat() {
   if (streaming.value) handleStop()
+  clearApproval()
   currentId.value = ''
   rememberSession('')
   messages.value = []
@@ -371,6 +403,7 @@ function handleNewChat() {
 async function handleSelect(id: string) {
   if (id === currentId.value) return
   if (streaming.value) handleStop()
+  clearApproval()
   try {
     const s = await api.getSession(id)
     currentId.value = s.id
@@ -481,6 +514,9 @@ function onSettingsClosed() {
         :current-project="currentProject"
         :agent="currentAgent"
         :messages="messages"
+        :awaiting-approval="planAwaitingApproval"
+        @approve="handleApprove"
+        @adjust-plan="handleAdjustPlan"
       />
       <Composer
         :busy="streaming"

@@ -184,3 +184,19 @@ func TestRunCommandDefaultCwd(t *testing.T) {
 		t.Fatal("越界 cwd 应被拒绝")
 	}
 }
+
+// run_command 在工作目录不存在时必须返回 error（原先 chdir 失败被当成功返回）。
+func TestRunCommandMissingCwdFails(t *testing.T) {
+	env := &Env{
+		Workspace: filepath.Join(t.TempDir(), "not-exist-yet"),
+		Allowlist: []string{"git"},
+	}
+	args, _ := json.Marshal(map[string]any{"command": "git", "args": []string{"--version"}})
+	out, err := execRunCommand(context.Background(), env, args)
+	if err == nil {
+		t.Fatalf("目录不存在应返回 error，实际 out=%q", out)
+	}
+	if !strings.Contains(err.Error(), "工作目录不存在") {
+		t.Fatalf("错误信息应说明目录不存在: %v", err)
+	}
+}

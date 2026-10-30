@@ -363,6 +363,11 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 			return "", err
 		}
 	}
+	// 目录不存在时 cmd.Run 只会把 chdir 错误拼进输出并返回 nil，
+	// 上层会误判为成功——这里先校验，明确报错。
+	if info, err := os.Stat(cwd); err != nil || !info.IsDir() {
+		return "", fmt.Errorf("工作目录不存在：%s（请先在侧栏选择或重建项目）", cwd)
+	}
 	cctx, cancel := context.WithTimeout(ctx, cmdTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, in.Command, in.Args...)

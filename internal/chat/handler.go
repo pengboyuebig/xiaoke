@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -193,6 +195,11 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	projName, projPath := "", ""
 	if project != nil {
 		projName, projPath = project.Name, project.Path
+		// 项目目录可能被外部删除（索引仍保留）：自动重建，避免写/执行静默失败
+		if err := os.MkdirAll(projPath, 0o755); err != nil {
+			log.Printf("重建项目目录失败 %s: %v", projPath, err)
+			projPath = ""
+		}
 	}
 	env := &tools.Env{
 		Workspace: projPath,
