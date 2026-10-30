@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -198,5 +199,80 @@ func TestRunCommandMissingCwdFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "工作目录不存在") {
 		t.Fatalf("错误信息应说明目录不存在: %v", err)
+	}
+}
+
+func TestIsWriteCapable(t *testing.T) {
+	write := []string{
+		"write_file", "run_command", "write_text_file", "edit_file",
+		"create_directory", "move_file", "delete_file", "append_note",
+		"insert_text", "copy_file", "patch_file", "shell_exec", "upload_file",
+		"rm_file", "mv_file", "cp_file", "touch_file", "truncate_file",
+		"save_file", "persist_state", "update_file", "mkfile", "put_file",
+	}
+	for _, n := range write {
+		if !IsWriteCapable(n) {
+			t.Errorf("%q 应判定为写类工具", n)
+		}
+	}
+	read := []string{
+		"read_file", "read_text_file", "list_directory", "list_files",
+		"search_files", "get_file_info", "directory_tree", "read_multiple_files",
+		"list_allowed_directories", "format_text", "confirm_status",
+	}
+	for _, n := range read {
+		if IsWriteCapable(n) {
+			t.Errorf("%q 不应判定为写类工具", n)
+		}
+	}
+}
+
+// 非 0 退出必须返回 error，避免 UI/模型把失败当成功。
+func TestRunCommandNonZeroExitIsError(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("仅在 Windows 上用 cmd 验证退出码")
+	}
+	env, _ := testEnv(t)
+	env.Allowlist = []string{"cmd"}
+	args, _ := json.Marshal(map[string]any{"command": "cmd", "args": []string{"/c", "exit", "1"}})
+	out, err := execRunCommand(context.Background(), env, args)
+	if err == nil {
+		t.Fatalf("非 0 退出应返回 error，实际 out=%q", out)
+	}
+	if !strings.Contains(err.Error(), "退出码") {
+		t.Fatalf("错误信息应包含退出码: %v", err)
+	}
+	if !strings.Contains(out, "$ cmd") {
+		t.Fatalf("错误结果仍应带上命令输出: %q", out)
+	}
+}
+
+// 工作区内的符号链接/junction 不能成为逃逸通道；指向工作区内部则允许。
+func TestSafeJoinRejectsSymlinkEscape(t *testing.T) {
+	env, ws := testEnv(t)
+	outside := t.TempDir()
+	link := filepath.Join(ws, "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("无法创建符号链接（Windows 需要开发者模式/权限）: %v", err)
+	}
+	if _, err := env.resolveWrite("link/evil.txt"); err == nil {
+		t.Fatal("通过符号链接写出工作区应被拒绝")
+	}
+	env.ReadDirs = nil
+	if _, err := env.resolveRead("link"); err == nil {
+		t.Fatal("通过符号链接读取工作区外应被拒绝")
+	}
+
+	// 指向工作区内部的链接应允许
+	real := filepath.Join(ws, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(ws, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("无法创建符号链接: %v", err)
+	}
+	if _, err := env.resolveWrite("alias/ok.txt"); err != nil {
+		t.Fatalf("指向工作区内部的符号链接应允许: %v", err)
 	}
 }

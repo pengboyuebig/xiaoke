@@ -55,7 +55,13 @@ const hasWork = computed(() => toolCount.value > 0 || !!turnError.value)
 // 工具调用（跨分组合并）
 const allTools = computed<ToolPair[]>(() => allGroups.value.flatMap((g) => g.tools || []))
 const toolCount = computed(() => allTools.value.length)
-const toolRounds = computed(() => allGroups.value.filter((g) => (g.tools || []).length > 0).length)
+const toolRounds = computed(() => {
+  const rounds = new Set<number>()
+  for (const g of allGroups.value) {
+    if ((g.tools || []).length > 0) rounds.add(g.round ?? 0)
+  }
+  return rounds.size
+})
 
 // 工作时长（首条→末条；流式中实时走秒）
 const now = ref(Date.now())
@@ -95,35 +101,72 @@ function fmtDur(ms: number): string {
 
 const durText = computed(() => fmtDur(durMs()))
 
-// 收起态显示的摘要：工具数 + 正文首行（若有）
-const hasSections = computed(() => allGroups.value.some((g) => (g.sections || []).length > 0))
-const firstLine = computed(() => {
-  const g = allGroups.value.find((x) => (x.sections || []).length)
-  const s = g?.sections?.[0] || ''
-  const plain = s.replace(/\*\*|__|`|#\s*/g, '').trim()
-  const line = plain.split('\n').find((l) => l.trim()) || ''
-  return line.length > 60 ? line.slice(0, 60) + '…' : line
-})
+// 流式时组件会随每个 delta 重渲染；相同文本只解析一次，避免长回答越写越卡。
+// 超大文本不缓存，防止一次长回答把缓存撑到几十 MB。
+const MD_CACHE_MAX = 100
+const MD_CACHE_MAX_CHARS = 64 * 1024
+const mdCache = new Map<string, string>()
 
-// 工具摘要行：name arg → 结果
+function render(md: string): string {
+  if (md.length > MD_CACHE_MAX_CHARS) return renderMarkdownCollapsed(md)
+  const hit = mdCache.get(md)
+  if (hit !== undefined) return hit
+  const out = renderMarkdownCollapsed(md)
+  if (mdCache.size >= MD_CACHE_MAX) {
+    const first = mdCache.keys().next().value
+    if (first !== undefined) mdCache.delete(first)
+  }
+  mdCache.set(md, out)
+  return out
+}
+
+// 工具参数/结果摘要的缓存：模板里同一行会多次调用，且每次渲染都会重算。
+const ARG_CACHE_MAX = 500
+const argCache = new Map<string, string>()
+const RES_CACHE_MAX = 200
+const resCache = new Map<string, string>()
+
 function argLabel(t: ToolPair): string {
   if (!t.arguments) return ''
+  const cacheable = t.arguments.length <= 4096
+  if (cacheable) {
+    const hit = argCache.get(t.arguments)
+    if (hit !== undefined) return hit
+  }
+  let out = ''
   try {
     const o = JSON.parse(t.arguments)
-    if (o.command && Array.isArray(o.args)) return [o.command, ...o.args].join(' ')
-    const v = o.path ?? o.query ?? o.cwd ?? o.dir ?? ''
-    return typeof v === 'string' ? v : ''
+    if (o.command && Array.isArray(o.args)) out = [o.command, ...o.args].join(' ')
+    else {
+      const v = o.path ?? o.query ?? o.cwd ?? o.dir ?? ''
+      out = typeof v === 'string' ? v : ''
+    }
   } catch {
     const s = t.arguments.trim()
-    return s.length > 40 ? s.slice(0, 40) + '…' : s
+    out = s.length > 40 ? s.slice(0, 40) + '…' : s
   }
+  if (cacheable) {
+    if (argCache.size >= ARG_CACHE_MAX) argCache.clear()
+    argCache.set(t.arguments, out)
+  }
+  return out
 }
 
 function resultLabel(t: ToolPair): string {
   if (t.result === undefined) return ''
+  const cacheable = t.result.length <= 16384
+  if (cacheable) {
+    const hit = resCache.get(t.result)
+    if (hit !== undefined) return hit
+  }
   const first = (t.result.split('\n').find((l) => l.trim()) || '').replace(/^\$\s*\S+\s*/, '').trim()
   const r = first || '(无输出)'
-  return r.length > 70 ? r.slice(0, 70) + '…' : r
+  const out = r.length > 70 ? r.slice(0, 70) + '…' : r
+  if (cacheable) {
+    if (resCache.size >= RES_CACHE_MAX) resCache.clear()
+    resCache.set(t.result, out)
+  }
+  return out
 }
 
 function toolIcon(name: string): string {
@@ -132,11 +175,6 @@ function toolIcon(name: string): string {
   if (name === 'write_file') return '✏️'
   if (name === 'read_file' || name === 'list_files' || name === 'search_files') return '🔍'
   return '⚙'
-}
-
-function render(md: string): string {
-  // 长代码块默认折叠，只显示步骤标题与摘要行
-  return renderMarkdownCollapsed(md)
 }
 
 // 代码高亮（内容为 v-html 注入，需要在挂载/更新后处理）

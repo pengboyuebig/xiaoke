@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # 小柯 · 一键构建启动
+# 传 --rebuild 强制重建前后端
 set -e
 cd "$(dirname "$0")"
 
+if [ "$1" = "--rebuild" ]; then
+  echo "[小柯] 强制重建..."
+  rm -f xiaoke.exe xiaoke
+  rm -rf web/dist
+fi
+
 if [ ! -f web/dist/index.html ]; then
-  echo "[小柯] 首次运行，构建前端..."
+  echo "[小柯] 构建前端..."
   (cd web && npm install && npm run build)
 fi
 

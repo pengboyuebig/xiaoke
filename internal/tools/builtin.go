@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -114,6 +115,9 @@ func execListFiles(ctx context.Context, env *Env, args json.RawMessage) (string,
 			return "", err
 		}
 		for _, de := range des {
+			if len(entries) >= maxListEntries {
+				break
+			}
 			name := de.Name()
 			if de.IsDir() {
 				name += "/"
@@ -125,6 +129,10 @@ func execListFiles(ctx context.Context, env *Env, args json.RawMessage) (string,
 		err = filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return nil // 单个不可读路径跳过
+			}
+			// 目录条目也计入上限，避免大仓库/node_modules 把内存撑爆
+			if len(entries) >= maxListEntries {
+				return fs.SkipAll
 			}
 			rel, rerr := filepath.Rel(root, p)
 			if rerr != nil {
@@ -139,9 +147,6 @@ func execListFiles(ctx context.Context, env *Env, args json.RawMessage) (string,
 				}
 				entries = append(entries, filepath.ToSlash(rel)+"/")
 				return nil
-			}
-			if len(entries) >= maxListEntries {
-				return fs.SkipAll
 			}
 			entries = append(entries, filepath.ToSlash(rel))
 			return nil
@@ -173,9 +178,20 @@ func execReadFile(ctx context.Context, env *Env, args json.RawMessage) (string, 
 	if err != nil {
 		return "", err
 	}
-	raw, err := os.ReadFile(abs)
+	f, err := os.Open(abs)
 	if err != nil {
 		return "", err
+	}
+	defer f.Close()
+	// 先限量读入，避免一次 os.ReadFile 把超大文件整个塞进内存。
+	// 4MB 足够覆盖正常源码/文档；更大的文件明确报错，避免 OOM。
+	const maxSourceBytes = 4 << 20
+	raw, err := io.ReadAll(io.LimitReader(f, maxSourceBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(raw) > maxSourceBytes {
+		return "", fmt.Errorf("文件超过 %dMB，无法按文本读取（可先用 search_files 定位关键内容）", maxSourceBytes>>20)
 	}
 	if bytes.IndexByte(raw, 0) >= 0 {
 		return "", fmt.Errorf("%s 是二进制文件，无法按文本读取", in.Path)
@@ -198,7 +214,7 @@ func execReadFile(ctx context.Context, env *Env, args json.RawMessage) (string, 
 	sel := lines[start-1 : end]
 	out := strings.Join(sel, "\n")
 	if len(out) > maxReadBytes {
-		out = truncateRunes(out, maxReadBytes) + "\n…(已按 64KB 截断)"
+		out = truncateBytes(out, maxReadBytes) + "\n…(已按 64KB 截断)"
 	}
 	header := fmt.Sprintf("(第 %d-%d 行，共 %d 行)\n", start, end, len(lines))
 	return header + out, nil
@@ -377,12 +393,13 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 	cmd.Stderr = &buf
 	runErr := cmd.Run()
 	out := buf.String()
-	if rs := []rune(out); len(rs) > maxOutBytes {
-		out = string(rs[:maxOutBytes]) + "\n…(输出已按 8KB 截断)"
+	if len(out) > maxOutBytes {
+		out = truncateBytes(out, maxOutBytes) + "\n…(输出已按 8KB 截断)"
 	}
 	head := fmt.Sprintf("$ %s %s\n", in.Command, strings.Join(in.Args, " "))
 	if runErr != nil {
-		return head + out + "\n(退出码非 0: " + runErr.Error() + ")", nil
+		// 非 0 退出必须作为错误返回，否则前端/模型会把失败当成功
+		return head + out, fmt.Errorf("命令退出码非 0: %w", runErr)
 	}
 	if strings.TrimSpace(out) == "" {
 		return head + "(无输出)", nil

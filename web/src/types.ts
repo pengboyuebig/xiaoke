@@ -51,6 +51,8 @@ export interface MsgGroup {
   sections: string[]
   /** 工具调用配对（assistant / live 分组用） */
   tools: ToolPair[]
+  /** 同一轮工具调用被拆成多块时共享同一个 round，用于统计「几轮」 */
+  round?: number
   error?: string
   streaming?: boolean
   /** user 内容 */
@@ -152,6 +154,8 @@ export interface MCPServerCfg {
   args: string[]
   env?: Record<string, string>
   enabled: boolean
+  /** 只读：不把写/删/移动类工具暴露给模型 */
+  readOnly?: boolean
 }
 
 export interface SettingsView {
@@ -175,6 +179,8 @@ export interface SettingsView {
 export interface MCPStatus {
   name: string
   enabled: boolean
+  /** 只读模式：写/删/移动类工具已从模型可用列表过滤 */
+  readOnly?: boolean
   running: boolean
   /** 握手进行中（npx 冷启动） */
   starting?: boolean

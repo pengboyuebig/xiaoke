@@ -5,7 +5,9 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,18 +37,30 @@ type ToolInfo struct {
 }
 
 // Client 是一个 MCP server 的子进程连接（异步就绪）。
+//
+// 并发模型：
+//   - writeMu 串行化 stdin 写入与请求 ID 分配
+//   - pendingMu 保护「请求 ID → 响应 channel」映射
+//   - 单独的 readLoop 常驻读 stdout，按 ID 把响应投递给对应请求；
+//     超时/取消只会移除 pending，不会留下并发读同一管道的 goroutine
 type Client struct {
-	name    string
-	cfg     settings.MCPServer
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	stdout  *bufio.Scanner
-	stderr  *tailBuffer // 抓 server 报错，握手失败时可诊断
-	mu      sync.Mutex  // 序列化请求/响应（一次一个在途请求）
-	nextID  int64
-	Tools   []ToolInfo
-	exited  chan struct{}
-	errText string // 非空表示启动/握手失败（伪 Client 仅用于状态展示）
+	name   string
+	cfg    settings.MCPServer
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Scanner
+	stderr *tailBuffer // 抓 server 报错，握手失败时可诊断
+
+	writeMu   sync.Mutex // 串行化 stdin 写入
+	mu        sync.Mutex // 保护 Tools/readyErr/errText 等状态
+	pendingMu sync.Mutex
+	pending   map[int64]chan rpcResponse
+
+	nextID   int64
+	Tools    []ToolInfo
+	exited   chan struct{}
+	readDone chan struct{} // readLoop 结束（stdout 关闭/读错误）
+	errText  string        // 非空表示启动/握手失败（伪 Client 仅用于状态展示）
 
 	readyOnce sync.Once
 	readyCh   chan struct{}
@@ -84,7 +98,8 @@ func Start(ctx context.Context, cfg settings.MCPServer) (*Client, error) {
 	}
 	c := &Client{
 		name: cfg.Name, cfg: cfg, nextID: 1,
-		exited: make(chan struct{}), readyCh: make(chan struct{}),
+		exited: make(chan struct{}), readDone: make(chan struct{}),
+		readyCh: make(chan struct{}), pending: map[int64]chan rpcResponse{},
 	}
 	cmd := exec.CommandContext(ctx, cfg.Command, cfg.Args...)
 	if len(cfg.Env) > 0 {
@@ -112,8 +127,38 @@ func Start(ctx context.Context, cfg settings.MCPServer) (*Client, error) {
 		return nil, fmt.Errorf("启动 MCP server %q 失败: %w", cfg.Command, err)
 	}
 	go func() { _ = cmd.Wait(); close(c.exited) }()
+	go c.readLoop()
 	go c.backgroundHandshake()
 	return c, nil
+}
+
+// readLoop 是唯一的 stdout 读者：把响应按 JSON-RPC id 投递给等待中的 request。
+// 通知（无 id）直接忽略；无法解析的行视为 server 杂音。
+func (c *Client) readLoop() {
+	defer close(c.readDone)
+	for c.stdout.Scan() {
+		line := bytes.TrimSpace(c.stdout.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var resp rpcResponse
+		if err := json.Unmarshal(line, &resp); err != nil {
+			continue
+		}
+		if resp.ID == 0 {
+			continue // 通知 / 无 id 的消息
+		}
+		c.pendingMu.Lock()
+		ch := c.pending[resp.ID]
+		c.pendingMu.Unlock()
+		if ch == nil {
+			continue
+		}
+		select {
+		case ch <- resp: // 缓冲 1，重复响应直接丢弃
+		default:
+		}
+	}
 }
 
 // backgroundHandshake 在后台完成 initialize → initialized → tools/list。
@@ -224,76 +269,75 @@ type rpcResponse struct {
 }
 
 func (c *Client) request(ctx context.Context, method string, params map[string]any, out any) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.writeMu.Lock()
 	c.nextID++
-	req := rpcRequest{JSONRPC: "2.0", ID: c.nextID, Method: method, Params: params}
+	id := c.nextID
+	req := rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}
 	line, err := json.Marshal(req)
+	var ch chan rpcResponse
+	if err == nil {
+		ch = make(chan rpcResponse, 1)
+		c.pendingMu.Lock()
+		c.pending[id] = ch
+		c.pendingMu.Unlock()
+		_, err = fmt.Fprintf(c.stdin, "%s\n", line)
+	}
+	c.writeMu.Unlock()
 	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(c.stdin, "%s\n", line); err != nil {
-		return fmt.Errorf("写入 stdin: %w%s", err, c.stderrSnippet())
-	}
-	// 逐行读，跳过通知/请求（无 id 的行），直到拿到匹配 id 的响应
-	deadline := time.Now().Add(defaultToolTimeout)
-	if d, ok := ctx.Deadline(); ok {
-		deadline = time.Now().Add(time.Until(d))
-	}
-	for {
-		if ctx.Err() != nil {
+		c.dropPending(id)
+		if _, ok := ctx.Deadline(); ok && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("%s 超时", method)
+		return fmt.Errorf("写入 stdin: %w%s", err, c.stderrSnippet())
+	}
+	defer c.dropPending(id)
+
+	deadline := time.Now().Add(defaultToolTimeout)
+	if d, ok := ctx.Deadline(); ok {
+		deadline = d
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+
+	select {
+	case resp := <-ch:
+		return c.handleResponse(resp, out)
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("%s 超时", method)
+	case <-c.exited:
+		return fmt.Errorf("MCP server %q 进程已退出%s", c.name, c.stderrSnippet())
+	case <-c.readDone:
+		// 读循环结束时可能还有一条已投递的响应，先取出来再用
+		select {
+		case resp := <-ch:
+			return c.handleResponse(resp, out)
+		default:
 		}
-		if !c.scanOrWait(ctx, deadline) {
-			return fmt.Errorf("MCP server %q 已退出或无响应%s", c.name, c.stderrSnippet())
-		}
-		lineBytes := c.stdout.Bytes()
-		if len(lineBytes) == 0 {
-			continue
-		}
-		var resp rpcResponse
-		if err := json.Unmarshal(lineBytes, &resp); err != nil {
-			continue // 非 JSON 行（server 杂音）忽略
-		}
-		if resp.ID != req.ID {
-			continue // 通知或别人的响应，忽略
-		}
-		if resp.Error != nil {
-			return fmt.Errorf("MCP 错误 %d: %s", resp.Error.Code, resp.Error.Message)
-		}
-		if out != nil && len(resp.Result) > 0 {
-			return json.Unmarshal(resp.Result, out)
-		}
-		return nil
+		return fmt.Errorf("MCP server %q 输出流已结束%s", c.name, c.stderrSnippet())
 	}
 }
 
-// scanOrWait 等待下一行；返回 false 表示流结束（进程退出）或超时。
-func (c *Client) scanOrWait(ctx context.Context, deadline time.Time) bool {
-	type res struct{ ok bool }
-	ch := make(chan res, 1)
-	go func() {
-		ok := c.stdout.Scan()
-		ch <- res{ok}
-	}()
-	select {
-	case r := <-ch:
-		return r.ok
-	case <-ctx.Done():
-		return false
-	case <-time.After(time.Until(deadline)):
-		return false
-	case <-c.exited:
-		return false
+func (c *Client) handleResponse(resp rpcResponse, out any) error {
+	if resp.Error != nil {
+		return fmt.Errorf("MCP 错误 %d: %s", resp.Error.Code, resp.Error.Message)
 	}
+	if out != nil && len(resp.Result) > 0 {
+		return json.Unmarshal(resp.Result, out)
+	}
+	return nil
+}
+
+func (c *Client) dropPending(id int64) {
+	c.pendingMu.Lock()
+	delete(c.pending, id)
+	c.pendingMu.Unlock()
 }
 
 func (c *Client) notify(method string, params map[string]any) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	nt := map[string]any{"jsonrpc": "2.0", "method": method}
 	if params != nil {
 		nt["params"] = params
@@ -370,10 +414,13 @@ var toolNameSan = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 
 // QualifyName 生成注入给模型的全局工具名：mcp_<server>_<tool>，符合 OpenAI 的
 // ^[a-zA-Z0-9_-]{1,64}$ 约束（中文 server 名会被替换成下划线）。
+// 超长时截断并追加内容哈希，避免两个长名字被截成同一个工具名。
 func QualifyName(server, tool string) string {
 	s := "mcp_" + toolNameSan.ReplaceAllString(server, "_") + "_" + toolNameSan.ReplaceAllString(tool, "_")
 	if len(s) > 64 {
-		s = s[:64]
+		sum := sha256.Sum256([]byte(server + "\x00" + tool))
+		suffix := fmt.Sprintf("_%x", sum[:3])
+		s = s[:64-len(suffix)] + suffix
 	}
 	return s
 }

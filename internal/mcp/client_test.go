@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -140,5 +141,80 @@ func TestMCPCallTool(t *testing.T) {
 	}
 	if out != "ECHO:你好" {
 		t.Fatalf("echo 结果异常: %q", out)
+	}
+}
+
+// 并发调用必须按请求 ID 正确分发（回归：旧实现超时后会并发读同一个 Scanner）。
+func TestMCPConcurrentCalls(t *testing.T) {
+	cli := spawnFake(t)
+	const n = 8
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			args := json.RawMessage(fmt.Sprintf(`{"text":"%d"}`, i))
+			out, err := cli.CallTool(context.Background(), "echo", args)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if want := fmt.Sprintf("ECHO:%d", i); out != want {
+				errCh <- fmt.Errorf("第 %d 个调用结果异常: %q != %q", i, out, want)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+}
+
+// readOnly server 的写类工具不能出现在模型可用工具里。
+func TestManagerToolsReadOnlyFilter(t *testing.T) {
+	m := NewManager(context.Background())
+	m.clients["fs"] = &Client{
+		name: "fs",
+		cfg:  settings.MCPServer{Name: "fs", ReadOnly: true},
+		Tools: []ToolInfo{
+			{Name: "read_file"},
+			{Name: "write_file"},
+			{Name: "edit_file"},
+			{Name: "create_directory"},
+			{Name: "list_directory"},
+		},
+		exited:   closedChan(),
+		readDone: closedChan(),
+		readyCh:  closedChan(),
+	}
+	defs := m.Tools()
+	got := map[string]bool{}
+	for _, d := range defs {
+		got[d.MCPTool] = true
+	}
+	if !got["read_file"] || !got["list_directory"] {
+		t.Fatalf("只读工具应保留: %+v", got)
+	}
+	for _, name := range []string{"write_file", "edit_file", "create_directory"} {
+		if got[name] {
+			t.Fatalf("只读 server 不应暴露 %q", name)
+		}
+	}
+}
+
+// 超长工具名截断后必须仍唯一且符合 OpenAI 命名约束。
+func TestQualifyNameTruncationUnique(t *testing.T) {
+	server := strings.Repeat("s", 80)
+	a := QualifyName(server, strings.Repeat("a", 40))
+	b := QualifyName(server, strings.Repeat("b", 40))
+	if a == b {
+		t.Fatalf("不同的长工具名被截成同一个名字: %q", a)
+	}
+	for _, s := range []string{a, b} {
+		if len(s) > 64 || !validToolName(s) {
+			t.Fatalf("工具名不符合约束: %q (len=%d)", s, len(s))
+		}
 	}
 }

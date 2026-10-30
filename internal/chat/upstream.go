@@ -85,6 +85,14 @@ func Upstream(llm config.LLMConfig) StreamFn {
 	}
 }
 
+// streamClient 专供流式补全：不设总超时（一次回答可能持续几分钟），
+// 但限制「等待响应头」的时间，避免上游完全卡死时请求无限挂起。
+var streamClient = func() *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = 60 * time.Second
+	return &http.Client{Transport: t}
+}()
+
 // streamOpenAI 调用 OpenAI 兼容 /chat/completions（stream=true），
 // 解析文本增量与 tool_calls 增量。baseURL 示例：
 //   - DeepSeek 官方:  https://api.deepseek.com
@@ -117,7 +125,7 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	req.Header.Set("User-Agent", "xiaoke")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := streamClient.Do(req)
 	if err != nil {
 		return "", nil, fmt.Errorf("请求上游失败: %w", err)
 	}

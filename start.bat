@@ -3,8 +3,15 @@ chcp 65001 >nul
 title 小柯
 cd /d "%~dp0"
 
+rem 传 --rebuild 强制重建前后端（改了源码但界面/二进制没更新时用）
+if /I "%~1"=="--rebuild" (
+  echo [小柯] 强制重建...
+  if exist "xiaoke.exe" del /q "xiaoke.exe"
+  if exist "web\dist" rmdir /s /q "web\dist"
+)
+
 if not exist "web\dist\index.html" (
-  echo [小柯] 首次运行，构建前端...
+  echo [小柯] 构建前端...
   pushd web
   call npm install || goto :err
   call npm run build || goto :err

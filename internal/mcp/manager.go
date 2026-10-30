@@ -16,6 +16,7 @@ import (
 type Status struct {
 	Name     string   `json:"name"`
 	Enabled  bool     `json:"enabled"`
+	ReadOnly bool     `json:"readOnly,omitempty"`
 	Running  bool     `json:"running"`
 	Starting bool     `json:"starting"`
 	Error    string   `json:"error,omitempty"`
@@ -55,10 +56,21 @@ func (m *Manager) Apply(servers []settings.MCPServer) {
 			delete(m.clients, name)
 		}
 	}
-	// 启动新增（Start 立即返回，握手在后台）
+	// 启动新增 / 重试失败或已退出的
 	for name, s := range want {
-		if _, ok := m.clients[name]; ok {
-			continue
+		if cli, ok := m.clients[name]; ok {
+			cli.mu.Lock()
+			readyErr, readyDone := cli.readyErr, cli.readyClosed()
+			startErr := cli.errText
+			cli.mu.Unlock()
+			// 启动失败、进程退出、握手失败都允许下一次 Apply 重试；
+			// 正在握手中的保持不动（npx 冷启动可能几十秒）。
+			recoverable := !cli.Alive() || startErr != "" || (readyDone && readyErr != nil)
+			if !recoverable {
+				continue
+			}
+			cli.Stop()
+			delete(m.clients, name)
 		}
 		cli, err := Start(m.ctx, s)
 		if err != nil {
@@ -66,6 +78,7 @@ func (m *Manager) Apply(servers []settings.MCPServer) {
 			m.clients[name] = &Client{
 				name: name, cfg: s,
 				exited:   closedChan(),
+				readDone: closedChan(),
 				readyCh:  closedChan(),
 				readyErr: err,
 				errText:  err.Error(),
@@ -83,7 +96,8 @@ func closedChan() chan struct{} {
 }
 
 func sameServer(a, b settings.MCPServer) bool {
-	if a.Command != b.Command || len(a.Args) != len(b.Args) || len(a.Env) != len(b.Env) {
+	if a.Command != b.Command || len(a.Args) != len(b.Args) || len(a.Env) != len(b.Env) ||
+		a.ReadOnly != b.ReadOnly {
 		return false
 	}
 	for i := range a.Args {
@@ -105,7 +119,7 @@ func (m *Manager) Status() []Status {
 	defer m.mu.Unlock()
 	out := make([]Status, 0, len(m.servers))
 	for _, s := range m.servers {
-		st := Status{Name: s.Name, Enabled: s.Enabled, Tools: []string{}}
+		st := Status{Name: s.Name, Enabled: s.Enabled, ReadOnly: s.ReadOnly, Tools: []string{}}
 		cli, ok := m.clients[s.Name]
 		if !ok || cli == nil {
 			if s.Enabled {
@@ -156,6 +170,10 @@ func (m *Manager) Tools() []tools.ToolDef {
 	for _, cli := range m.clients {
 		cli.mu.Lock()
 		for _, t := range cli.Tools {
+			// readOnly server：写/删/移动类工具不暴露给模型（内置写工具也走同一判定）
+			if cli.cfg.ReadOnly && tools.IsWriteCapable(t.Name) {
+				continue
+			}
 			name := QualifyName(cli.name, t.Name)
 			desc := fmt.Sprintf("[MCP:%s] %s", cli.name, strings.TrimSpace(t.Description))
 			if strings.TrimSpace(t.Description) == "" {
@@ -197,4 +215,14 @@ func (m *Manager) Call(ctx context.Context, server, tool string, args json.RawMe
 		return "", err
 	}
 	return cli.CallTool(ctx, tool, args)
+}
+
+// Close 停止所有 MCP 子进程（应用退出时调用）。
+func (m *Manager) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for name, cli := range m.clients {
+		cli.Stop()
+		delete(m.clients, name)
+	}
 }

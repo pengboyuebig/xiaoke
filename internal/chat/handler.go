@@ -34,6 +34,10 @@ type Handler struct {
 	skills   *skills.Store
 }
 
+// maxHistoryBytes 是发给上游的历史消息总字节预算：
+// 只按条数截断时，几条大文件结果（单条可达 64KB）就可能撑爆上下文。
+const maxHistoryBytes = 256 * 1024
+
 func NewHandler(cfg *config.Config, st *store.Store, set *settings.Store, pm *projects.Manager, mm *mcp.Manager, ag *agents.Store, sk *skills.Store) *Handler {
 	return &Handler{cfg: cfg, store: st, set: set, projects: pm, mcp: mm, agents: ag, skills: sk}
 }
@@ -132,6 +136,13 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求需要非空 content 字段"})
 		return
 	}
+	// 同一会话串行处理：第二个并发请求直接返回 409，避免两条流交错写坏 tool 调用序列。
+	unlock, ok := h.store.TryLockSession(req.SessionID)
+	if !ok {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "该会话正在生成回复，请等待完成或新建会话"})
+		return
+	}
+	defer unlock()
 	sset := h.set.Get()
 	eff := h.set.Effective()
 
@@ -212,12 +223,17 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	defs := tools.Defs(tools.Builtin())
 	defs = append(defs, h.mcp.Tools()...)
 
-	// 计划模式：只保留只读工具（list/read/search + MCP），禁写文件、禁执行命令
+	// 计划模式：只保留只读工具（list/read/search + 只读 MCP），禁写文件、禁执行命令
 	planMode := strings.EqualFold(req.Mode, "plan")
 	if planMode {
 		readOnly := make([]tools.ToolDef, 0, len(defs))
 		for _, d := range defs {
-			if isPlanModeBlocked(d.Function.Name) {
+			// MCP 工具用 server 侧的原始名判断（去掉 mcp_<server>_ 前缀的干扰）
+			name := d.Function.Name
+			if d.FromMCP != "" {
+				name = d.MCPTool
+			}
+			if tools.IsWriteCapable(name) {
 				continue
 			}
 			readOnly = append(readOnly, d)
@@ -241,10 +257,9 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		Instructions:   prompt.PlanGuideFor(planMode),
 	})
 	convo := []ChatMessage{{Role: "system", Content: sysPrompt}}
-	history := full.Messages
-	if eff.MaxHistory > 0 && len(history) > eff.MaxHistory {
-		history = history[len(history)-eff.MaxHistory:]
-	}
+	// 历史：先按条数/字节裁剪并向前对齐到 user 边界，再清理孤立/不完整的 tool 消息。
+	// 否则截断点落在 assistant.tool_calls 与 tool 结果之间时，严格上游会直接 400。
+	history := sanitizeHistory(trimHistory(full.Messages, eff.MaxHistory, maxHistoryBytes))
 	convo = append(convo, toWire(history)...)
 
 	maxSteps := sset.MaxToolSteps
@@ -408,22 +423,6 @@ func toWire(msgs []store.Message) []ChatMessage {
 		out = append(out, cm)
 	}
 	return out
-}
-
-// isPlanModeBlocked 判断工具在计划模式下是否禁用：
-// 内置写/执行工具按精确名，MCP 工具按名字模式（write/edit/create/move/delete/write_text…）。
-func isPlanModeBlocked(name string) bool {
-	switch name {
-	case "write_file", "run_command":
-		return true
-	}
-	lower := strings.ToLower(name)
-	for _, kw := range []string{"write", "edit", "create_dir", "createdir", "move", "delete", "remove", "rename", "apply_patch", "exec", "run_"} {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-	return false
 }
 
 func effAsConfig(e settings.LLMSettings) config.LLMConfig {

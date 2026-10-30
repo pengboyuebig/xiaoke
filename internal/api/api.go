@@ -36,6 +36,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/settings/test", h.testLLM)
 	mux.HandleFunc("GET /api/models", h.listModels)
 	mux.HandleFunc("GET /api/mcp/status", h.mcpStatus)
+	mux.HandleFunc("POST /api/mcp/retry", h.retryMCP)
 	mux.HandleFunc("GET /api/projects", h.listProjects)
 	mux.HandleFunc("POST /api/projects", h.createProject)
 	mux.HandleFunc("DELETE /api/projects/{id}", h.deleteProject)
@@ -171,9 +172,6 @@ func fetchModels(ctx context.Context, baseURL, apiKey string) ([]string, error) 
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, fmt.Errorf("baseURL 未配置")
 	}
-	if strings.Contains(strings.ToLower(baseURL), "mock") {
-		return nil, fmt.Errorf("mock 模式没有上游模型")
-	}
 	url := strings.TrimRight(baseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -219,6 +217,13 @@ func fetchModels(ctx context.Context, baseURL, apiKey string) ([]string, error) 
 // ---------- MCP 状态 ----------
 
 func (h *Handler) mcpStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"servers": h.mcp.Status()})
+}
+
+// retryMCP 收敛 MCP 进程：退出/启动失败/握手失败的 server 会重新拉起；
+// 正在运行或握手中的保持不动。设置页「刷新状态」走这个接口。
+func (h *Handler) retryMCP(w http.ResponseWriter, r *http.Request) {
+	h.mcp.Apply(h.set.Get().MCPServers)
 	writeJSON(w, http.StatusOK, map[string]any{"servers": h.mcp.Status()})
 }
 

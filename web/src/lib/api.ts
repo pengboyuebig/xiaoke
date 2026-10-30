@@ -142,6 +142,10 @@ export const api = {
   mcpStatus(): Promise<{ servers: MCPStatus[] }> {
     return jfetch('/api/mcp/status')
   },
+  /** 收敛 MCP 进程：退出/启动失败的 server 会重新拉起 */
+  retryMCP(): Promise<{ servers: MCPStatus[] }> {
+    return jfetch('/api/mcp/retry', { method: 'POST' })
+  },
 
   /**
    * 发起一次流式对话（含工具调用循环）。onDelta 逐段接收文本增量；

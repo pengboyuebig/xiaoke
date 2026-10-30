@@ -36,11 +36,12 @@ type LLMSettings struct {
 
 // MCPServer 描述一个 stdio MCP server（与 opensquilla 的 [[mcp.servers]] 同形态）。
 type MCPServer struct {
-	Name    string            `json:"name"`
-	Command string            `json:"command"`
-	Args    []string          `json:"args"`
-	Env     map[string]string `json:"env,omitempty"`
-	Enabled bool              `json:"enabled"`
+	Name     string            `json:"name"`
+	Command  string            `json:"command"`
+	Args     []string          `json:"args"`
+	Env      map[string]string `json:"env,omitempty"`
+	Enabled  bool              `json:"enabled"`
+	ReadOnly bool              `json:"readOnly,omitempty"` // 为 true 时不把写/删/移动类工具暴露给模型
 }
 
 // Store 是并发安全的设置仓库。

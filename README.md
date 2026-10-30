@@ -8,7 +8,7 @@
 - 🤖 **多智能体**：设置页可新建多个智能体（名字、头像 emoji 或上传图片、人格提示词、工具开关），侧栏一键切换，会话自动绑定所选智能体
 - 📚 **技能系统**：写一条 Markdown 技能（如「金字塔写作」），启用后注入系统提示词，随时生效
 - ⚙️ **设置中心**：整页导航（智能体 / 技能 / 模型 / MCP / 目录 / 高级），模型 API 界面配置热生效、一键测试连接拉模型列表
-- 🔌 **MCP 工具**：内置标准 MCP 客户端（stdio），可添加任意 MCP server；一键添加官方 filesystem 只读服务看代码
+- 🔌 **MCP 工具**：内置标准 MCP 客户端（stdio），可添加任意 MCP server；一键添加官方 filesystem 服务（默认只读过滤）看代码
 - 📁 **项目工作区**：新建项目（代码/文章模板），小柯在项目里读写文件、跑白名单命令，真正帮你写代码、写文章
 - 🧠 **思考程度**：对话页右下角随时调节（关/极简/低/中/高），浏览器记住选择
 
@@ -28,7 +28,9 @@ xiaoke.exe
 
 打开 **http://127.0.0.1:18790**。默认 mock 演示模式，无需 API Key；在项目里说「帮我写一个文件」可以看到完整的工具调用演示。
 
-前端热更新开发：`cd web && npm run dev`（:5175，/api、/assets、/healthz 自动代理）。
+> 改了源码之后请用 `start.bat --rebuild`（或 `./start.sh --rebuild`）强制重建。默认脚本只在产物不存在时构建，直接双击可能仍在跑旧二进制。
+
+前端热更新开发：`cd web && npm run dev`（:5175，/api、/assets、/healthz 自动代理）。类型检查：`npm run typecheck`。
 
 ## 三步接上真实模型（设置中心）
 
@@ -50,13 +52,15 @@ xiaoke.exe
 
 设置 → **MCP** 分区：
 
-- 在「授权小柯只读查看的目录」里填绝对路径（如你想让小柯读的代码仓库），点 **＋ 添加 filesystem 只读服务** —— 会自动生成一条 npx 版官方 filesystem server 配置
-- 也可以「手动添加其它 MCP 服务」（name / command / args，空格分隔），与 opensquilla 的 `[[mcp.servers]]` 形态一致
-- 保存后服务作为常驻进程启动；「刷新状态」能看到 ● 运行中 · N 个工具
+- 在「一键添加 filesystem 服务」里填绝对路径，点 **＋ 添加** —— 会自动生成一条 npx 版官方 filesystem server 配置，并**默认勾选「只读」**
+- 每条服务的参数**每行一个**，路径里的空格会原样保留（不再用空格切分）；也可以直接改卡片里的参数框
+- 「只读」勾选后，`write/edit/create/move/delete/...` 这类工具不会出现在模型可用工具里；取消勾选才会把写能力暴露出去
+- 也可以「手动添加其它 MCP 服务」（name / command / 参数，参数每行一个），与 opensquilla 的 `[[mcp.servers]]` 形态一致
+- 保存后服务作为常驻进程启动；「刷新并重试」会重启已退出/启动失败的 server，正在运行的不动
 
-之后接上真实模型，就可以直接问「看看 opencode_set 的路由是怎么写的」这类问题，小柯会自己调 MCP 工具去读代码。
+之后接上真实模型，就可以直接问「看看这个项目的路由是怎么写的」这类问题，小柯会自己调 MCP 工具去读代码。
 
-> 注意：官方 filesystem server 对授权目录是**可读写**的，授权前想清楚范围；只是想让它「看」就授权尽量小的目录。
+> 说明：「只读」是在**工具暴露层**过滤写类工具，不是操作系统权限隔离。第三方 MCP server 仍以你的用户权限运行；只安装可信的 server，别把系统根目录授权给它。
 
 ## 项目工作区（写代码 / 写文章）
 
@@ -115,6 +119,7 @@ xiaoke.exe
 | POST | `/api/settings/test` | 测试上游连通 + 拉模型列表 |
 | GET | `/api/models` | 当前配置的模型列表 |
 | GET | `/api/mcp/status` | MCP server 运行状态 |
+| POST | `/api/mcp/retry` | 重启退出/启动失败的 MCP server（正在运行的不动） |
 | GET/POST | `/api/projects` | 项目列表 / 新建（支持模板与自定义目录） |
 | DELETE | `/api/projects/{id}` | 删除项目（**连带删除目录内全部文件**） |
 | GET | `/api/projects/{id}/tree` | 项目文件树 |
@@ -138,11 +143,11 @@ xiaoke.exe
 │   ├── prompt/              # 系统提示词组装（智能体人格+技能+项目+工具规范）
 │   ├── agents/              # 智能体仓库（data/agents.json）
 │   ├── skills/              # 技能仓库（data/skills.json，注入系统提示词）
-│   ├── chat/                # agent 工具调用循环 + OpenAI 流式 + mock 演示
+│   ├── chat/                # agent 工具调用循环 + OpenAI 流式 + mock + 历史裁剪/清理
 │   ├── tools/               # 内置工具（路径安全/白名单/超时/截断）
 │   ├── mcp/                 # MCP stdio 客户端 + 常驻进程 Manager
 │   ├── projects/            # 项目工作区（索引 data/projects.json）
-│   ├── store/               # 会话存储（data/sessions/*.json，含工具消息与智能体绑定）
+│   ├── store/               # 会话存储（.json 快照 + .log 追加 + .meta.json 摘要）
 │   └── api/                 # 设置/项目/MCP/智能体/技能/头像上传路由
 ├── config.json.example      # 启动配置模板
 ├── assets/avatar.png        # 默认智能体头像（灰原哀）
@@ -161,26 +166,45 @@ xiaoke.exe
 ## 测试
 
 ```bash
-go test -race ./internal/...   # 工具路径逃逸、文件读写、白名单、cwd 缺省、
+go test -race ./internal/...   # 工具路径逃逸/符号链接逃逸、文件读写、白名单、cwd 缺省、
                                # settings 空切片/Key 语义、projects 并发创建、
                                # agents/skills CRUD 与种子、
-                               # MCP 握手/调用（内建假 server）、ToolDef 序列化
+                               # MCP 握手/调用/并发（内建假 server）、ToolDef 序列化、
+                               # 只读工具过滤、历史裁剪与孤立 tool 清理、会话锁、
+                               # 快照/日志存储与合并、静态资源目录列表与安全响应头
 ```
 
-已验证（2026-10-29 回归）：
-- **真实模型工具调用**：`zai/glm-5.3-flash` → `write_file` 真实落盘 → 回填 → 继续生成 → done
-- **真实模型 + MCP 读代码**：模型自主调 `mcp_fs-opencode_list_directory`/`read_text_file`，遇权限拒绝自己换路径，给出带「小柯」前缀的总结
-- **run_command 白名单**：`git --version` cwd 缺省直接跑项目根
-- **停止语义**：中途断开后服务端只存 user 消息，半截回复不落库
-- **MCP 冷启动**：npx 首次下载慢启动时保存设置秒回，状态页显示「启动中」，90 秒内就绪
-- mock 工具闭环、设置热更新、项目 CRUD/边界、非法输入拒绝
+CI：`.github/workflows/ci.yml`（push / PR 自动跑 `go vet`、`go test -race`、`npm ci` + typecheck + build）。
+
+已验证（2026-10-30 回归）：
+- **存储结构**：追加只写日志不重写快照；日志超阈值自动合并；无 meta 的旧会话可读可继续追加；50 路并发追加不丢消息
+- **符号链接**：指向工作区外的链接被拒绝（Linux CI 覆盖；本机 Windows 无符号链接权限时跳过）
+- **静态资源**：`/assets/` 目录不可列出，文件正常返回；CSP/nosniff/X-Frame-Options 均存在
+- **历史裁剪**：按 maxHistory + 256KB 字节预算裁剪，并从 user 边界开始；115 条会话模拟不再出现「以 tool 开头」
+- **孤立 tool 清理**：中断留下的不完整 tool_calls / tool 结果会在发送前被清掉
+- **MCP 并发**：8 路并发 `echo` 调用结果全部按 ID 正确分发（回归旧的并发 Scan 问题）
+- **MCP 只读**：`readOnly=true` 的 server 只暴露读工具，`write_file`/`edit_file`/`create_directory` 被过滤
+- **会话锁**：同一会话两个并发请求，一个 200、一个 409「该会话正在生成回复」
+- **命令退出码**：`cmd /c exit 1` 返回错误，前端标红
+- **设置往返**：MCP 参数含空格路径、`env`、`readOnly` 保存后原样保留
+- **临时实例 E2E**：mock 对话、工具写文件、`/api/mcp/retry`、静态页面均正常
+- 2026-10-29 的回归项仍然有效：真实模型工具调用、MCP 读代码、停止语义、MCP 冷启动
 
 ## 安全与限制
 
 - **默认只监听 `127.0.0.1`**，所有 API 无鉴权。改 `XIAOKE_ADDR=0.0.0.0` 会把模型 Key 和文件工具暴露给同网段——对外请套反代 + 鉴权。
-- **写文件 / 命令被限制在项目工作区内**（路径归一化 + 越界拒绝），但**没有逐次审批门**：接了真实模型后小柯可以直接改你项目里的文件、跑白名单命令。重要项目先提交 git 再让它动手。
-- **filesystem MCP server 对授权目录可读写**，授权范围尽量小。
-- **同一会话并发对话未加会话级写锁**（单人使用无碍）。
+- **写文件 / 命令被限制在项目工作区内**（路径归一化 + 符号链接解析 + 越界拒绝），但**没有逐次审批门**：接了真实模型后小柯可以直接改你项目里的文件、跑白名单命令。重要项目先提交 git 再让它动手。
+- **MCP 的「只读」是工具暴露层过滤**：一键添加的 filesystem server 默认勾选只读，写类工具不会给模型；取消勾选后它对授权目录可读写。过滤不等于 OS 权限隔离，第三方 server 仍以你的用户权限运行。
+- **同一会话串行处理**：同时只允许一个生成请求，第二个会收到 409「该会话正在生成回复」。
+- **历史会裁剪**：按 `maxHistory` 条数 + 256KB 字节预算，从最近的 user 消息开始；被中断的工具轮会在下次请求前清理，不会把非法序列发给上游。
+- **命令非 0 退出会标为失败**（红色），输出仍保留在工具结果里。
+- **会话存储是快照 + 追加日志**：每条消息只追加一行 `<id>.log`，侧栏只读 `<id>.meta.json`；日志超过 1MB 自动合并回 `<id>.json` 快照。备份/迁移请把 `data/sessions/` 整个目录一起带走。
+- **计划批准条**：只有在回答里出现「实施步骤 / 风险与边界」或编号步骤时才出现，模型反问或闲聊不会误触发。
+- **静态资源**：`/assets/` 不允许目录列表；所有响应带 CSP、nosniff、X-Frame-Options、Referrer-Policy 等基本安全头。
 - 点「停止」：未完成的回复不落库，本地保留半截并标注「已停止」。
-- **MCP server 采用异步启动**：保存设置立即返回，状态页显示「启动中/运行中/失败」；npx 类 server 首次冷启动可能需要 30-60 秒（握手上限 90 秒），失败会在状态里显示 server 报错。
+- **MCP server 采用异步启动**：保存设置立即返回，状态页显示「启动中/运行中/失败」；npx 类 server 首次冷启动可能需要 30-60 秒（握手上限 90 秒），失败会在状态里显示 server 报错；「刷新并重试」可重新拉起。
 - 头像来自名侦探柯南官方 Wiki，**仅供个人本地使用**。`config.json`、`data/settings.json`（含 Key）与 `data/` 已 gitignore，勿外传。
+
+## 许可
+
+代码以 MIT 许可发布（见 `LICENSE`）。`assets/avatar.png` 来自名侦探柯南官方 Wiki，版权归原作者，不在 MIT 许可范围内，仅供个人本地使用。

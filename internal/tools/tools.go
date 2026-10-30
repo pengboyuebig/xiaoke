@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -82,6 +83,41 @@ func Defs(all []Tool) []ToolDef {
 	return defs
 }
 
+// IsWriteCapable 判断一个工具名是否具有写入/修改/执行副作用。
+// 用于两个地方：
+//   - 计划模式：只保留只读工具
+//   - MCP server 标记 readOnly：从暴露给模型的工具列表里过滤掉写类工具
+//
+// 内置工具按精确名判断；MCP 工具名不统一，按常见动词模式匹配。
+func IsWriteCapable(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "" {
+		return false
+	}
+	switch n {
+	case "write_file", "run_command":
+		return true
+	}
+	for _, kw := range []string{
+		"write", "edit", "create", "mkdir", "move", "rename", "delete", "remove",
+		"patch", "append", "insert", "replace", "copy", "truncate", "chmod",
+		"chown", "symlink", "upload", "save", "persist", "update", "mkfile",
+		"put_", "exec", "run_", "shell", "terminal",
+	} {
+		if strings.Contains(n, kw) {
+			return true
+		}
+	}
+	// rm/mv/cp/touch 这类两字母动词按「整词」匹配，避免误伤 format/confirm 等单词。
+	for _, w := range []string{"rm", "mv", "cp", "touch"} {
+		if n == w || strings.HasPrefix(n, w+"_") || strings.HasSuffix(n, "_"+w) ||
+			strings.Contains(n, "_"+w+"_") || strings.Contains(n, w+"_file") {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------- 路径安全 ----------
 
 // resolveRead 把用户路径解析为可读的绝对路径：先试工作区，再试只读目录。
@@ -115,7 +151,8 @@ func (e *Env) resolveWrite(p string) (string, error) {
 	return safeJoin(e.Workspace, p)
 }
 
-// safeJoin 把用户相对路径安全地拼到 root 下，拒绝一切逃逸（..、绝对路径注入、盘符）。
+// safeJoin 把用户相对路径安全地拼到 root 下，拒绝一切逃逸（..、绝对路径注入、盘符），
+// 并解析符号链接/junction，防止工作区内的链接指向外部。
 func safeJoin(root, userPath string) (string, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -127,13 +164,52 @@ func safeJoin(root, userPath string) (string, error) {
 		if _, err := relChecked(absRoot, clean); err != nil {
 			return "", err
 		}
+		if err := ensureNoSymlinkEscape(absRoot, clean); err != nil {
+			return "", err
+		}
 		return clean, nil
 	}
 	joined := filepath.Join(absRoot, clean)
 	if _, err := relChecked(absRoot, joined); err != nil {
 		return "", err
 	}
+	if err := ensureNoSymlinkEscape(absRoot, joined); err != nil {
+		return "", err
+	}
 	return joined, nil
+}
+
+// ensureNoSymlinkEscape 解析 target 最深的已存在祖先的真实路径，
+// 确认它仍在 root 的真实路径内。root 不存在时跳过（后续 os 操作会报错）。
+func ensureNoSymlinkEscape(root, target string) error {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil
+	}
+	probe := target
+	suffix := []string{}
+	for {
+		if _, err := os.Lstat(probe); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return nil // 权限等错误不在这一层判断
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return nil
+		}
+		suffix = append([]string{filepath.Base(probe)}, suffix...)
+		probe = parent
+	}
+	realProbe, err := filepath.EvalSymlinks(probe)
+	if err != nil {
+		return fmt.Errorf("解析路径失败: %w", err)
+	}
+	realTarget := filepath.Join(append([]string{realProbe}, suffix...)...)
+	if _, err := relChecked(realRoot, realTarget); err != nil {
+		return fmt.Errorf("路径经过符号链接越出授权根目录: %w", err)
+	}
+	return nil
 }
 
 // relChecked 校验 target 必须位于 root 内（含 root 本身），返回相对路径。

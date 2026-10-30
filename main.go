@@ -5,13 +5,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"xiaoke/internal/agents"
 	"xiaoke/internal/api"
@@ -104,8 +108,8 @@ func main() {
 		fmt.Fprintf(w, `{"ok":1,"agent":%q,"mode":%q,"model":%q}`, persona.Name, eff.Mode, eff.Model)
 	})
 
-	// 灰原哀头像等静态资源
-	assets := http.StripPrefix("/assets/", http.FileServer(http.Dir(cfg.AssetsDir)))
+	// 灰原哀头像等静态资源（不允许目录列表）
+	assets := http.StripPrefix("/assets/", http.FileServer(noDirList{http.Dir(cfg.AssetsDir)}))
 	mux.Handle("GET /assets/", assets)
 
 	// 前端构建产物（SPA 回退到 index.html）
@@ -126,9 +130,63 @@ func main() {
 		log.Printf("  MCP servers: %d 个", n)
 	}
 	log.Printf("================================================")
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	srv := &http.Server{Addr: addr, Handler: securityHeaders(mux)}
+	errCh := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+
+	// 优雅退出：Ctrl+C / 终止信号时先停 HTTP，再杀掉 MCP 子进程
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	select {
+	case err := <-errCh:
 		log.Fatal(err)
+	case <-sig:
+		log.Printf("收到退出信号，正在关闭…")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+	mcpMgr.Close()
+}
+
+// noDirList 包装 FileSystem，禁止目录列表（避免 /assets/ 暴露上传文件名）。
+type noDirList struct{ fs http.FileSystem }
+
+func (n noDirList) Open(name string) (http.File, error) {
+	f, err := n.fs.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if info.IsDir() {
+		_ = f.Close()
+		return nil, os.ErrNotExist
+	}
+	return f, nil
+}
+
+// securityHeaders 给所有响应加基本安全头。
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; "+
+				"script-src 'self'; connect-src 'self'; font-src 'self'; "+
+				"frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // spaHandler 服务前端静态文件；未命中的路径回退到 index.html（前端路由用）。

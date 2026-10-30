@@ -41,7 +41,7 @@ const form = reactive({
   projectsRoot: '',
   maxToolSteps: 8,
   allowlistText: 'git, npm, node, python, pip',
-  mcpServers: [] as (MCPServerCfg & { argText: string })[],
+  mcpServers: [] as (MCPServerCfg & { argLines: string })[],
 })
 const newMcp = reactive({ name: '', command: '', argsText: '', dir: '' })
 const keyInfo = reactive({ set: false, tail: '' })
@@ -71,7 +71,14 @@ async function loadSettings() {
     form.projectsRoot = s.projectsRoot
     form.maxToolSteps = s.maxToolSteps
     form.allowlistText = s.commandAllowlist.join(', ')
-    form.mcpServers = s.mcpServers.map((m) => ({ ...m, args: [...m.args], argText: m.args.join(' ') }))
+    form.mcpServers = s.mcpServers.map((m) => ({
+      ...m,
+      args: [...m.args],
+      // 参数按行编辑：保留路径中的空格，不再用空格分隔（Windows 路径常见坑）
+      argLines: m.args.join('\n'),
+      // 后端 omitempty：只有显式 true 会落盘；false/缺省都表示不启用只读过滤
+      readOnly: m.readOnly === true,
+    }))
   } catch (e) {
     saveErr.value = (e as Error).message
   }
@@ -93,7 +100,8 @@ async function refreshSkills() {
 }
 async function refreshMcpStatus() {
   try {
-    mcpStatuses.value = (await api.mcpStatus()).servers
+    // 「刷新状态」同时收敛进程：退出/启动失败的 server 会重新拉起，正在运行的保持不动
+    mcpStatuses.value = (await api.retryMCP()).servers
   } catch {
     mcpStatuses.value = []
   }
@@ -145,9 +153,16 @@ async function runTest() {
 async function pullModels() {
   pullingModels.value = true
   try {
-    const r = await api.listModels()
+    // 用表单里的当前值测试/拉取，而不是已保存的旧配置
+    const r = await api.testLLM({ baseURL: form.baseURL, apiKey: form.apiKey || undefined, model: form.model })
     modelList.value = r.models || []
-    if (r.error) testResult.value = { ok: false, text: r.error }
+    if (r.ok) {
+      testResult.value = { ok: true, text: `拉取成功，发现 ${modelList.value.length} 个模型` }
+    } else {
+      testResult.value = { ok: false, text: r.error || '拉取失败' }
+    }
+  } catch (e) {
+    testResult.value = { ok: false, text: (e as Error).message }
   } finally {
     pullingModels.value = false
   }
@@ -158,24 +173,32 @@ function addFilesystemServer() {
   const dir = newMcp.dir.trim()
   if (!dir) return
   const n = form.mcpServers.filter((m) => m.name.startsWith('fs-')).length + 1
+  const args = ['-y', '@modelcontextprotocol/server-filesystem', dir]
   form.mcpServers.push({
     name: `fs-${n}`,
     command: 'npx',
-    args: ['-y', '@modelcontextprotocol/server-filesystem', dir],
-    argText: `-y @modelcontextprotocol/server-filesystem ${dir}`,
+    args,
+    argLines: args.join('\n'),
     enabled: true,
+    // 官方 filesystem server 是可读写的：默认按只读过滤，避免承诺「只读」却给写权限
+    readOnly: true,
   })
   newMcp.dir = ''
 }
 
 function addManualServer() {
   if (!newMcp.name.trim() || !newMcp.command.trim()) return
+  const args = newMcp.argsText
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean)
   form.mcpServers.push({
     name: newMcp.name.trim(),
     command: newMcp.command.trim(),
-    args: newMcp.argsText.trim().split(/\s+/).filter(Boolean),
-    argText: newMcp.argsText.trim(),
+    args,
+    argLines: args.join('\n'),
     enabled: true,
+    readOnly: false,
   })
   newMcp.name = ''
   newMcp.command = ''
@@ -208,8 +231,10 @@ async function save() {
         mcpServers: form.mcpServers.map((m) => ({
           name: m.name.trim(),
           command: m.command.trim(),
-          args: (m.argText || '').trim().split(/\s+/).filter(Boolean),
+          args: (m.argLines || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
+          env: m.env,
           enabled: m.enabled,
+          readOnly: !!m.readOnly,
         })),
         readDirs: form.readDirs.map((d) => d.trim()).filter(Boolean),
         projectsRoot: form.projectsRoot.trim(),
@@ -219,7 +244,7 @@ async function save() {
       form.clearApiKey,
     )
     showToast('已保存并应用 ✓')
-    setTimeout(() => emit('close'), 500)
+    // 不自动关闭：避免在智能体/技能 tab 有未保存编辑时被一起关掉
   } catch (e) {
     saveErr.value = (e as Error).message
   } finally {
@@ -347,37 +372,43 @@ async function save() {
         <section v-else-if="tab === 'mcp'" class="panel">
           <div class="panel-head">
             <h2>MCP 服务</h2>
-            <p>每个服务是一个本机常驻进程（stdio），参数用空格分隔。</p>
-            <button class="btn ghost tiny" @click="refreshMcpStatus">↻ 刷新状态</button>
+            <p>每个服务是一个本机常驻进程（stdio）。参数每行一个，路径里的空格会原样保留。</p>
+            <button class="btn ghost tiny" @click="refreshMcpStatus">↻ 刷新并重试</button>
           </div>
 
           <div v-for="(m, i) in form.mcpServers" :key="i" class="mcp-card" :class="{ off: !m.enabled }">
             <div class="mcp-top">
               <label class="chk"><input type="checkbox" v-model="m.enabled" /> 启用</label>
+              <label class="chk" title="只读：不把 write/edit/create/move/delete 等工具暴露给模型">
+                <input type="checkbox" v-model="m.readOnly" /> 只读
+              </label>
               <b class="mcp-name">{{ m.name }}</b>
               <button class="btn tiny danger-ghost" @click="form.mcpServers.splice(i, 1)">删除</button>
             </div>
-            <code class="mcp-cmd">{{ m.command }} {{ m.argText }}</code>
+            <code class="mcp-cmd">{{ m.command }} {{ m.argLines.replace(/\n/g, ' ') }}</code>
+            <textarea v-model="m.argLines" class="inp wide mcp-args" rows="2" placeholder="参数，每行一个"></textarea>
             <div v-if="statusOf(m.name)" class="mcp-status" :class="statusOf(m.name)!.running ? 'ok' : 'bad'">
               {{ statusOf(m.name)!.running ? `● 运行中 · ${statusOf(m.name)!.tools.length} 个工具` : `● ${statusOf(m.name)!.error || (statusOf(m.name)!.starting ? '启动中…' : '未运行')}` }}
               <span v-if="statusOf(m.name)!.toolHint">（{{ statusOf(m.name)!.toolHint }}）</span>
+              <span v-if="m.readOnly" class="mcp-ro">· 只读过滤已开启</span>
             </div>
           </div>
           <div v-if="!form.mcpServers.length" class="empty-box">还没有 MCP 服务，用下面的方式添加。</div>
 
           <div class="card">
-            <div class="card-title">一键添加 filesystem 只读服务</div>
+            <div class="card-title">一键添加 filesystem 服务（默认只读）</div>
             <div class="add-row">
-              <input v-model="newMcp.dir" class="inp" placeholder="授权小柯只读查看的目录绝对路径，如 D:\work\test\opencode_set" />
+              <input v-model="newMcp.dir" class="inp" placeholder="授权查看的目录绝对路径，如 D:\code\my-project" />
               <button class="btn primary" @click="addFilesystemServer">＋ 添加</button>
             </div>
+            <div class="hint">官方 filesystem server 本身可读写；默认勾选「只读」后，write/edit/create/move/delete 类工具不会暴露给模型。</div>
           </div>
           <div class="card">
             <div class="card-title">手动添加其它 MCP 服务</div>
             <div class="manual-grid">
               <input v-model="newMcp.name" class="inp" placeholder="名称，如 git-tools" />
               <input v-model="newMcp.command" class="inp" placeholder="命令，如 npx / python / node" />
-              <input v-model="newMcp.argsText" class="inp wide" placeholder="参数（空格分隔）" />
+              <textarea v-model="newMcp.argsText" class="inp wide" rows="3" placeholder="参数，每行一个（路径可含空格）"></textarea>
               <button class="btn ghost" @click="addManualServer">添加</button>
             </div>
           </div>
@@ -786,6 +817,18 @@ async function save() {
   border-radius: var(--radius-sm);
   padding: 7px 10px;
   word-break: break-all;
+}
+
+.mcp-args {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.mcp-ro {
+  color: var(--text-faint);
+  margin-left: 6px;
 }
 
 .mcp-status {

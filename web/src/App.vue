@@ -211,12 +211,17 @@ const turns = computed<Turn[]>(() => {
   const out: Turn[] = []
   let cur: Turn | null = null
   let round: { sections: string[]; tools: ToolPair[] } | null = null
+  let roundNo = 0
   const PER_BLOCK = 14
 
   const flushRound = () => {
     if (!cur || !round) return
+    // 同一轮工具调用超过 14 次会被拆成多块，但共享同一个 round 编号
+    const thisRound = roundNo++
     if (round.tools.length === 0) {
-      if (round.sections.length) cur.groups.push({ kind: 'assistant', sections: round.sections, tools: [] })
+      if (round.sections.length) {
+        cur.groups.push({ kind: 'assistant', sections: round.sections, tools: [], round: thisRound })
+      }
     } else {
       const total = Math.ceil(round.tools.length / PER_BLOCK)
       let n = 0
@@ -224,7 +229,7 @@ const turns = computed<Turn[]>(() => {
         n++
         const chunk = round.tools.slice(i, i + PER_BLOCK)
         for (const t of chunk) t.id = `blk-${n}/${total}|${t.id}`
-        cur.groups.push({ kind: 'assistant', sections: i === 0 ? round.sections : [], tools: chunk })
+        cur.groups.push({ kind: 'assistant', sections: i === 0 ? round.sections : [], tools: chunk, round: thisRound })
       }
     }
     round = null
@@ -241,12 +246,14 @@ const turns = computed<Turn[]>(() => {
       flushRound()
       // 隐藏消息（如批准计划的自动指令）不显示问题气泡，但仍开启一个新回合承接回复
       cur = { question: m.hidden ? '' : m.content, groups: [], startTime: m.createdAt }
+      roundNo = 0
       out.push(cur)
       continue
     }
     if (!cur) {
       // 历史数据可能缺 user 头：兜底建空回合
       cur = { question: '', groups: [] }
+      roundNo = 0
       out.push(cur)
     }
     touchTime(cur, m.createdAt)
@@ -275,7 +282,7 @@ const turns = computed<Turn[]>(() => {
       const pair = round.tools.find((t) => t.id === m.toolCallId)
       if (pair) {
         pair.result = m.content
-        pair.ok = !/工具执行出错|路径不在|路径不能为空|不在白名单|尚未选择项目/.test(m.content)
+        pair.ok = !/工具执行出错|路径不在|路径不能为空|不在白名单|尚未选择项目|命令退出码非 0/.test(m.content)
       } else {
         round.tools.push({ id: m.toolCallId || '', name: m.name || 'tool', arguments: '', result: m.content, ok: true })
       }
@@ -303,6 +310,7 @@ const turns = computed<Turn[]>(() => {
       kind: 'live',
       sections: streamingText.value ? [streamingText.value] : [],
       tools,
+      round: roundNo,
       streaming: true,
       error: streaming.value ? undefined : error.value || undefined,
     })
@@ -383,9 +391,15 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
     if (abortedByUser && !serverHadThis && r.sessionId === currentId.value && streamingText.value) {
       messages.value.push({ role: 'assistant', content: streamingText.value, stopped: true })
     }
-    // 计划模式下正常完成：在回合末尾给出「批准并开始开发」
+    // 计划模式下，只有回答看起来是结构化计划时才出现批准条；
+    // 模型反问/闲聊时不误判（用户仍可手动切开发模式）。
     if (sentMode === 'plan' && !abortedByUser && !error.value) {
-      planAwaitingApproval.value = true
+      const lastAssistant = [...messages.value]
+        .reverse()
+        .find((m) => m.role === 'assistant' && (m.content || '').trim())
+      const text = lastAssistant?.content || ''
+      const looksLikePlan = /实施步骤|风险与边界/.test(text) || /(^|\n)\s*1[.、]/.test(text)
+      if (looksLikePlan) planAwaitingApproval.value = true
     }
     streamingText.value = ''
     liveTools.value = []
