@@ -192,6 +192,7 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
           :start-time="t.startTime"
           :end-time="t.endTime"
           :streaming="t.streaming"
+          :stopped="t.stopped"
           :agent-name="agentName()"
           :avatar="agentAvatar()"
         />

@@ -279,6 +279,8 @@ const turns = computed<Turn[]>(() => {
       if (hasText) {
         round.sections.push(m.content)
       }
+      // 用户停止的回合：标记到回合上，让 TurnView 区分「已停止」与「空回复」
+      if (m.stopped && cur) cur.stopped = true
     } else if (m.role === 'tool') {
       const pair = round.tools.find((t) => t.id === m.toolCallId)
       if (pair) {
@@ -388,8 +390,9 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
         }
       }
     }
-    // 中途停止且服务端没保存这条内容：本地保留半截并标记「已停止」
-    if (abortedByUser && !serverHadThis && r.sessionId === currentId.value && streamingText.value) {
+    // 中途停止且服务端没保存这条内容：本地保留半截并标记「已停止」。
+    // 首 token 前就停止时内容为空，也要标记，否则界面会误显示「没有收到内容，请重试」。
+    if (abortedByUser && !serverHadThis && r.sessionId === currentId.value) {
       messages.value.push({ role: 'assistant', content: streamingText.value, stopped: true })
     }
     // 计划模式下，只有回答看起来是结构化计划时才出现批准条；
@@ -451,7 +454,12 @@ async function handleSelect(id: string) {
 
 async function handleRemove(id: string) {
   const s = sessions.value.find((x) => x.id === id)
-  if (!confirm(`删除会话「${s?.title || '新对话'}」？删除后不可恢复。`)) return
+  if (
+    !confirm(
+      `删除会话「${s?.title || '新对话'}」？\n删除后会保留在「设置 → 高级 → 回收站」30 天，可随时恢复。`,
+    )
+  )
+    return
   try {
     await api.deleteSession(id)
   } catch {

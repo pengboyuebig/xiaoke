@@ -70,6 +70,8 @@ export interface Turn {
   /** 末条消息时间（回合结束）；流式中为空 */
   endTime?: string
   streaming?: boolean
+  /** 用户中途停止生成（无正文时显示「已停止」而不是「没有收到内容」） */
+  stopped?: boolean
 }
 
 export interface SessionMeta {

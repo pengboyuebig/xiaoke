@@ -13,6 +13,8 @@ const props = defineProps<{
   /** 回合结束时间（末条消息）；流式中为空表示进行中 */
   endTime?: string
   streaming?: boolean
+  /** 用户中途停止生成 */
+  stopped?: boolean
   agentName?: string
   avatar?: string
 }>()
@@ -75,9 +77,22 @@ const showStatus = computed(() => props.streaming && !hasWork.value && !turnErro
 const statusText = computed(() => (hasSections.value ? '正在输入' : '正在思考'))
 
 // 流式结束但既没有正文也没有工具（模型空回复 / 首 token 前停止）
+// 用户主动停止时不算「空回复」，改由下面的 stoppedEmpty 提示
 const isEmptyReply = computed(
   () =>
     !props.streaming &&
+    !props.stopped &&
+    !turnError.value &&
+    toolCount.value === 0 &&
+    !hasSections.value &&
+    !!props.startTime,
+)
+
+// 用户停止且没有留下任何内容：说明是首 token 前就停了，提示「已停止」而非让用户重试
+const stoppedEmpty = computed(
+  () =>
+    !props.streaming &&
+    !!props.stopped &&
     !turnError.value &&
     toolCount.value === 0 &&
     !hasSections.value &&
@@ -289,8 +304,10 @@ onUpdated(highlight)
       <span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>
     </div>
 
-    <!-- 空回复兜底：模型没返回内容 / 首 token 前停止 -->
+    <!-- 空回复兜底：模型没返回内容 -->
     <div v-if="isEmptyReply" class="turn-empty">没有收到内容，请重试</div>
+    <!-- 用户停止：没有内容时明确说是「已停止」，而不是让用户以为模型坏了 -->
+    <div v-else-if="stoppedEmpty" class="turn-empty turn-stopped">已停止生成</div>
   </div>
 </template>
 
@@ -372,6 +389,11 @@ onUpdated(highlight)
   border-radius: 10px;
   color: var(--text-faint);
   font-size: 12px;
+}
+
+/* 用户主动停止：中性提示，不用告警色，避免看起来像出错 */
+.turn-stopped {
+  color: var(--text-muted);
 }
 
 /* ---------- 顶栏 ---------- */
