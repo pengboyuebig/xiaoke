@@ -10,6 +10,7 @@ import type {
   SettingsPayload,
   SettingsView,
   Skill,
+  TrashItem,
   TreeItem,
 } from '../types'
 
@@ -60,6 +61,16 @@ export const api = {
   },
   deleteSession(id: string): Promise<void> {
     return jfetch(`/api/sessions/${id}`, { method: 'DELETE' })
+  },
+  // ---------- 回收站 ----------
+  listTrash(): Promise<{ items: TrashItem[] }> {
+    return jfetch('/api/trash')
+  },
+  restoreTrash(dir: string): Promise<{ ok: string; id: string }> {
+    return jfetch(`/api/trash/${encodeURIComponent(dir)}/restore`, { method: 'POST' })
+  },
+  purgeTrash(dir: string): Promise<{ ok: string }> {
+    return jfetch(`/api/trash/${encodeURIComponent(dir)}`, { method: 'DELETE' })
   },
   health(): Promise<HealthInfo> {
     return jfetch('/healthz')

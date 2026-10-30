@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../lib/api'
-import type { Agent, MCPServerCfg, MCPStatus, SettingsView, Skill } from '../types'
+import type { Agent, MCPServerCfg, MCPStatus, SettingsView, Skill, TrashItem } from '../types'
 import AgentSection from './AgentSection.vue'
 import SkillSection from './SkillSection.vue'
 import Icon from './Icon.vue'
@@ -28,6 +28,8 @@ const TABS: { id: Tab; icon: string; label: string; desc: string }[] = [
 const agents = ref<Agent[]>([])
 const skills = ref<Skill[]>([])
 const mcpStatuses = ref<MCPStatus[]>([])
+const trashItems = ref<TrashItem[]>([])
+const trashBusy = ref('')
 
 const form = reactive({
   mode: 'mock',
@@ -54,7 +56,7 @@ const testing = ref(false)
 const tabMeta = computed(() => TABS.find((t) => t.id === tab.value))
 
 onMounted(async () => {
-  await Promise.all([loadSettings(), refreshAgents(), refreshSkills(), refreshMcpStatus()])
+  await Promise.all([loadSettings(), refreshAgents(), refreshSkills(), refreshMcpStatus(), refreshTrash()])
   loading.value = false
 })
 
@@ -109,6 +111,56 @@ async function refreshMcpStatus() {
 }
 
 const statusOf = (name: string): MCPStatus | undefined => mcpStatuses.value.find((s) => s.name === name)
+
+// ---------- 回收站 ----------
+async function refreshTrash() {
+  try {
+    trashItems.value = (await api.listTrash()).items
+  } catch {
+    trashItems.value = []
+  }
+}
+
+async function restoreTrashItem(it: TrashItem) {
+  if (trashBusy.value) return
+  trashBusy.value = it.dir
+  try {
+    await api.restoreTrash(it.dir)
+    await refreshTrash()
+    showToast(`已恢复「${it.title || it.id}」，可在侧栏会话列表看到`)
+  } catch (e) {
+    saveErr.value = (e as Error).message
+  } finally {
+    trashBusy.value = ''
+  }
+}
+
+async function purgeTrashItem(it: TrashItem) {
+  if (trashBusy.value) return
+  if (!confirm(`彻底删除「${it.title || it.id}」？此操作不可恢复。`)) return
+  trashBusy.value = it.dir
+  try {
+    await api.purgeTrash(it.dir)
+    await refreshTrash()
+  } catch (e) {
+    saveErr.value = (e as Error).message
+  } finally {
+    trashBusy.value = ''
+  }
+}
+
+function fmtSize(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+function fmtDeletedAt(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
 
 function showToast(msg: string) {
   toast.value = msg
@@ -470,7 +522,7 @@ async function save() {
           <div class="card backup-card">
             <div class="card-title">数据备份</div>
             <div class="hint">
-              删除会话时会先保留一份到 <code>data/sessions/trash/</code>，可从这里恢复。
+              删除会话时会先保留一份到 <code>data/sessions/trash/</code>，可在下方「回收站」里恢复。
               服务启动时和之后每 24 小时会把全部会话打包到 <code>data/backups/</code>（保留最近 14 份）。
               随时可以手动下载一份完整备份。
             </div>
@@ -479,6 +531,50 @@ async function save() {
                 <Icon name="download" :size="14" /> 下载全部会话（ZIP）
               </a>
               <span class="hint">备份含会话快照与未合并日志，可直接解压查看。</span>
+            </div>
+          </div>
+
+          <div class="card trash-card">
+            <div class="card-title trash-head">
+              <span>回收站</span>
+              <button class="btn ghost tiny" :disabled="!!trashBusy" @click="refreshTrash">
+                <Icon name="refresh" :size="12" /> 刷新
+              </button>
+            </div>
+            <div class="hint">
+              删除的会话会在这里保留 30 天，随时可以恢复。彻底删除不可撤销。
+            </div>
+            <div v-if="!trashItems.length" class="trash-empty">
+              回收站是空的。删除会话后会在这里留一份副本。
+            </div>
+            <div v-else class="trash-list">
+              <div v-for="it in trashItems" :key="it.dir" class="trash-item">
+                <div class="ti-main">
+                  <div class="ti-title">{{ it.title || '（无标题会话）' }}</div>
+                  <div class="ti-meta">
+                    {{ fmtDeletedAt(it.deletedAt) }} 删除 · {{ it.messageCount }} 条消息 · {{ fmtSize(it.sizeBytes) }}
+                  </div>
+                </div>
+                <div class="ti-actions">
+                  <button
+                    class="btn ghost tiny"
+                    :disabled="!!trashBusy"
+                    title="恢复到会话列表"
+                    @click="restoreTrashItem(it)"
+                  >
+                    <Icon name="refresh" :size="12" />
+                    {{ trashBusy === it.dir ? '恢复中…' : '恢复' }}
+                  </button>
+                  <button
+                    class="btn danger tiny"
+                    :disabled="!!trashBusy"
+                    title="彻底删除，不可恢复"
+                    @click="purgeTrashItem(it)"
+                  >
+                    <Icon name="trash" :size="12" /> 彻底删除
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         </section>
@@ -1034,6 +1130,72 @@ textarea.inp {
   flex-wrap: wrap;
   gap: 12px;
   margin-top: 12px;
+}
+
+/* ---------- 回收站 ---------- */
+.trash-card {
+  margin-top: 14px;
+}
+
+.trash-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.trash-empty {
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  font-size: 12px;
+  text-align: center;
+}
+
+.trash-list {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trash-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-inset);
+}
+
+.ti-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.ti-title {
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ti-meta {
+  margin-top: 3px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.ti-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 .btn.primary {

@@ -131,6 +131,9 @@ xiaoke.exe
 | GET/POST | `/api/sessions`、GET/DELETE `/api/sessions/{id}` | 会话 CRUD（带 projectId + agentId 绑定） |
 | GET | `/api/sessions/{id}/export` | 导出单个会话为 JSON 附件（含未合并日志） |
 | GET | `/api/backup/sessions` | 下载全部会话的 ZIP 备份（含 manifest.json） |
+| GET | `/api/trash` | 回收站列表（标题、删除时间、消息数、大小） |
+| POST | `/api/trash/{dir}/restore` | 从回收站恢复一条会话（同 ID 仍在时返回 409） |
+| DELETE | `/api/trash/{dir}` | 彻底删除回收站里的一条记录 |
 | POST | `/api/chat` | 流式对话（SSE：start/delta/tool/tool_result/done/error，请求可带 agentId/reasoning） |
 
 ## 目录结构
@@ -214,14 +217,17 @@ CI：`.github/workflows/ci.yml`（push / PR 自动跑 `go vet`、`go test -race`
 | 机制 | 位置 | 说明 |
 |---|---|---|
 | 自动备份 | `data/backups/sessions-*.zip` | 服务启动时立刻备份一次，之后每 24 小时一次，自动只保留最近 **14** 份 |
-| 删除回收站 | `data/sessions/trash/<id>-<时间戳>/` | 每次删除会话前先复制快照/日志/摘要；复制失败则**取消删除**并报错 |
+| 删除回收站 | `data/sessions/trash/<id>-<时间戳>/` | 每次删除会话前先复制快照/日志/摘要；复制失败则**取消删除**并报错。保留 **30 天**，过期自动清理 |
 | 手动导出 | 侧栏会话悬停的下载按钮 / 设置 → 高级 | 单会话 JSON：`GET /api/sessions/{id}/export`；全量 ZIP：`GET /api/backup/sessions` |
 
 恢复方式：
 
-- 单个会话：从 `data/sessions/trash/<id>-<时间戳>/` 把 `<id>.json`、`<id>.log`、`<id>.meta.json` 复制回 `data/sessions/`，重启即可在侧栏看到。
+- **界面恢复（推荐）**：设置 → 高级 → 回收站，列出每条被删会话的标题、删除时间、消息数和大小，点「恢复」即可回到侧栏；点「彻底删除」才会真正移除。
+- 单个会话（手工）：从 `data/sessions/trash/<id>-<时间戳>/` 把 `<id>.json`、`<id>.log`、`<id>.meta.json` 复制回 `data/sessions/`，重启即可在侧栏看到。
 - 整库回滚：停服务，解压 `data/backups/sessions-<时间戳>.zip` 覆盖到 `data/sessions/`（zip 内含 `manifest.json` 记录会话清单）。
 - 备份目录和回收站都在 `data/` 下，已 gitignore；迁移或换机时连同 `data/sessions/` 一起带走。
+
+> 同 ID 的会话仍然存在时，恢复会返回 409 而不是覆盖——避免把新会话冲掉。
 
 ## 许可
 

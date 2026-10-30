@@ -157,21 +157,27 @@ func main() {
 	mcpMgr.Close()
 }
 
-// 自动备份保留份数与间隔（14 份 ≈ 两周历史）。
+// 自动备份保留份数、间隔，以及回收站保留天数。
 const (
 	backupKeep  = 14
 	backupEvery = 24 * time.Hour
+	trashKeep   = 30 * 24 * time.Hour
 )
 
-// autoBackup 启动时先备份一份，之后按 backupEvery 周期备份。
+// autoBackup 启动时先备份一份，之后按 backupEvery 周期备份；顺带清理过期回收站。
 func autoBackup(st *store.Store, dir string) {
 	run := func() {
 		p, err := st.Backup(dir, backupKeep)
 		if err != nil {
 			log.Printf("自动备份失败: %v", err)
-			return
+		} else {
+			log.Printf("会话已自动备份: %s", p)
 		}
-		log.Printf("会话已自动备份: %s", p)
+		if n, err := st.PurgeTrashOlderThan(trashKeep); err != nil {
+			log.Printf("清理回收站失败: %v", err)
+		} else if n > 0 {
+			log.Printf("回收站已清理 %d 条超过 %d 天的记录", n, int(trashKeep.Hours()/24))
+		}
 	}
 	run()
 	t := time.NewTicker(backupEvery)

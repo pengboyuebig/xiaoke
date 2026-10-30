@@ -175,6 +175,117 @@ func TestDeleteKeepsTrashCopy(t *testing.T) {
 	}
 }
 
+// 回收站：列表能看到标题/消息数，恢复后会话回来且消息完整，同 ID 已存在时拒绝覆盖。
+func TestTrashListAndRestore(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := s.Create("要恢复的会话", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := s.Append(sess.ID, Message{Role: "user", Content: fmt.Sprintf("m%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Delete(sess.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := s.ListTrash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("回收站应有 1 条，实际 %d", len(items))
+	}
+	if items[0].ID != sess.ID || items[0].Title != "要恢复的会话" || items[0].MessageCount != 2 {
+		t.Fatalf("回收站条目信息不对: %+v", items[0])
+	}
+	if items[0].DeletedAt.IsZero() || items[0].SizeBytes <= 0 {
+		t.Fatalf("回收站条目缺少时间/大小: %+v", items[0])
+	}
+
+	id, err := s.RestoreTrash(items[0].Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != sess.ID {
+		t.Fatalf("恢复的 ID 不对: %s", id)
+	}
+	got, err := s.Get(sess.ID)
+	if err != nil {
+		t.Fatalf("恢复后应能读取会话: %v", err)
+	}
+	if len(got.Messages) != 2 || got.Title != "要恢复的会话" {
+		t.Fatalf("恢复后内容不完整: %+v", got)
+	}
+	// 恢复成功会移除回收站目录
+	if left, _ := s.ListTrash(); len(left) != 0 {
+		t.Fatalf("恢复后回收站应为空，实际 %d", len(left))
+	}
+
+	// 会话仍在时，手工造一个同名回收站目录，验证冲突分支
+	dup := filepath.Join(s.TrashDir(), sess.ID+"-20200101-000000")
+	if err := os.MkdirAll(dup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(s.path(sess.ID), filepath.Join(dup, sess.ID+".json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RestoreTrash(filepath.Base(dup)); !errors.Is(err, ErrSessionExists) {
+		t.Fatalf("会话仍存在时应返回 ErrSessionExists，got %v", err)
+	}
+}
+
+// 回收站清理：只删超过保留期的记录，且 d<=0 时什么都不删。
+func TestTrashPurge(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := s.Create("过期会话", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(sess.ID); err != nil {
+		t.Fatal(err)
+	}
+	items, err := s.ListTrash()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("应有 1 条回收站记录: %v", err)
+	}
+	// d<=0 不清理
+	if n, err := s.PurgeTrashOlderThan(0); err != nil || n != 0 {
+		t.Fatalf("d<=0 不应清理，got n=%d err=%v", n, err)
+	}
+	// 保留期很长，刚删的不应被清
+	if n, err := s.PurgeTrashOlderThan(365 * 24 * time.Hour); err != nil || n != 0 {
+		t.Fatalf("未过期记录不应清理，got n=%d err=%v", n, err)
+	}
+	// 把目录时间戳改成很久以前，再按 1 天清理
+	old := filepath.Join(s.TrashDir(), sess.ID+"-20200101-000000")
+	if err := os.Rename(filepath.Join(s.TrashDir(), items[0].Dir), old); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.PurgeTrashOlderThan(24 * time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("应清理 1 条过期记录，got %d", n)
+	}
+	if left, _ := s.ListTrash(); len(left) != 0 {
+		t.Fatalf("清理后应为空，实际 %d", len(left))
+	}
+	// 非法目录名
+	if err := s.PurgeTrash("not-a-valid-name"); !errors.Is(err, ErrTrashNotFound) {
+		t.Fatalf("非法目录名应返回 ErrTrashNotFound，got %v", err)
+	}
+}
+
 func TestExportContainsLogMessages(t *testing.T) {
 	s, err := New(t.TempDir())
 	if err != nil {

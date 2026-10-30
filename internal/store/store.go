@@ -413,6 +413,173 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
+// trashName 匹配回收站目录名 <id>-<YYYYMMDD>-<HHMMSS>。
+var trashName = regexp.MustCompile(`^([0-9a-f]{16})-(\d{8}-\d{6})$`)
+
+// ErrTrashNotFound 表示回收站里没有这个目录。
+var ErrTrashNotFound = errors.New("回收站里没有这条记录")
+
+// ErrSessionExists 表示同 ID 的会话仍在，不能覆盖恢复。
+var ErrSessionExists = errors.New("该会话仍然存在，无需恢复")
+
+// TrashItem 是回收站里的一条记录。
+type TrashItem struct {
+	Dir          string    `json:"dir"`   // 目录名（恢复/彻底删除时用）
+	ID           string    `json:"id"`    // 原会话 ID
+	Title        string    `json:"title"` // 快照里的标题（可能为空）
+	MessageCount int       `json:"messageCount"`
+	DeletedAt    time.Time `json:"deletedAt"` // 取自目录名时间戳
+	SizeBytes    int64     `json:"sizeBytes"`
+}
+
+// ListTrash 列出回收站记录，按删除时间倒序（最近的在前）。
+func (s *Store) ListTrash() ([]TrashItem, error) {
+	entries, err := os.ReadDir(s.TrashDir())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []TrashItem{}, nil
+		}
+		return nil, err
+	}
+	items := []TrashItem{}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		m := trashName.FindStringSubmatch(e.Name())
+		if m == nil {
+			continue
+		}
+		item := TrashItem{Dir: e.Name(), ID: m[1]}
+		if t, err := time.ParseInLocation("20060102-150405", m[2], time.Local); err == nil {
+			item.DeletedAt = t
+		}
+		dir := filepath.Join(s.TrashDir(), e.Name())
+		item.MessageCount = countMessagesInDir(dir, item.ID)
+		if data, err := os.ReadFile(filepath.Join(dir, item.ID+".json")); err == nil {
+			var snap Session
+			if json.Unmarshal(data, &snap) == nil {
+				item.Title = snap.Title
+			}
+		}
+		if fs, err := os.ReadDir(dir); err == nil {
+			for _, f := range fs {
+				if info, err := f.Info(); err == nil {
+					item.SizeBytes += info.Size()
+				}
+			}
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].DeletedAt.Equal(items[j].DeletedAt) {
+			return items[i].Dir > items[j].Dir
+		}
+		return items[i].DeletedAt.After(items[j].DeletedAt)
+	})
+	return items, nil
+}
+
+// countMessagesInDir 统计回收站副本的消息数：快照 + 未合并日志。
+// 删除时快照可能还没合并日志，只看快照会漏掉最近的消息。
+func countMessagesInDir(dir, id string) int {
+	n := 0
+	if data, err := os.ReadFile(filepath.Join(dir, id+".json")); err == nil {
+		var snap Session
+		if json.Unmarshal(data, &snap) == nil {
+			n = len(snap.Messages)
+		}
+	}
+	f, err := os.Open(filepath.Join(dir, id+".log"))
+	if err != nil {
+		return n
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), maxLogLine)
+	for sc.Scan() {
+		if strings.TrimSpace(sc.Text()) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// RestoreTrash 把回收站里的一条记录恢复到会话目录。
+// 同 ID 会话仍存在时拒绝覆盖（返回 ErrSessionExists）。
+func (s *Store) RestoreTrash(dirName string) (string, error) {
+	m := trashName.FindStringSubmatch(dirName)
+	if m == nil {
+		return "", ErrTrashNotFound
+	}
+	id := m[1]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	src := filepath.Join(s.TrashDir(), dirName)
+	if _, err := os.Stat(filepath.Join(src, id+".json")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", ErrTrashNotFound
+		}
+		return "", err
+	}
+	if _, err := os.Stat(s.path(id)); err == nil {
+		return "", ErrSessionExists
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	// 快照必须成功；日志/摘要缺失不算错误
+	if err := copyFile(filepath.Join(src, id+".json"), s.path(id)); err != nil {
+		return "", err
+	}
+	for _, name := range []string{id + ".log", id + ".meta.json"} {
+		if err := copyFile(filepath.Join(src, name), filepath.Join(s.dir, name)); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	_ = os.RemoveAll(src)
+	return id, nil
+}
+
+// PurgeTrash 彻底删除回收站里的一条记录。
+func (s *Store) PurgeTrash(dirName string) error {
+	if trashName.FindStringSubmatch(dirName) == nil {
+		return ErrTrashNotFound
+	}
+	src := filepath.Join(s.TrashDir(), dirName)
+	if _, err := os.Stat(src); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ErrTrashNotFound
+		}
+		return err
+	}
+	return os.RemoveAll(src)
+}
+
+// PurgeTrashOlderThan 清理超过 d 的回收站记录，返回清理条数。
+// d<=0 表示不清理（避免误把保留期写成 0 导致全删）。
+func (s *Store) PurgeTrashOlderThan(d time.Duration) (int, error) {
+	if d <= 0 {
+		return 0, nil
+	}
+	items, err := s.ListTrash()
+	if err != nil {
+		return 0, err
+	}
+	cutoff := time.Now().Add(-d)
+	n := 0
+	for _, it := range items {
+		if it.DeletedAt.IsZero() || it.DeletedAt.After(cutoff) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(s.TrashDir(), it.Dir)); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
+
 // Export 返回完整会话的 JSON（快照 + 未合并日志），用于单会话导出。
 func (s *Store) Export(id string) ([]byte, error) {
 	sess, err := s.Get(id)

@@ -53,6 +53,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/sessions/{id}/export", h.exportSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", h.deleteSession)
 	mux.HandleFunc("GET /api/backup/sessions", h.backupSessions)
+	mux.HandleFunc("GET /api/trash", h.listTrash)
+	mux.HandleFunc("POST /api/trash/{dir}/restore", h.restoreTrash)
+	mux.HandleFunc("DELETE /api/trash/{dir}", h.purgeTrash)
 	mux.HandleFunc("POST /api/chat", h.chat)
 }
 
@@ -140,6 +143,46 @@ func (h *Handler) backupSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	filename := "sessions-" + time.Now().Format("20060102-150405") + ".zip"
 	serveDownload(w, filename, "application/zip", buf.Bytes())
+}
+
+// listTrash 列出回收站记录（删除会话时保留的副本）。
+func (h *Handler) listTrash(w http.ResponseWriter, r *http.Request) {
+	items, err := h.store.ListTrash()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// restoreTrash 把回收站里的一条记录恢复成正常会话。
+func (h *Handler) restoreTrash(w http.ResponseWriter, r *http.Request) {
+	dir := r.PathValue("dir")
+	id, err := h.store.RestoreTrash(dir)
+	switch {
+	case errors.Is(err, store.ErrTrashNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "回收站里没有这条记录"})
+	case errors.Is(err, store.ErrSessionExists):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "该会话仍然存在，无需恢复"})
+	case err != nil:
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	default:
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "1", "id": id})
+	}
+}
+
+// purgeTrash 彻底删除回收站里的一条记录。
+func (h *Handler) purgeTrash(w http.ResponseWriter, r *http.Request) {
+	dir := r.PathValue("dir")
+	err := h.store.PurgeTrash(dir)
+	switch {
+	case errors.Is(err, store.ErrTrashNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "回收站里没有这条记录"})
+	case err != nil:
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	default:
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "1"})
+	}
 }
 
 // serveDownload 以附件形式返回数据（浏览器直接触发下载）。

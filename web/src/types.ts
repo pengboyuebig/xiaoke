@@ -82,6 +82,17 @@ export interface SessionMeta {
   messageCount: number
 }
 
+/** 回收站里的一条记录（删除会话时保留的副本） */
+export interface TrashItem {
+  /** 目录名，恢复/彻底删除时用 */
+  dir: string
+  id: string
+  title: string
+  messageCount: number
+  deletedAt: string
+  sizeBytes: number
+}
+
 export interface Session {
   id: string
   title: string
