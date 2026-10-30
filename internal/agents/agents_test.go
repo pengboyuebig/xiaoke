@@ -140,3 +140,36 @@ func TestBuiltinAgentIsProtected(t *testing.T) {
 		t.Fatal("同名旧人格应被补上内置标记")
 	}
 }
+
+// 重名拦截：Create 与 Update 都不允许与其他智能体同名（改名排除自己）。
+func TestDuplicateName(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "agents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureDefault(Agent{Name: "小柯"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(Agent{Name: "小柯"}); !errors.Is(err, ErrDuplicateName) {
+		t.Fatalf("与内置重名应被拦截，got %v", err)
+	}
+	a, err := s.Create(Agent{Name: "分析师"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(Agent{Name: "分析师"}); !errors.Is(err, ErrDuplicateName) {
+		t.Fatalf("重复创建应被拦截，got %v", err)
+	}
+	// 改名撞别人
+	if _, err := s.Update(a.ID, Agent{Name: "小柯", Tools: true}); !errors.Is(err, ErrDuplicateName) {
+		t.Fatalf("改名撞名应被拦截，got %v", err)
+	}
+	// 改成自己的名字（排除自己）应允许
+	same, err := s.Update(a.ID, Agent{Name: "分析师", Description: "只改描述"})
+	if err != nil {
+		t.Fatalf("保留自己名字应允许: %v", err)
+	}
+	if same.Description != "只改描述" {
+		t.Fatalf("更新未生效: %+v", same)
+	}
+}

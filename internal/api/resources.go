@@ -73,6 +73,10 @@ func (h *Handler) updateAgent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 		return
 	}
+	if errors.Is(err, agents.ErrDuplicateName) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -88,6 +92,10 @@ func (h *Handler) deleteAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, agents.ErrBuiltin) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, agents.ErrDuplicateName) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
 	if err != nil {

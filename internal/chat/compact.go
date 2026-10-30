@@ -24,6 +24,11 @@ const (
 	compactMinMessages = 4
 	compactMinBytes    = 1 << 10 // 1KB
 
+	// compactTriggerRatio 是压缩触发的字节水位（占预算的百分比）。
+	// 70%：既保证「上下文真吃紧了才压缩」，又留出余量——
+	// 等到 100% 时被动裁剪已经先丢消息了，压缩就失去了意义。
+	compactTriggerRatio = 70
+
 	// compactInputLimit 喂给摘要模型的最大输入字节（防止摘要请求自身超预算）。
 	compactInputLimit = 80 * 1024
 
@@ -113,10 +118,12 @@ func maybeCompact(
 ) summaryView {
 	view := splitBySummary(sess.Messages, sess.Summary, sess.SummaryUpTo)
 
-	// 触发条件：近期窗口本身就超预算（条数或字节），且够格做摘要
-	overCount := keepCount > 0 && len(view.Recent) > keepCount
-	overBytes := byteBudget > 0 && historyBytes(view.Recent) > byteBudget
-	if !overCount && !overBytes {
+	// 触发条件（只看字节）：近期窗口的字节占用达到预算的 compactTriggerRatio 才压缩。
+	// 条数不作为触发依据——上游真正限制的是 token 而非条数，几十条一句话消息
+	// 占用极小，条数一超就压缩会在上下文还很充足时白白烧一次模型调用并丢细节；
+	// 条数超限由被动裁剪（trimHistory 的 maxCount）兜底。
+	recentBytes := historyBytes(view.Recent)
+	if byteBudget <= 0 || recentBytes < byteBudget*compactTriggerRatio/100 {
 		return view
 	}
 

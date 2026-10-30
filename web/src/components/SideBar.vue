@@ -18,6 +18,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   select: [id: string]
   newChat: []
+  rename: [id: string, title: string]
   remove: [id: string]
   selectProject: [id: string]
   newProject: []
@@ -26,6 +27,25 @@ const emit = defineEmits<{
   openSettings: []
 }>()
 
+
+// 会话重命名：双击标题进入行内编辑，Enter 确认 / Esc 取消
+const renamingId = ref('')
+const renamingText = ref('')
+function startRename(s: SessionMeta) {
+  renamingId.value = s.id
+  renamingText.value = s.title || ''
+}
+function commitRename() {
+  const id = renamingId.value
+  const title = renamingText.value.trim()
+  renamingId.value = ''
+  if (!id) return
+  emit('rename', id, title)
+}
+function cancelRename() {
+  renamingId.value = ''
+  renamingText.value = ''
+}
 
 // 会话搜索：标题/ID 本地过滤（纯前端，无请求）
 const sessionQuery = ref('')
@@ -139,7 +159,22 @@ function projectName(projects: Project[], id?: string): string {
         <span v-if="projectName(projects, s.projectId)" class="proj-badge" :title="'项目：' + projectName(projects, s.projectId)">
           {{ projectName(projects, s.projectId).slice(0, 4) }}
         </span>
-        <span class="item-title">{{ s.title || '新对话' }}</span>
+        <input
+          v-if="renamingId === s.id"
+          v-model="renamingText"
+          class="item-rename"
+          autofocus
+          @click.stop
+          @keydown.enter.prevent="commitRename"
+          @keydown.esc.prevent="cancelRename"
+          @blur="commitRename"
+        />
+        <span
+          v-else
+          class="item-title"
+          :title="s.title || '新对话（双击重命名）'"
+          @dblclick.stop="startRename(s)"
+        >{{ s.title || '新对话' }}</span>
         <span class="item-time">{{ fmtTime(s.updatedAt) }}</span>
         <a
           class="item-export"
@@ -195,6 +230,19 @@ function projectName(projects: Project[], id?: string): string {
   opacity: 0.55;
 }
 
+
+
+.item-rename {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border-accent);
+  background: var(--bg-inset);
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+}
 
 .sess-search {
   border: 1px solid var(--border);

@@ -98,7 +98,7 @@ func TestMaybeCompactTriggers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	view := maybeCompact(context.Background(), st, full, 4, 256*1024, testSummarizer(&realCalls, "用户做了 6 个任务，全部完成"), config.LLMConfig{Mode: "openai"})
+	view := maybeCompact(context.Background(), st, full, 4, 6*1024, testSummarizer(&realCalls, "用户做了 6 个任务，全部完成"), config.LLMConfig{Mode: "openai"})
 	if realCalls != 1 {
 		t.Fatalf("摘要应被调用 1 次，got %d", realCalls)
 	}
@@ -134,13 +134,13 @@ func TestMaybeCompactCooldownAndFailure(t *testing.T) {
 	full, _ := st.Get(sess.ID)
 
 	calls := 0
-	view := maybeCompact(context.Background(), st, full, 4, 256*1024, testSummarizer(&calls, "摘要"), config.LLMConfig{})
+	view := maybeCompact(context.Background(), st, full, 4, 6*1024, testSummarizer(&calls, "摘要"), config.LLMConfig{})
 	if calls != 1 || view.Summary == "" {
 		t.Fatalf("首次应触发压缩: calls=%d summary=%q", calls, view.Summary)
 	}
 	// 同一会话立刻再来一次：冷却期内不调模型，视图沿用已持久化的摘要
 	full2, _ := st.Get(sess.ID)
-	view2 := maybeCompact(context.Background(), st, full2, 4, 256*1024, testSummarizer(&calls, "摘要"), config.LLMConfig{})
+	view2 := maybeCompact(context.Background(), st, full2, 4, 6*1024, testSummarizer(&calls, "摘要"), config.LLMConfig{})
 	if calls != 1 {
 		t.Fatalf("冷却期内不应再次调用摘要，calls=%d", calls)
 	}
@@ -158,7 +158,7 @@ func TestMaybeCompactCooldownAndFailure(t *testing.T) {
 	}
 	full3, _ := st.Get(sess2.ID)
 	failCalls := 0
-	view3 := maybeCompact(context.Background(), st, full3, 4, 256*1024, testFailingSummarizer(&failCalls), config.LLMConfig{})
+	view3 := maybeCompact(context.Background(), st, full3, 4, 6*1024, testFailingSummarizer(&failCalls), config.LLMConfig{})
 	if failCalls != 1 {
 		t.Fatalf("失败重试应被调用一次: %d", failCalls)
 	}
@@ -223,5 +223,26 @@ func testFailingSummarizer(calls *int) StreamFn {
 	return func(ctx context.Context, cfg config.LLMConfig, msgs []ChatMessage, defs []tools.ToolDef, hooks Hooks, reasoning string) (string, []ToolCall, error) {
 		*calls++
 		return "", nil, errors.New("模拟上游故障")
+	}
+}
+
+// 用户场景回归：条数超了但字节预算充足 → 上下文并不吃紧，不应压缩。
+// （30 条一句话消息 ≈ 3KB，远小于 256KB 预算的 70% 水位）
+func TestCompactSkipsWhenBudgetHealthy(t *testing.T) {
+	st, _ := store.New(t.TempDir())
+	sess, _ := st.Create("健康预算", "")
+	base := time.Now()
+	for i := 0; i < 30; i++ {
+		_ = st.Append(sess.ID, store.Message{Role: "user", Content: fmt.Sprintf("第%d句话", i), CreatedAt: base})
+		_ = st.Append(sess.ID, store.Message{Role: "assistant", Content: "好", CreatedAt: base})
+	}
+	full, _ := st.Get(sess.ID)
+	calls := 0
+	view := maybeCompact(context.Background(), st, full, 4, 256*1024, testSummarizer(&calls, "不该被调用"), config.LLMConfig{})
+	if calls != 0 {
+		t.Fatalf("上下文充足时不应压缩，calls=%d", calls)
+	}
+	if len(view.Recent) != len(full.Messages) {
+		t.Fatal("未压缩时应保留完整消息供被动裁剪处理")
 	}
 }

@@ -44,6 +44,8 @@ export interface ChatOptions {
   approve?: boolean
   signal?: AbortSignal
   onDelta: (text: string) => void
+  /** 本次请求触发了上下文压缩：covered 是被摘要覆盖的消息数 */
+  onCompact?: (covered: number) => void
   onToolStart?: (name: string, args: string, id: string) => void
   onToolResult?: (info: { id: string; name: string; ok: boolean; preview: string; error?: string; ms: number }) => void
 }
@@ -61,6 +63,9 @@ export const api = {
   },
   deleteSession(id: string): Promise<void> {
     return jfetch(`/api/sessions/${id}`, { method: 'DELETE' })
+  },
+  renameSession(id: string, title: string): Promise<{ ok: string; title: string }> {
+    return jfetch(`/api/sessions/${id}/title`, jsonBody('PUT', { title }))
   },
   // ---------- 回收站 ----------
   listTrash(): Promise<{ items: TrashItem[] }> {
@@ -211,6 +216,9 @@ export const api = {
                     break
                   case 'delta':
                     opts.onDelta(evt.text as string)
+                    break
+                  case 'compact':
+                    opts.onCompact?.((evt.covered as number) || 0)
                     break
                   case 'tool':
                     opts.onToolStart?.(

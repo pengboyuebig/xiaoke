@@ -59,6 +59,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/sessions", h.createSession)
 	mux.HandleFunc("GET /api/sessions/{id}", h.getSession)
 	mux.HandleFunc("GET /api/sessions/{id}/export", h.exportSession)
+	mux.HandleFunc("PUT /api/sessions/{id}/title", h.renameSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", h.deleteSession)
 	mux.HandleFunc("GET /api/backup/sessions", h.backupSessions)
 	mux.HandleFunc("GET /api/trash", h.listTrash)
@@ -151,6 +152,27 @@ func (h *Handler) backupSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	filename := "sessions-" + time.Now().Format("20060102-150405") + ".zip"
 	serveDownload(w, filename, "application/zip", buf.Bytes())
+}
+
+// renameSession 用户主动重命名会话（空标题 = 清空，回退自动命名）。
+func (h *Handler) renameSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var in struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+		return
+	}
+	if err := h.store.RenameTitle(id, in.Title); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"ok": "1", "title": strings.TrimSpace(in.Title)})
 }
 
 // listTrash 列出回收站记录（删除会话时保留的副本）。
@@ -262,10 +284,26 @@ type chatRequest struct {
 //	data: {"type":"tool_result","name":"...","ok":true,"preview":"...","ms":123}
 //	data: {"type":"done"}
 //	data: {"type":"error","error":"..."}
+//
+// maxContentBytes 是单条用户消息的字节上限（128KB）。
+// 前端输入框装不下这么多；上限拦的是程序化调用把整本书塞进一条消息。
+const maxContentBytes = 128 * 1024
+
 func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	var req chatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Content == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求需要非空 content 字段"})
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+		return
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "消息内容不能为空"})
+		return
+	}
+	if len(req.Content) > maxContentBytes {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("单条消息过长（%dKB，上限 %dKB）——请拆分发送或放入项目文件后让小柯读取",
+				len(req.Content)/1024, maxContentBytes/1024),
+		})
 		return
 	}
 	// 同一会话串行处理：第二个并发请求直接返回 409，避免两条流交错写坏 tool 调用序列。
@@ -330,8 +368,8 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 自动命名：标题还是空时，用首条用户消息的第一行生成（本地截断，不花模型调用）。
-	// SetTitle 内部保证不覆盖已有标题。
-	if sess.Title == "" {
+	// SetTitle 内部保证不覆盖已有标题；批准计划的隐藏指令不适合当标题。
+	if sess.Title == "" && !req.Approve {
 		if t := deriveTitle(req.Content); t != "" {
 			if err := h.store.SetTitle(sess.ID, t); err == nil {
 				sess.Title = t
@@ -411,6 +449,13 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		view = maybeCompact(r.Context(), h.store, full, keep, maxHistoryBytes, streamFn, effAsConfig(eff))
 	}
+	// 本次请求新生成的摘要（与请求开始时的快照对比）：用于向前端发 compact 事件
+	newSummary := ""
+	covered := 0
+	if strings.TrimSpace(view.Summary) != "" && view.Summary != full.Summary {
+		newSummary = view.Summary
+		covered = len(full.Messages) - len(view.Recent) // 新摘要覆盖的消息数
+	}
 	if strings.TrimSpace(view.Summary) != "" {
 		// 摘要以 system 角色紧跟主提示词，明确告知它是「此前的对话压缩」
 		convo = append(convo, ChatMessage{
@@ -455,6 +500,10 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		fl.Flush()
 	}
 	send(map[string]any{"type": "start", "sessionId": sess.ID, "projectId": pid, "agentId": agentIDOf(agent)})
+	if newSummary != "" {
+		// 透明度：让用户知道上下文刚被压缩过（否则摘要悄无声息地替换历史，像失忆）
+		send(map[string]any{"type": "compact", "covered": covered})
+	}
 	hooks := Hooks{OnDelta: func(delta string) {
 		send(map[string]any{"type": "delta", "text": delta})
 	}}

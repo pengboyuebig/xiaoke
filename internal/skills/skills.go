@@ -42,6 +42,9 @@ type Store struct {
 	mu    sync.Mutex
 	path  string
 	items []Skill
+	// assembly 缓存：每次对话请求都要拼一次技能正文，改动（增删改/开关）才失效
+	assembly    string
+	assemblySet bool
 }
 
 // Open 打开（或初始化）技能索引。
@@ -72,7 +75,11 @@ func (s *Store) EnsureSeed(seed Skill) error {
 	now := time.Now()
 	seed.CreatedAt, seed.UpdatedAt = now, now
 	s.items = []Skill{seed}
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		return err
+	}
+	s.invalidateAssemblyLocked()
+	return nil
 }
 
 func (s *Store) List() []Skill {
@@ -118,6 +125,7 @@ func (s *Store) Create(in Skill) (Skill, error) {
 	if err := s.saveLocked(); err != nil {
 		return Skill{}, err
 	}
+	s.invalidateAssemblyLocked()
 	return in, nil
 }
 
@@ -146,6 +154,7 @@ func (s *Store) Update(id string, in Skill) (Skill, error) {
 		if err := s.saveLocked(); err != nil {
 			return Skill{}, err
 		}
+		s.invalidateAssemblyLocked()
 		return in, nil
 	}
 	return Skill{}, ErrNotFound
@@ -164,6 +173,7 @@ func (s *Store) Toggle(id string) (Skill, error) {
 		if err := s.saveLocked(); err != nil {
 			return Skill{}, err
 		}
+		s.invalidateAssemblyLocked()
 		return s.items[i], nil
 	}
 	return Skill{}, ErrNotFound
@@ -183,7 +193,11 @@ func (s *Store) Delete(id string) error {
 		return ErrNotFound
 	}
 	s.items = append(s.items[:idx], s.items[idx+1:]...)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		return err
+	}
+	s.invalidateAssemblyLocked()
+	return nil
 }
 
 // maxAssemblyBytes 是技能注入系统提示词的总字节上限。
@@ -196,6 +210,16 @@ const maxAssemblyBytes = 16 * 1024
 func (s *Store) Assembly() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.assemblySet {
+		return s.assembly
+	}
+	s.assembly = s.buildAssemblyLocked()
+	s.assemblySet = true
+	return s.assembly
+}
+
+// buildAssemblyLocked 实际拼装（调用方需持有 s.mu）。
+func (s *Store) buildAssemblyLocked() string {
 	var b strings.Builder
 	budget := maxAssemblyBytes
 	truncated := false
@@ -245,6 +269,12 @@ func genID() string {
 		panic(err)
 	}
 	return hex.EncodeToString(b)
+}
+
+// invalidateAssemblyLocked 任何写操作后调用。调用方需持有 s.mu。
+func (s *Store) invalidateAssemblyLocked() {
+	s.assembly = ""
+	s.assemblySet = false
 }
 
 func (s *Store) saveLocked() error {

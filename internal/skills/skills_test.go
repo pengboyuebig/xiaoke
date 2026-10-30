@@ -102,3 +102,36 @@ func TestAssemblyByteCap(t *testing.T) {
 		t.Fatal("截断产生了非法 UTF-8")
 	}
 }
+
+// Assembly 缓存：写操作后立即失效，下一次读取反映最新状态。
+func TestAssemblyCacheInvalidation(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "skills.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sk, err := s.Create(Skill{Name: "缓存技能", Content: "第一次内容", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := s.Assembly(); !strings.Contains(out, "第一次内容") {
+		t.Fatalf("首次装配缺少内容: %q", out[:50])
+	}
+	if _, err := s.Update(sk.ID, Skill{Name: "缓存技能", Content: "第二次内容", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if out := s.Assembly(); !strings.Contains(out, "第二次内容") || strings.Contains(out, "第一次内容") {
+		t.Fatal("Update 后缓存未失效")
+	}
+	if _, err := s.Toggle(sk.ID); err != nil {
+		t.Fatal(err)
+	}
+	if out := s.Assembly(); strings.Contains(out, "第二次内容") {
+		t.Fatal("Toggle 后缓存未失效")
+	}
+	if err := s.Delete(sk.ID); err != nil {
+		t.Fatal(err)
+	}
+	if out := s.Assembly(); out != "" {
+		t.Fatalf("Delete 后装配应为空: %q", out)
+	}
+}

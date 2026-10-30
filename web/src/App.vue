@@ -19,6 +19,9 @@ const emptyProjectHint = ref('')
 const streaming = ref(false)
 const streamingText = ref('')
 const liveTools = ref<ToolActivity[]>([])
+// 上下文压缩提示：压缩发生后短暂显示，让「模型为什么记得概括版历史」有解释
+const compactNotice = ref('')
+let compactTimer: number | undefined
 const error = ref('')
 const mode = ref('')
 const model = ref('')
@@ -354,6 +357,11 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
       onDelta: (t) => {
         streamingText.value += t
       },
+      onCompact: (covered) => {
+        compactNotice.value = `上下文已自动压缩：较早的 ${covered} 条消息已总结为摘要（完整历史仍在本地，可在设置关闭自动压缩）`
+        if (compactTimer) window.clearTimeout(compactTimer)
+        compactTimer = window.setTimeout(() => (compactNotice.value = ''), 8000)
+      },
       onToolStart: (name, args, id) => {
         liveTools.value.push({ id, name, args, done: false })
       },
@@ -465,6 +473,15 @@ async function handleSelect(id: string) {
   }
 }
 
+async function handleRename(id: string, title: string) {
+  try {
+    await api.renameSession(id, title)
+    await refreshSessions()
+  } catch (e) {
+    error.value = (e as Error).message
+  }
+}
+
 async function handleRemove(id: string) {
   const s = sessions.value.find((x) => x.id === id)
   const ok = await askConfirm({
@@ -548,6 +565,7 @@ function onSettingsClosed() {
       :model="model"
       @select="handleSelect"
       @new-chat="handleNewChat"
+      @rename="handleRename"
       @remove="handleRemove"
       @select-project="handleSelectProject"
       @new-project="projectModalOpen = true"
@@ -566,6 +584,9 @@ function onSettingsClosed() {
           <Icon name="x" :size="13" :stroke="2" />
         </button>
       </div>
+      <transition name="toast">
+        <div v-if="compactNotice" class="compact-notice">{{ compactNotice }}</div>
+      </transition>
       <ChatView
         :turns="turns"
         :streaming="streaming"
@@ -675,6 +696,26 @@ function onSettingsClosed() {
   color: var(--danger);
   border-color: rgba(251, 113, 133, 0.25);
   background: var(--danger-soft);
+}
+
+
+.compact-notice {
+  position: fixed;
+  top: 78px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(560px, calc(100vw - 48px));
+  background: rgba(96, 165, 250, 0.12);
+  border: 1px solid rgba(96, 165, 250, 0.3);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 10px 18px;
+  border-radius: 999px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+  z-index: 60;
+  pointer-events: none;
 }
 
 @media (max-width: 720px) {

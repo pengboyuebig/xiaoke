@@ -146,7 +146,7 @@ func execListFiles(ctx context.Context, env *Env, args json.RawMessage) (string,
 			}
 			if d.IsDir() {
 				// 与 search_files/项目树同一套跳过规则：递归浏览不应走进依赖目录
-				if skipDirs[d.Name()] {
+				if SkipDirs[d.Name()] {
 					return fs.SkipDir
 				}
 				if strings.Count(rel, string(filepath.Separator)) >= 4 {
@@ -268,7 +268,8 @@ func execWriteFile(ctx context.Context, env *Env, args json.RawMessage) (string,
 	return fmt.Sprintf("已写入 %s（%d 字节）", filepath.ToSlash(in.Path), len(in.Content)), nil
 }
 
-var skipDirs = map[string]bool{
+// SkipDirs 是递归遍历（列目录/搜索）统一跳过的依赖/构建目录。
+var SkipDirs = map[string]bool{
 	"node_modules": true, ".git": true, ".svn": true, "dist": true,
 	"build": true, "__pycache__": true, ".venv": true, "venv": true, ".idea": true,
 }
@@ -338,7 +339,7 @@ func execSearchFiles(ctx context.Context, env *Env, args json.RawMessage) (strin
 			return nil
 		}
 		if d.IsDir() {
-			if skipDirs[d.Name()] {
+			if SkipDirs[d.Name()] {
 				return fs.SkipDir
 			}
 			return nil

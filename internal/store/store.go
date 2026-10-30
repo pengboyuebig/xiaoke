@@ -928,6 +928,31 @@ func (s *Store) SetTitle(id, title string) error {
 	return s.saveMeta(m)
 }
 
+// RenameTitle 强制重命名会话（与 SetTitle 的「只补空白」不同，这是用户主动改名）。
+// 允许改名后跟随自动命名：传空串表示清空标题，下次对话会重新自动命名。
+func (s *Store) RenameTitle(id, title string) error {
+	if !validID.MatchString(id) {
+		return ErrNotFound
+	}
+	title = strings.TrimSpace(title)
+	if rs := []rune(title); len(rs) > 64 {
+		title = string(rs[:64])
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.loadMeta(id)
+	if err != nil {
+		sess, lerr := s.loadFullLocked(id)
+		if lerr != nil {
+			return lerr
+		}
+		m = metaOf(sess)
+	}
+	m.Title = title
+	m.UpdatedAt = time.Now()
+	return s.saveMeta(m)
+}
+
 // SetSummary 持久化「历史摘要」：把摘要写进快照并收敛日志，
 // 保证重启后摘要与消息边界（SummaryUpTo）一起还原。
 func (s *Store) SetSummary(id string, summary string, upTo time.Time) error {

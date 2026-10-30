@@ -175,3 +175,12 @@ func TestDeriveTitle(t *testing.T) {
 		t.Fatalf("应截断到 32，got %d", len([]rune(got)))
 	}
 }
+
+// 自动命名：批准计划的隐藏指令（approve）不参与命名。
+func TestDeriveTitleSkipsApproval(t *testing.T) {
+	// deriveTitle 本身无差别；跳过逻辑在 handler 里（!req.Approve），
+	// 这里固化 deriveTitle 对批准指令文本的行为，配合 handler 的分支使用。
+	if got := deriveTitle("批准以上计划并开始开发"); got != "批准以上计划并开始开发" {
+		t.Fatalf("deriveTitle 行为变化: %q", got)
+	}
+}
