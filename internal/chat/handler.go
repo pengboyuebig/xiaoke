@@ -198,7 +198,8 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		// 项目目录可能被外部删除（索引仍保留）：自动重建，避免写/执行静默失败
 		if err := os.MkdirAll(projPath, 0o755); err != nil {
 			log.Printf("重建项目目录失败 %s: %v", projPath, err)
-			projPath = ""
+			// 目录不可用时按「未选择项目」处理，避免提示词给出空路径
+			projName, projPath = "", ""
 		}
 	}
 	env := &tools.Env{

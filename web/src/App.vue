@@ -65,6 +65,12 @@ function clearApproval() {
   planAwaitingApproval.value = false
 }
 
+// 切到开发模式即视为已离开计划流程，批准条作废（避免切回计划时出现过期的待批准）
+function onModeChange(m: WorkMode) {
+  setWorkMode(m)
+  if (m === 'build') clearApproval()
+}
+
 /** 批准计划：切开发模式 → 自动发送「开始」按计划开工 */
 function handleApprove() {
   if (streaming.value) return
@@ -525,7 +531,7 @@ function onSettingsClosed() {
         @send="handleSend"
         @stop="handleStop"
         @update:reasoning="setReasoning"
-        @set-mode="setWorkMode"
+        @set-mode="onModeChange"
       />
     </main>
 
