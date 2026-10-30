@@ -134,8 +134,8 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
     <!-- 回合流：每个回合 = 问题气泡 + 工作容器 -->
     <div v-else ref="threadEl" class="thread">
       <div v-for="(t, i) in props.turns" :key="i" class="turn-item">
-        <!-- 我的问题 -->
-        <div v-if="t.question" class="msg user">
+        <!-- 我的问题（与 questionList 同条件：trim 后非空才渲染，保证索引一一对应） -->
+        <div v-if="(t.question || '').trim()" class="msg user">
           <div class="body">
             <div class="meta"><span class="name">我</span></div>
             <div class="content user-bubble">{{ t.question }}</div>
@@ -163,7 +163,7 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
         <div class="jl-body">
           <button v-for="(q, i) in questionList" :key="i" class="jl-item" @click="jumpTo(i)">
             <span class="jl-idx">{{ i + 1 }}</span>
-            <span class="jl-text">{{ q.text }}</span>
+            <span class="jl-text" :title="q.text">{{ q.text }}</span>
             <span class="jl-time">{{ q.time }}</span>
           </button>
         </div>
