@@ -5,6 +5,7 @@ import type { Agent, MCPServerCfg, MCPStatus, SettingsView, Skill, TrashItem } f
 import AgentSection from './AgentSection.vue'
 import SkillSection from './SkillSection.vue'
 import Icon from './Icon.vue'
+import { askConfirm } from '../lib/confirm'
 
 const emit = defineEmits<{ close: [] }>()
 
@@ -137,7 +138,12 @@ async function restoreTrashItem(it: TrashItem) {
 
 async function purgeTrashItem(it: TrashItem) {
   if (trashBusy.value) return
-  if (!confirm(`彻底删除「${it.title || it.id}」？此操作不可恢复。`)) return
+  const ok = await askConfirm({
+    title: `彻底删除「${it.title || it.id}」`,
+    message: '这条会话将从回收站永久移除，无法再恢复。',
+    confirmText: '彻底删除',
+  })
+  if (!ok) return
   trashBusy.value = it.dir
   try {
     await api.purgeTrash(it.dir)

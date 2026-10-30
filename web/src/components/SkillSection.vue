@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { api } from '../lib/api'
 import type { Skill } from '../types'
 import Icon from './Icon.vue'
+import { askConfirm } from '../lib/confirm'
 
 const props = defineProps<{ skills: Skill[] }>()
 const emit = defineEmits<{ changed: [] }>()
@@ -84,7 +85,12 @@ async function save() {
 async function remove() {
   const e = editing.value
   if (!e || creating.value || busy.value) return
-  if (!confirm(`删除技能「${e.name}」？`)) return
+  const ok = await askConfirm({
+    title: `删除技能「${e.name}」`,
+    message: '删除后不再注入到系统提示词。',
+    confirmText: '删除',
+  })
+  if (!ok) return
   busy.value = true
   try {
     await api.deleteSkill(e.id)

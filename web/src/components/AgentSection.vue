@@ -4,6 +4,7 @@ import { api } from '../lib/api'
 import type { Agent } from '../types'
 import AvatarBadge from './AvatarBadge.vue'
 import Icon from './Icon.vue'
+import { askConfirm } from '../lib/confirm'
 
 const props = defineProps<{ agents: Agent[] }>()
 const emit = defineEmits<{ changed: []; selected: [id: string] }>()
@@ -90,7 +91,12 @@ async function save() {
 async function remove() {
   const e = editing.value
   if (!e || creating.value || busy.value) return
-  if (!confirm(`删除智能体「${e.name}」？（会话记录不受影响）`)) return
+  const ok = await askConfirm({
+    title: `删除智能体「${e.name}」`,
+    message: '该智能体的历史会话记录不受影响。',
+    confirmText: '删除',
+  })
+  if (!ok) return
   busy.value = true
   try {
     await api.deleteAgent(e.id)

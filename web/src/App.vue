@@ -7,7 +7,9 @@ import ChatView from './components/ChatView.vue'
 import Composer from './components/Composer.vue'
 import SettingsView from './components/SettingsView.vue'
 import ProjectModal from './components/ProjectModal.vue'
+import ConfirmDialog from './components/ConfirmDialog.vue'
 import Icon from './components/Icon.vue'
+import { askConfirm } from './lib/confirm'
 
 const sessions = ref<SessionMeta[]>([])
 const currentId = ref('')
@@ -454,12 +456,12 @@ async function handleSelect(id: string) {
 
 async function handleRemove(id: string) {
   const s = sessions.value.find((x) => x.id === id)
-  if (
-    !confirm(
-      `删除会话「${s?.title || '新对话'}」？\n删除后会保留在「设置 → 高级 → 回收站」30 天，可随时恢复。`,
-    )
-  )
-    return
+  const ok = await askConfirm({
+    title: `删除会话「${s?.title || '新对话'}」`,
+    message: '会话会保留在「设置 → 高级 → 回收站」30 天，期间可随时恢复。',
+    confirmText: '删除',
+  })
+  if (!ok) return
   try {
     await api.deleteSession(id)
   } catch {
@@ -502,7 +504,12 @@ function handleProjectCreated(p: Project) {
 }
 
 async function handleDeleteProject(id: string) {
-  if (!confirm('删除项目会连带删除项目目录里的全部文件，确定？')) return
+  const ok = await askConfirm({
+    title: '删除项目',
+    message: '会连带删除项目目录里的全部文件，且无法从回收站恢复。确定继续？',
+    confirmText: '删除',
+  })
+  if (!ok) return
   try {
     await api.deleteProject(id)
   } catch {
@@ -582,6 +589,7 @@ function onSettingsClosed() {
       @close="projectModalOpen = false"
       @created="handleProjectCreated"
     />
+    <ConfirmDialog />
   </div>
 </template>
 
