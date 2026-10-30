@@ -5,7 +5,7 @@
 **能做什么：**
 
 - 💬 流式对话（Markdown / 代码高亮 / 工具过程可视化 / 左右分区气泡）
-- 🤖 **多智能体**：设置页可新建多个智能体（名字、头像 emoji 或上传图片、人格提示词、工具开关），侧栏一键切换，会话自动绑定所选智能体
+- 🤖 **多智能体**：设置页可新建多个智能体（名字、头像 emoji 或上传图片、人格提示词、工具开关），侧栏一键切换，会话自动绑定所选智能体。内置的「小柯」人格对用户隐藏、不可编辑或删除，始终可用
 - 📚 **技能系统**：写一条 Markdown 技能（如「金字塔写作」），启用后注入系统提示词，随时生效
 - ⚙️ **设置中心**：整页导航（智能体 / 技能 / 模型 / MCP / 目录 / 高级），模型 API 界面配置热生效、一键测试连接拉模型列表
 - 🔌 **MCP 工具**：内置标准 MCP 客户端（stdio），可添加任意 MCP server；一键添加官方 filesystem 服务（默认只读过滤）看代码
@@ -123,12 +123,14 @@ xiaoke.exe
 | GET/POST | `/api/projects` | 项目列表 / 新建（支持模板与自定义目录） |
 | DELETE | `/api/projects/{id}` | 删除项目（**连带删除目录内全部文件**） |
 | GET | `/api/projects/{id}/tree` | 项目文件树 |
-| GET/POST/PUT/DELETE | `/api/agents[/{id}]` | 智能体 CRUD（名字/头像/人格/工具开关） |
-| POST | `/api/agents/{id}/toggle` | 智能体工具开关 |
+| GET/POST/PUT/DELETE | `/api/agents[/{id}]` | 智能体 CRUD（名字/头像/人格/工具开关）；内置小柯的 PUT/DELETE 返回 403 |
+| POST | `/api/agents/{id}/toggle` | 智能体工具开关（内置小柯返回 403） |
 | GET/POST/PUT/DELETE | `/api/skills[/{id}]` | 技能 CRUD |
 | POST | `/api/skills/{id}/toggle` | 技能启用/停用 |
 | POST | `/api/upload/avatar` | 头像上传（PNG/JPEG/WebP/GIF ≤2MB） |
 | GET/POST | `/api/sessions`、GET/DELETE `/api/sessions/{id}` | 会话 CRUD（带 projectId + agentId 绑定） |
+| GET | `/api/sessions/{id}/export` | 导出单个会话为 JSON 附件（含未合并日志） |
+| GET | `/api/backup/sessions` | 下载全部会话的 ZIP 备份（含 manifest.json） |
 | POST | `/api/chat` | 流式对话（SSE：start/delta/tool/tool_result/done/error，请求可带 agentId/reasoning） |
 
 ## 目录结构
@@ -204,6 +206,22 @@ CI：`.github/workflows/ci.yml`（push / PR 自动跑 `go vet`、`go test -race`
 - 点「停止」：未完成的回复不落库，本地保留半截并标注「已停止」。
 - **MCP server 采用异步启动**：保存设置立即返回，状态页显示「启动中/运行中/失败」；npx 类 server 首次冷启动可能需要 30-60 秒（握手上限 90 秒），失败会在状态里显示 server 报错；「刷新并重试」可重新拉起。
 - 头像来自名侦探柯南官方 Wiki，**仅供个人本地使用**。`config.json`、`data/settings.json`（含 Key）与 `data/` 已 gitignore，勿外传。
+
+## 数据安全（备份 / 回收站 / 导出）
+
+小柯对会话数据做了三层保护，避免误删或崩溃后不可恢复：
+
+| 机制 | 位置 | 说明 |
+|---|---|---|
+| 自动备份 | `data/backups/sessions-*.zip` | 服务启动时立刻备份一次，之后每 24 小时一次，自动只保留最近 **14** 份 |
+| 删除回收站 | `data/sessions/trash/<id>-<时间戳>/` | 每次删除会话前先复制快照/日志/摘要；复制失败则**取消删除**并报错 |
+| 手动导出 | 侧栏会话悬停的下载按钮 / 设置 → 高级 | 单会话 JSON：`GET /api/sessions/{id}/export`；全量 ZIP：`GET /api/backup/sessions` |
+
+恢复方式：
+
+- 单个会话：从 `data/sessions/trash/<id>-<时间戳>/` 把 `<id>.json`、`<id>.log`、`<id>.meta.json` 复制回 `data/sessions/`，重启即可在侧栏看到。
+- 整库回滚：停服务，解压 `data/backups/sessions-<时间戳>.zip` 覆盖到 `data/sessions/`（zip 内含 `manifest.json` 记录会话清单）。
+- 备份目录和回收站都在 `data/` 下，已 gitignore；迁移或换机时连同 `data/sessions/` 一起带走。
 
 ## 许可
 

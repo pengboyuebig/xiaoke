@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -82,5 +83,60 @@ func TestPersistAcrossReopen(t *testing.T) {
 	}
 	if len(s2.List()) != 2 {
 		t.Fatalf("重开应有 2 个，got %d", len(s2.List()))
+	}
+}
+
+// 内置人格：种子标记 builtin，不可编辑、删除、切换工具；客户端不能自封 builtin。
+func TestBuiltinAgentIsProtected(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "agents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureDefault(Agent{Name: "小柯", Avatar: "/assets/avatar.png", Tools: true}); err != nil {
+		t.Fatal(err)
+	}
+	builtin := s.List()[0]
+	if !builtin.Builtin {
+		t.Fatal("种子人格应标记为内置")
+	}
+	// 内置人格不可修改
+	builtin.Description = "试图修改"
+	if _, err := s.Update(builtin.ID, builtin); !errors.Is(err, ErrBuiltin) {
+		t.Fatalf("修改内置人格应返回 ErrBuiltin，got %v", err)
+	}
+	// 内置人格不可删除（即使只剩它一个也应先报内置错误）
+	if err := s.Delete(builtin.ID); !errors.Is(err, ErrBuiltin) {
+		t.Fatalf("删除内置人格应返回 ErrBuiltin，got %v", err)
+	}
+	// 客户端不能通过 Create 自封 builtin
+	created, err := s.Create(Agent{Name: "冒充者", Builtin: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Builtin {
+		t.Fatal("Create 不应接受客户端传入的 builtin")
+	}
+	// 普通智能体可以正常删除
+	if err := s.Delete(created.ID); err != nil {
+		t.Fatal(err)
+	}
+	// 旧数据：已存在同名小柯但没有 builtin 标记，EnsureDefault 应补标记而不是新增
+	s2, _ := Open(filepath.Join(t.TempDir(), "old.json"))
+	old, err := s2.Create(Agent{Name: "小柯"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Builtin {
+		t.Fatal("普通创建不应是内置")
+	}
+	if err := s2.EnsureDefault(Agent{Name: "小柯"}); err != nil {
+		t.Fatal(err)
+	}
+	list := s2.List()
+	if len(list) != 1 {
+		t.Fatalf("同名旧人格应被标记为内置而不是新增，got %d", len(list))
+	}
+	if !list[0].Builtin {
+		t.Fatal("同名旧人格应被补上内置标记")
 	}
 }

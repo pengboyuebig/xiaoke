@@ -7,6 +7,7 @@ import ChatView from './components/ChatView.vue'
 import Composer from './components/Composer.vue'
 import SettingsView from './components/SettingsView.vue'
 import ProjectModal from './components/ProjectModal.vue'
+import Icon from './components/Icon.vue'
 
 const sessions = ref<SessionMeta[]>([])
 const currentId = ref('')
@@ -530,9 +531,14 @@ function onSettingsClosed() {
     />
     <main class="main">
       <div v-if="currentProject" class="proj-banner">
-        <span class="pb-name">📁 {{ currentProject.name }}</span>
+        <div class="pb-left">
+          <Icon name="folder" :size="14" />
+          <span class="pb-name">{{ currentProject.name }}</span>
+        </div>
         <span class="pb-path" :title="currentProject.path">{{ currentProject.path }}</span>
-        <button class="pb-x" title="退出项目（回到通用对话）" @click="unbindProject">✕</button>
+        <button class="pb-x" title="退出项目（回到通用对话）" @click="unbindProject">
+          <Icon name="x" :size="13" :stroke="2" />
+        </button>
       </div>
       <ChatView
         :turns="turns"
@@ -549,6 +555,7 @@ function onSettingsClosed() {
         @approve="handleApprove"
         @approve-custom="handleApproveCustom"
         @adjust-plan="handleAdjustPlan"
+        @quick="handleSend"
       />
       <Composer
         :busy="streaming"
@@ -582,51 +589,73 @@ function onSettingsClosed() {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  background: var(--bg);
+  background: transparent;
 }
 
 .proj-banner {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 20px;
-  background: var(--bg-surface);
+  gap: 12px;
+  padding: 10px 26px;
+  background: rgba(10, 11, 15, 0.5);
   border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(16px);
   font-size: 12px;
 }
 
-.pb-name {
+.pb-left {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   color: var(--accent);
-  font-weight: 600;
   flex-shrink: 0;
 }
 
+.pb-name {
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
 .pb-path {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  flex: 1;
 }
 
 .pb-x {
-  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
   background: none;
   color: var(--text-faint);
-  border-radius: 4px;
-  padding: 2px 8px;
-  font-size: 11px;
+  border-radius: 7px;
   flex-shrink: 0;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
 .pb-x:hover {
   color: var(--danger);
-  border-color: var(--danger);
+  border-color: rgba(251, 113, 133, 0.25);
+  background: var(--danger-soft);
 }
 
 @media (max-width: 720px) {
   .app {
     flex-direction: column;
+  }
+
+  .proj-banner {
+    padding: 9px 16px;
   }
 }
 </style>

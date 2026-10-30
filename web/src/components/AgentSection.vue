@@ -3,9 +3,13 @@ import { computed, reactive, ref, watch } from 'vue'
 import { api } from '../lib/api'
 import type { Agent } from '../types'
 import AvatarBadge from './AvatarBadge.vue'
+import Icon from './Icon.vue'
 
 const props = defineProps<{ agents: Agent[] }>()
 const emit = defineEmits<{ changed: []; selected: [id: string] }>()
+
+// 内置人格（小柯）不在管理列表出现：它始终存在，用户不该编辑或删除
+const userAgents = computed(() => props.agents.filter((a) => !a.builtin))
 
 const EMOJI_PRESETS = ['🤖', '🐱', '🦊', '🌸', '🔮', '🧠', '🐧', '⚡', '🌙', '💻', '🎭', '🔥']
 const selectedId = ref('')
@@ -17,18 +21,18 @@ const fileInput = ref<HTMLInputElement | null>(null)
 
 const current = computed<Agent | null>(() => {
   if (creating.value) return editing.value
-  return props.agents.find((a) => a.id === selectedId.value) || null
+  return userAgents.value.find((a) => a.id === selectedId.value) || null
 })
 
 // 选中项变化或列表刷新时同步编辑副本（agents 异步加载，需把列表本身纳入监听）
 watch(
-  () => [selectedId.value, creating.value, props.agents] as const,
+  () => [selectedId.value, creating.value, userAgents.value] as const,
   () => {
     if (creating.value) return
-    if (!selectedId.value && props.agents.length) {
-      selectedId.value = props.agents[0].id // 默认选中第一个
+    if (!selectedId.value && userAgents.value.length) {
+      selectedId.value = userAgents.value[0].id // 默认选中第一个
     }
-    const a = props.agents.find((x) => x.id === selectedId.value)
+    const a = userAgents.value.find((x) => x.id === selectedId.value)
     editing.value = a ? { ...a } : null
   },
   { immediate: true, deep: false },
@@ -57,7 +61,7 @@ function startCreate() {
 
 function cancel() {
   creating.value = false
-  const a = props.agents.find((x) => x.id === selectedId.value)
+  const a = userAgents.value.find((x) => x.id === selectedId.value)
   editing.value = a ? { ...a } : null
   err.value = ''
 }
@@ -90,7 +94,7 @@ async function remove() {
   busy.value = true
   try {
     await api.deleteAgent(e.id)
-    const rest = props.agents.filter((a) => a.id !== e.id)
+    const rest = userAgents.value.filter((a) => a.id !== e.id)
     selectedId.value = rest[0]?.id || ''
     emit('changed')
   } catch (ex) {
@@ -121,11 +125,14 @@ async function onPickFile(ev: Event) {
     <div class="list-col">
       <div class="col-head">
         <span class="col-title">智能体</span>
-        <button class="btn tiny primary" @click="startCreate">＋ 新建</button>
+        <button class="btn tiny primary" @click="startCreate">
+          <Icon name="plus" :size="12" :stroke="2.2" />
+          新建
+        </button>
       </div>
       <div class="agent-list">
         <div
-          v-for="a in props.agents"
+          v-for="a in userAgents"
           :key="a.id"
           class="agent-item"
           :class="{ active: !creating && a.id === selectedId }"
@@ -136,7 +143,10 @@ async function onPickFile(ev: Event) {
             <div class="ai-name">{{ a.name }}</div>
             <div class="ai-desc">{{ a.description || (a.tools ? '可用工具' : '纯对话') }}</div>
           </div>
-          <span v-if="a.tools" class="tool-dot" title="可用工具">⚙</span>
+          <span v-if="a.tools" class="tool-dot" title="可用工具"><Icon name="settings" :size="12" /></span>
+        </div>
+        <div v-if="!userAgents.length" class="empty-list">
+          还没有自定义智能体。点「新建」创建一个，小柯作为内置人格始终可用。
         </div>
       </div>
     </div>
@@ -205,7 +215,7 @@ async function onPickFile(ev: Event) {
           </button>
         </div>
       </div>
-      <div v-else class="empty-edit">选择左侧智能体开始编辑，或点「＋ 新建」。</div>
+      <div v-else class="empty-edit">选择左侧智能体开始编辑，或点「新建」。</div>
     </div>
   </div>
 </template>
@@ -223,7 +233,7 @@ async function onPickFile(ev: Event) {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   min-height: 0;
 }
 
@@ -234,9 +244,11 @@ async function onPickFile(ev: Event) {
 }
 
 .col-title {
-  font-size: 13px;
+  font-size: 10.5px;
   font-weight: 700;
-  color: var(--text);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-faint);
 }
 
 .agent-list {
@@ -252,21 +264,25 @@ async function onPickFile(ev: Event) {
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
-  background: var(--bg);
+  background: rgba(255, 255, 255, 0.025);
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: 12px;
   cursor: pointer;
-  transition: border-color 0.15s ease, background 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    transform 0.15s var(--ease);
 }
 
 .agent-item:hover {
   border-color: var(--border-strong);
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.045);
 }
 
 .agent-item.active {
-  border-color: var(--accent);
-  background: var(--accent-soft);
+  border-color: rgba(255, 154, 61, 0.22);
+  background: linear-gradient(90deg, var(--accent-soft), rgba(255, 154, 61, 0.02));
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .ai-meta {
@@ -275,7 +291,7 @@ async function onPickFile(ev: Event) {
 }
 
 .ai-name {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
   color: var(--text);
   overflow: hidden;
@@ -284,7 +300,7 @@ async function onPickFile(ev: Event) {
 }
 
 .ai-desc {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -292,24 +308,25 @@ async function onPickFile(ev: Event) {
 }
 
 .tool-dot {
-  color: var(--accent);
-  font-size: 12px;
+  display: flex;
+  color: var(--text-faint);
 }
 
 .edit-col {
   flex: 1;
   min-width: 0;
   overflow-y: auto;
-  background: var(--bg);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.01));
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 20px 22px;
+  border-radius: 18px;
+  padding: 22px 24px;
+  box-shadow: var(--shadow-sm), var(--ring-inset);
 }
 
 .editor {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 16px;
   max-width: 640px;
 }
 
@@ -317,17 +334,19 @@ async function onPickFile(ev: Event) {
   display: flex;
   align-items: center;
   gap: 14px;
-  padding-bottom: 6px;
+  padding-bottom: 12px;
   border-bottom: 1px solid var(--border);
 }
 
 .ed-name {
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 700;
+  letter-spacing: -0.01em;
 }
 
 .ed-sub {
-  font-size: 12px;
+  margin-top: 2px;
+  font-size: 11.5px;
   color: var(--text-faint);
 }
 
@@ -338,7 +357,7 @@ async function onPickFile(ev: Event) {
 }
 
 .field label {
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-muted);
 }
 
@@ -348,24 +367,25 @@ async function onPickFile(ev: Event) {
 }
 
 .inp {
-  background: var(--bg-surface);
+  background: rgba(0, 0, 0, 0.26);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 10px;
   color: var(--text);
-  padding: 9px 12px;
-  font-size: 13px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .inp:focus {
   outline: none;
-  border-color: var(--accent);
+  border-color: var(--border-accent);
   box-shadow: var(--focus-ring);
 }
 
 .area {
   resize: vertical;
-  min-height: 130px;
-  line-height: 1.6;
+  min-height: 150px;
+  line-height: 1.7;
   font-family: inherit;
 }
 
@@ -383,18 +403,19 @@ async function onPickFile(ev: Event) {
 }
 
 .emoji-btn {
-  width: 32px;
-  height: 32px;
-  border-radius: var(--radius-sm);
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
   border: 1px solid var(--border);
-  background: var(--bg-surface);
-  font-size: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 17px;
   cursor: pointer;
-  transition: border-color 0.12s ease, transform 0.1s ease;
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.12s ease;
 }
 
 .emoji-btn:hover {
-  border-color: var(--accent);
+  border-color: var(--border-accent);
+  background: rgba(255, 255, 255, 0.055);
   transform: translateY(-1px);
 }
 
@@ -407,7 +428,7 @@ async function onPickFile(ev: Event) {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text-muted);
   cursor: pointer;
 }
@@ -420,14 +441,14 @@ async function onPickFile(ev: Event) {
 
 .err {
   color: var(--danger);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .ed-foot {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding-top: 8px;
+  padding-top: 14px;
   border-top: 1px solid var(--border);
 }
 
@@ -437,8 +458,17 @@ async function onPickFile(ev: Event) {
 
 .empty-edit {
   color: var(--text-faint);
-  font-size: 13px;
-  padding: 40px 0;
+  font-size: 12.5px;
+  padding: 48px 0;
   text-align: center;
+}
+
+.empty-list {
+  padding: 14px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  line-height: 1.6;
 }
 </style>

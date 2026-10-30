@@ -1,39 +1,76 @@
-/* 小柯 · 暗色主题令牌（复刻 opensquilla dark 风格：石墨底 + 单一品牌橙） */
+/* 小柯 · 暗色主题令牌（Aurora Graphite：暖琥珀 + 冷紫/青辅助光） */
 :root {
+  color-scheme: dark;
+
   /* 底色层级 */
-  --bg: #18181a;
-  --bg-surface: #202022;
-  --bg-surface-2: #28282b;
-  --bg-inset: #111113;
+  --bg: #0a0b0f;
+  --bg-deep: #07080b;
+  --bg-surface: #12141b;
+  --bg-surface-2: #191c25;
+  --bg-surface-3: #20242f;
+  --bg-inset: #0d0f15;
+  --bg-glass: rgba(19, 22, 30, 0.72);
+  --bg-glass-strong: rgba(25, 29, 39, 0.88);
 
   /* 文本 */
-  --text: #f5f5f7;
-  --text-muted: #9a9aa3;
-  --text-faint: #6b6b73;
+  --text: #eef1f7;
+  --text-muted: #a6aec0;
+  --text-faint: #727b8f;
 
   /* 边框 */
-  --border: #303034;
-  --border-strong: #3d3d42;
+  --border: rgba(255, 255, 255, 0.075);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --border-accent: rgba(255, 154, 61, 0.34);
 
-  /* 唯一强调色：品牌橙 */
-  --accent: #f26a1b;
-  --accent-hover: #ff7a2e;
-  --accent-soft: rgba(242, 106, 27, 0.14);
-  --accent-text: #ffffff;
+  /* 品牌色：暖琥珀 → 橙 */
+  --accent: #ff9a3d;
+  --accent-strong: #f97316;
+  --accent-hover: #ffb066;
+  --accent-soft: rgba(255, 154, 61, 0.13);
+  --accent-soft-2: rgba(255, 154, 61, 0.22);
+  --accent-text: #1b1205;
+  --accent-gradient: linear-gradient(135deg, #ffc078 0%, #ff9a3d 46%, #f26a1b 100%);
 
-  /* 状态色（少量点缀） */
-  --ok: #39d7a2;
-  --warn: #e8b23a;
-  --danger: #ff6b6b;
+  /* 辅助色 */
+  --violet: #a78bfa;
+  --violet-soft: rgba(167, 139, 250, 0.14);
+  --cyan: #67e8f9;
+  --cyan-soft: rgba(103, 232, 249, 0.12);
 
-  /* 形状与层次 */
-  --radius: 10px;
-  --radius-sm: 6px;
-  --radius-lg: 14px;
-  --shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
-  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 40%, transparent);
+  /* 状态色 */
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --danger: #fb7185;
+  --danger-soft: rgba(251, 113, 133, 0.12);
+
+  /* 形状 */
+  --radius-xs: 6px;
+  --radius-sm: 9px;
+  --radius: 13px;
+  --radius-lg: 18px;
+  --radius-xl: 24px;
+  --radius-pill: 999px;
+
+  /* 阴影与光 */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.34);
+  --shadow: 0 18px 46px rgba(0, 0, 0, 0.44), 0 2px 8px rgba(0, 0, 0, 0.28);
+  --shadow-soft: 0 10px 30px rgba(0, 0, 0, 0.28);
+  --shadow-accent: 0 10px 30px rgba(242, 106, 27, 0.24);
+  --glow-accent: 0 0 46px rgba(255, 154, 61, 0.16);
+  --focus-ring: 0 0 0 3px rgba(255, 154, 61, 0.18);
+  --ring-inset: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+
+  /* 字体 */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'Cascadia Code', 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono',
+    monospace;
 
   /* 布局 */
-  --sidebar-w: 268px;
-  --content-w: 760px;
+  --sidebar-w: 284px;
+  --content-w: 820px;
+
+  /* 动效 */
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur: 0.22s;
 }

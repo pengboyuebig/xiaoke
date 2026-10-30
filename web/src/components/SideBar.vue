@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import type { Agent, Project, SessionMeta } from '../types'
 import AvatarBadge from './AvatarBadge.vue'
+import Icon from './Icon.vue'
 
 const props = defineProps<{
   sessions: SessionMeta[]
@@ -58,7 +59,7 @@ function projectName(projects: Project[], id?: string): string {
           <div class="as-name">{{ currentAgent?.name || '小柯' }}</div>
           <div class="as-sub">点击切换智能体</div>
         </div>
-        <span class="as-caret">▾</span>
+        <span class="as-caret"><Icon name="chevron-down" :size="14" /></span>
       </div>
       <div v-if="expanding" class="as-list">
         <div
@@ -70,22 +71,24 @@ function projectName(projects: Project[], id?: string): string {
         >
           <AvatarBadge :value="a.avatar" :fallback="a.name" :size="26" />
           <span class="as-item-name">{{ a.name }}</span>
-          <span v-if="a.id === currentAgentId" class="as-check">✓</span>
+          <span v-if="a.builtin" class="as-tag" title="内置人格，不可修改">内置</span>
+          <span v-if="a.id === currentAgentId" class="as-check"><Icon name="check" :size="13" /></span>
         </div>
+        <div v-if="props.agents.length <= 1" class="as-hint">可在 设置 → 智能体 里创建更多人格</div>
       </div>
       <span class="brand-status" title="在线"></span>
     </div>
 
     <button class="new-chat" @click="emit('newChat')">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
-        <path d="M12 5v14M5 12h14" />
-      </svg>
+      <Icon name="plus" :size="15" :stroke="2.4" />
       新对话
     </button>
 
     <div class="section-label">
       项目
-      <button class="add-mini" title="新建项目" @click="emit('newProject')">＋</button>
+      <button class="add-mini" title="新建项目" @click="emit('newProject')">
+        <Icon name="plus" :size="12" :stroke="2.2" />
+      </button>
     </div>
     <div class="list short">
       <div
@@ -96,12 +99,10 @@ function projectName(projects: Project[], id?: string): string {
         :title="p.path"
         @click="emit('selectProject', p.id)"
       >
-        <span class="folder">📁</span>
+        <span class="folder"><Icon name="folder" :size="15" /></span>
         <span class="item-title">{{ p.name }}</span>
         <button class="item-del" title="删除项目（含目录内全部文件）" @click.stop="emit('removeProject', p.id)">
-          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-            <path d="M18 6L6 18M6 6l12 12" />
-          </svg>
+          <Icon name="x" :size="12" :stroke="2" />
         </button>
       </div>
       <div v-if="!projects.length" class="empty">还没有项目，点「＋」创建一个。</div>
@@ -121,10 +122,17 @@ function projectName(projects: Project[], id?: string): string {
         </span>
         <span class="item-title">{{ s.title || '新对话' }}</span>
         <span class="item-time">{{ fmtTime(s.updatedAt) }}</span>
+        <a
+          class="item-export"
+          :href="`/api/sessions/${s.id}/export`"
+          :download="`session-${s.id}.json`"
+          title="导出这个会话（JSON）"
+          @click.stop
+        >
+          <Icon name="download" :size="12" />
+        </a>
         <button class="item-del" title="删除会话" @click.stop="emit('remove', s.id)">
-          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-            <path d="M18 6L6 18M6 6l12 12" />
-          </svg>
+          <Icon name="x" :size="12" :stroke="2" />
         </button>
       </div>
       <div v-if="!sessions.length" class="empty">还没有会话。</div>
@@ -134,10 +142,7 @@ function projectName(projects: Project[], id?: string): string {
       <span class="mode-dot" :class="mode === 'mock' ? 'amber' : 'green'"></span>
       <span class="foot-text">{{ mode === 'mock' ? '演示模式' : '在线模型' }} · {{ model || '—' }}</span>
       <button class="gear" title="设置" @click="emit('openSettings')">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="3" />
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-        </svg>
+        <Icon name="settings" :size="16" />
       </button>
     </div>
   </aside>
@@ -147,37 +152,58 @@ function projectName(projects: Project[], id?: string): string {
 .sidebar {
   width: var(--sidebar-w);
   flex-shrink: 0;
-  background: var(--bg-surface);
-  border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  padding: 14px 12px;
-  gap: 12px;
+  gap: 14px;
+  padding: 16px 14px 12px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), transparent 26%),
+    rgba(9, 10, 14, 0.72);
+  border-right: 1px solid var(--border);
+  backdrop-filter: blur(22px);
+  position: relative;
+}
+
+.sidebar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: -1px;
+  width: 1px;
+  height: 180px;
+  background: linear-gradient(180deg, rgba(255, 154, 61, 0.35), transparent);
+  opacity: 0.55;
 }
 
 /* ---------- 智能体切换器 ---------- */
 .agent-switch {
   position: relative;
-  background: var(--bg);
+  background: linear-gradient(150deg, rgba(32, 37, 48, 0.96), rgba(17, 20, 27, 0.98));
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   cursor: pointer;
-  transition: border-color 0.15s ease;
+  box-shadow: var(--shadow-sm), var(--ring-inset);
+  transition:
+    border-color var(--dur) var(--ease),
+    transform var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
 }
 
 .agent-switch:hover {
   border-color: var(--border-strong);
+  transform: translateY(-1px);
 }
 
 .agent-switch.open {
-  border-color: var(--accent);
+  border-color: var(--border-accent);
+  box-shadow: var(--shadow-soft), 0 0 0 3px rgba(255, 154, 61, 0.08);
 }
 
 .as-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 9px 11px;
+  gap: 11px;
+  padding: 12px;
 }
 
 .as-meta {
@@ -188,25 +214,27 @@ function projectName(projects: Project[], id?: string): string {
 .as-name {
   font-size: 15px;
   font-weight: 700;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.01em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .as-sub {
-  font-size: 11px;
+  margin-top: 1px;
+  font-size: 10.5px;
   color: var(--text-faint);
 }
 
 .as-caret {
+  display: flex;
   color: var(--text-faint);
-  font-size: 11px;
-  transition: transform 0.15s ease;
+  transition: transform var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 
 .agent-switch.open .as-caret {
   transform: rotate(180deg);
+  color: var(--accent);
 }
 
 .as-list {
@@ -215,21 +243,21 @@ function projectName(projects: Project[], id?: string): string {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-height: 220px;
+  max-height: 240px;
   overflow-y: auto;
 }
 
 .as-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 9px;
-  border-radius: var(--radius-sm);
-  transition: background 0.12s ease;
+  gap: 9px;
+  padding: 8px 9px;
+  border-radius: 10px;
+  transition: background 0.16s ease;
 }
 
 .as-item:hover {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .as-item.active {
@@ -246,64 +274,104 @@ function projectName(projects: Project[], id?: string): string {
 }
 
 .as-check {
+  display: flex;
   color: var(--accent);
-  font-size: 12px;
+}
+
+.as-tag {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+
+.as-hint {
+  padding: 8px 9px 4px;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .brand-status {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--ok);
-  box-shadow: 0 0 6px var(--ok);
+  box-shadow: 0 0 0 4px rgba(74, 222, 128, 0.08), 0 0 12px rgba(74, 222, 128, 0.65);
   position: absolute;
-  top: 12px;
-  right: 11px;
+  top: 14px;
+  right: 14px;
 }
 
 .new-chat {
+  position: relative;
+  overflow: hidden;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 9px 12px;
-  background: var(--accent);
+  gap: 7px;
+  padding: 11px 14px;
+  background: var(--accent-gradient);
   color: var(--accent-text);
   border: none;
   border-radius: var(--radius);
-  font-weight: 600;
-  transition: background 0.15s ease;
+  font-size: 13.5px;
+  font-weight: 700;
+  box-shadow: var(--shadow-accent), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  transition: transform var(--dur) var(--ease), filter var(--dur) var(--ease);
+}
+
+.new-chat::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.3) 50%, transparent 80%);
+  transform: translateX(-130%);
+  transition: transform 0.6s var(--ease);
 }
 
 .new-chat:hover {
-  background: var(--accent-hover);
+  transform: translateY(-1px);
+  filter: brightness(1.04);
+}
+
+.new-chat:hover::after {
+  transform: translateX(130%);
 }
 
 .section-label {
-  font-size: 11px;
-  color: var(--text-faint);
-  letter-spacing: 1px;
-  padding: 0 6px;
-  margin-top: 4px;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  padding: 0 8px;
+  margin-top: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-faint);
 }
 
 .add-mini {
-  border: 1px solid var(--border);
-  background: none;
-  color: var(--text-muted);
-  border-radius: 4px;
-  width: 18px;
-  height: 18px;
-  line-height: 1;
-  font-size: 12px;
+  width: 20px;
+  height: 20px;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-faint);
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
 .add-mini:hover {
   color: var(--accent);
-  border-color: var(--accent);
+  border-color: var(--border);
+  background: var(--accent-soft);
 }
 
 .list {
@@ -312,48 +380,55 @@ function projectName(projects: Project[], id?: string): string {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  padding-right: 2px;
 }
 
 .list.short {
   flex: 0 0 auto;
-  max-height: 168px;
+  max-height: 170px;
 }
 
 .item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  border-radius: var(--radius-sm);
+  gap: 9px;
+  padding: 9px 10px;
+  border-radius: 10px;
   cursor: pointer;
   color: var(--text-muted);
   border: 1px solid transparent;
-  transition: background 0.12s ease, color 0.12s ease;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 
 .item:hover {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.045);
   color: var(--text);
 }
 
 .item.active {
-  background: var(--accent-soft);
-  border-color: var(--border);
+  background: linear-gradient(90deg, var(--accent-soft), rgba(255, 154, 61, 0.025));
+  border-color: rgba(255, 154, 61, 0.16);
   color: var(--text);
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .folder {
-  font-size: 13px;
+  display: flex;
+  color: var(--accent);
+  opacity: 0.9;
 }
 
 .proj-badge {
   flex-shrink: 0;
-  font-size: 10px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
   color: var(--accent);
-  background: var(--accent-soft);
-  border-radius: 4px;
+  background: rgba(255, 154, 61, 0.1);
+  border: 1px solid rgba(255, 154, 61, 0.16);
+  border-radius: 5px;
   padding: 1px 5px;
-  max-width: 52px;
+  max-width: 54px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -365,63 +440,102 @@ function projectName(projects: Project[], id?: string): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 13px;
+  font-size: 12.5px;
 }
 
 .item-time {
-  font-size: 11px;
-  color: var(--text-faint);
   flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.item-export {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--text-faint);
+  border-radius: 5px;
+  text-decoration: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, visibility 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.item:hover .item-export {
+  opacity: 1;
+  visibility: visible;
+}
+
+.item-export:hover {
+  color: var(--accent);
+  background: rgba(255, 154, 61, 0.12);
 }
 
 .item-del {
   flex-shrink: 0;
-  display: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
   border: none;
   background: none;
   color: var(--text-faint);
-  padding: 2px;
-  border-radius: 4px;
+  border-radius: 5px;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, visibility 0.15s ease, color 0.15s ease, background 0.15s ease;
 }
 
 .item:hover .item-del {
-  display: flex;
+  opacity: 1;
+  visibility: visible;
 }
 
 .item-del:hover {
   color: var(--danger);
-  background: rgba(255, 107, 107, 0.12);
+  background: var(--danger-soft);
 }
 
 .empty {
-  padding: 8px 6px;
+  padding: 9px 8px;
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: 11.5px;
+  line-height: 1.6;
 }
 
 .foot {
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 8px 6px 2px;
+  padding: 11px 6px 2px;
   border-top: 1px solid var(--border);
 }
 
-
 .gear {
-  border: none;
+  border: 1px solid transparent;
   background: none;
   color: var(--text-faint);
-  padding: 5px;
-  border-radius: var(--radius-sm);
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 9px;
   display: flex;
+  align-items: center;
+  justify-content: center;
   margin-left: auto;
-  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
 .gear:hover {
   color: var(--accent);
-  background: var(--bg-surface-2);
+  border-color: var(--border);
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .mode-dot {
@@ -433,14 +547,16 @@ function projectName(projects: Project[], id?: string): string {
 
 .mode-dot.green {
   background: var(--ok);
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.55);
 }
 
 .mode-dot.amber {
   background: var(--warn);
+  box-shadow: 0 0 8px rgba(251, 191, 36, 0.45);
 }
 
 .foot-text {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;

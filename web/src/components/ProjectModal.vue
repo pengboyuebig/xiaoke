@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { api } from '../lib/api'
 import type { Project } from '../types'
+import Icon from './Icon.vue'
 
 const emit = defineEmits<{ close: []; created: [project: Project] }>()
 
@@ -33,7 +34,9 @@ async function create() {
     <div class="modal">
       <div class="head">
         <span class="title">新建项目</span>
-        <button class="x" @click="emit('close')">✕</button>
+        <button class="x" @click="emit('close')" title="关闭">
+          <Icon name="x" :size="14" :stroke="2" />
+        </button>
       </div>
       <div class="body">
         <div class="row">
@@ -70,7 +73,9 @@ async function create() {
 .backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  padding: 20px;
+  background: rgba(5, 6, 9, 0.68);
+  backdrop-filter: blur(10px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -78,67 +83,88 @@ async function create() {
 }
 
 .modal {
-  width: min(460px, 92vw);
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  width: min(480px, 92vw);
+  background: linear-gradient(180deg, rgba(26, 30, 40, 0.97), rgba(16, 19, 26, 0.99));
+  border: 1px solid var(--border-strong);
+  border-radius: 20px;
   box-shadow: var(--shadow);
+  overflow: hidden;
+  animation: modalIn 0.22s var(--ease);
+}
+
+@keyframes modalIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 18px;
+  padding: 16px 20px;
   border-bottom: 1px solid var(--border);
 }
 
 .title {
   font-weight: 700;
-  font-size: 15px;
+  font-size: 15.5px;
+  letter-spacing: -0.01em;
 }
 
 .x {
-  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
   background: none;
-  color: var(--text-muted);
-  padding: 4px 8px;
-  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  border-radius: 8px;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
 .x:hover {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--border);
   color: var(--text);
 }
 
 .body {
-  padding: 16px 18px 6px;
+  padding: 18px 20px 8px;
 }
 
 .row {
   display: flex;
   flex-direction: column;
-  gap: 5px;
-  margin-bottom: 14px;
+  gap: 7px;
+  margin-bottom: 15px;
 }
 
 label {
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-muted);
 }
 
 .inp {
-  background: var(--bg);
+  background: rgba(0, 0, 0, 0.28);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 10px;
   color: var(--text);
-  padding: 8px 10px;
-  font-size: 13px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .inp:focus {
   outline: none;
-  border-color: var(--accent);
+  border-color: var(--border-accent);
   box-shadow: var(--focus-ring);
 }
 
@@ -149,23 +175,30 @@ label {
 
 .chip {
   flex: 1;
-  background: var(--bg);
+  background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--border);
   color: var(--text-muted);
-  border-radius: var(--radius-sm);
-  padding: 8px 6px;
-  font-size: 12px;
+  border-radius: 10px;
+  padding: 10px 8px;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.chip:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
 }
 
 .chip.active {
-  border-color: var(--accent);
-  color: var(--text);
+  border-color: rgba(255, 154, 61, 0.28);
+  color: var(--accent);
   background: var(--accent-soft);
 }
 
 .err {
   color: var(--danger);
-  font-size: 13px;
+  font-size: 12px;
   margin-bottom: 10px;
 }
 
@@ -173,33 +206,8 @@ label {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
-  padding: 12px 18px;
+  padding: 14px 20px;
   border-top: 1px solid var(--border);
-}
-
-.btn {
-  border: none;
-  border-radius: var(--radius-sm);
-  padding: 8px 16px;
-  font-size: 13px;
-}
-
-.btn.primary {
-  background: var(--accent);
-  color: var(--accent-text);
-}
-
-.btn.primary:hover:not(:disabled) {
-  background: var(--accent-hover);
-}
-
-.btn.primary:disabled {
-  opacity: 0.6;
-}
-
-.btn.ghost {
-  background: var(--bg-surface-2);
-  color: var(--text);
-  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.012);
 }
 </style>

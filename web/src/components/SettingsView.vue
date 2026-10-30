@@ -4,6 +4,7 @@ import { api } from '../lib/api'
 import type { Agent, MCPServerCfg, MCPStatus, SettingsView, Skill } from '../types'
 import AgentSection from './AgentSection.vue'
 import SkillSection from './SkillSection.vue'
+import Icon from './Icon.vue'
 
 const emit = defineEmits<{ close: [] }>()
 
@@ -15,12 +16,12 @@ const saveErr = ref('')
 const toast = ref('')
 
 const TABS: { id: Tab; icon: string; label: string; desc: string }[] = [
-  { id: 'agents', icon: '🤖', label: '智能体', desc: '名字、头像、人格' },
-  { id: 'skills', icon: '📚', label: '技能', desc: '可复用的知识注入' },
-  { id: 'llm', icon: '🧠', label: '模型', desc: 'API 与思考程度' },
-  { id: 'mcp', icon: '🔌', label: 'MCP', desc: '外部工具服务' },
-  { id: 'dirs', icon: '📁', label: '目录', desc: '只读授权与项目根' },
-  { id: 'adv', icon: '⚙️', label: '高级', desc: '轮数与命令白名单' },
+  { id: 'agents', icon: 'bot', label: '智能体', desc: '名字、头像、人格' },
+  { id: 'skills', icon: 'book', label: '技能', desc: '可复用的知识注入' },
+  { id: 'llm', icon: 'brain', label: '模型', desc: 'API 与思考程度' },
+  { id: 'mcp', icon: 'plug', label: 'MCP', desc: '外部工具服务' },
+  { id: 'dirs', icon: 'folder', label: '目录', desc: '只读授权与项目根' },
+  { id: 'adv', icon: 'settings', label: '高级', desc: '轮数与命令白名单' },
 ]
 
 // ---------- 数据 ----------
@@ -258,20 +259,19 @@ async function save() {
     <!-- 头部 -->
     <header class="sp-head">
       <button class="back" title="返回对话" @click="emit('close')">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M19 12H5M12 19l-7-7 7-7" />
-        </svg>
+        <Icon name="arrow-left" :size="15" />
         返回对话
       </button>
       <div class="sp-title">
-        <span class="sp-icon">⚙️</span>
+        <span class="sp-icon"><Icon name="settings" :size="18" /></span>
         <div>
           <div class="sp-name">设置中心</div>
           <div class="sp-desc">{{ tabMeta?.desc }}</div>
         </div>
       </div>
       <button class="save-btn" :disabled="saving" @click="save">
-        {{ saving ? '保存中…' : '💾 保存并应用' }}
+        <Icon name="save" :size="15" v-if="!saving" />
+        {{ saving ? '保存中…' : '保存并应用' }}
       </button>
     </header>
 
@@ -287,7 +287,7 @@ async function save() {
           :class="{ active: tab === t.id }"
           @click="tab = t.id"
         >
-          <span class="nav-icon">{{ t.icon }}</span>
+          <span class="nav-icon"><Icon :name="t.icon" :size="17" /></span>
           <span class="nav-text">
             <span class="nav-label">{{ t.label }}</span>
             <span class="nav-desc">{{ t.desc }}</span>
@@ -365,7 +365,7 @@ async function save() {
               </div>
             </div>
           </template>
-          <div class="note">💡 思考程度在对话页右下角随时调节，无需进设置。</div>
+          <div class="note"><Icon name="sparkles" :size="14" /> 思考程度在对话页右下角随时调节，无需进设置。</div>
         </section>
 
         <!-- MCP -->
@@ -373,7 +373,10 @@ async function save() {
           <div class="panel-head">
             <h2>MCP 服务</h2>
             <p>每个服务是一个本机常驻进程（stdio）。参数每行一个，路径里的空格会原样保留。</p>
-            <button class="btn ghost tiny" @click="refreshMcpStatus">↻ 刷新并重试</button>
+            <button class="btn ghost tiny" @click="refreshMcpStatus">
+              <Icon name="refresh" :size="13" />
+              刷新并重试
+            </button>
           </div>
 
           <div v-for="(m, i) in form.mcpServers" :key="i" class="mcp-card" :class="{ off: !m.enabled }">
@@ -388,9 +391,10 @@ async function save() {
             <code class="mcp-cmd">{{ m.command }} {{ m.argLines.replace(/\n/g, ' ') }}</code>
             <textarea v-model="m.argLines" class="inp wide mcp-args" rows="2" placeholder="参数，每行一个"></textarea>
             <div v-if="statusOf(m.name)" class="mcp-status" :class="statusOf(m.name)!.running ? 'ok' : 'bad'">
-              {{ statusOf(m.name)!.running ? `● 运行中 · ${statusOf(m.name)!.tools.length} 个工具` : `● ${statusOf(m.name)!.error || (statusOf(m.name)!.starting ? '启动中…' : '未运行')}` }}
-              <span v-if="statusOf(m.name)!.toolHint">（{{ statusOf(m.name)!.toolHint }}）</span>
-              <span v-if="m.readOnly" class="mcp-ro">· 只读过滤已开启</span>
+              <span class="mcp-dot"></span>
+              <span>{{ statusOf(m.name)!.running ? `运行中 · ${statusOf(m.name)!.tools.length} 个工具` : (statusOf(m.name)!.error || (statusOf(m.name)!.starting ? '启动中…' : '未运行')) }}</span>
+              <span v-if="statusOf(m.name)!.toolHint" class="mcp-hint">（{{ statusOf(m.name)!.toolHint }}）</span>
+              <span v-if="m.readOnly" class="mcp-ro">只读过滤</span>
             </div>
           </div>
           <div v-if="!form.mcpServers.length" class="empty-box">还没有 MCP 服务，用下面的方式添加。</div>
@@ -399,7 +403,10 @@ async function save() {
             <div class="card-title">一键添加 filesystem 服务（默认只读）</div>
             <div class="add-row">
               <input v-model="newMcp.dir" class="inp" placeholder="授权查看的目录绝对路径，如 D:\code\my-project" />
-              <button class="btn primary" @click="addFilesystemServer">＋ 添加</button>
+              <button class="btn primary" @click="addFilesystemServer">
+                <Icon name="plus" :size="13" :stroke="2.2" />
+                添加
+              </button>
             </div>
             <div class="hint">官方 filesystem server 本身可读写；默认勾选「只读」后，write/edit/create/move/delete 类工具不会暴露给模型。</div>
           </div>
@@ -409,7 +416,10 @@ async function save() {
               <input v-model="newMcp.name" class="inp" placeholder="名称，如 git-tools" />
               <input v-model="newMcp.command" class="inp" placeholder="命令，如 npx / python / node" />
               <textarea v-model="newMcp.argsText" class="inp wide" rows="3" placeholder="参数，每行一个（路径可含空格）"></textarea>
-              <button class="btn ghost" @click="addManualServer">添加</button>
+              <button class="btn ghost" @click="addManualServer">
+                <Icon name="plus" :size="13" :stroke="2.2" />
+                添加
+              </button>
             </div>
           </div>
         </section>
@@ -456,9 +466,24 @@ async function save() {
               <div class="hint">run_command 只允许执行这里的命令，argv 直传不经 shell。</div>
             </div>
           </div>
+
+          <div class="card backup-card">
+            <div class="card-title">数据备份</div>
+            <div class="hint">
+              删除会话时会先保留一份到 <code>data/sessions/trash/</code>，可从这里恢复。
+              服务启动时和之后每 24 小时会把全部会话打包到 <code>data/backups/</code>（保留最近 14 份）。
+              随时可以手动下载一份完整备份。
+            </div>
+            <div class="backup-actions">
+              <a class="btn ghost" href="/api/backup/sessions" download>
+                <Icon name="download" :size="14" /> 下载全部会话（ZIP）
+              </a>
+              <span class="hint">备份含会话快照与未合并日志，可直接解压查看。</span>
+            </div>
+          </div>
         </section>
 
-        <div v-if="saveErr" class="err-bar">⚠ {{ saveErr }}</div>
+        <div v-if="saveErr" class="err-bar"><Icon name="warning" :size="14" /> {{ saveErr }}</div>
       </main>
     </div>
 
@@ -472,40 +497,47 @@ async function save() {
 .settings-page {
   position: fixed;
   inset: 0;
-  background: var(--bg);
   z-index: 40;
   display: flex;
   flex-direction: column;
+  background:
+    radial-gradient(900px 520px at 8% -10%, rgba(255, 154, 61, 0.09), transparent 60%),
+    radial-gradient(720px 460px at 96% 0%, rgba(167, 139, 250, 0.08), transparent 60%),
+    var(--bg);
 }
 
 /* ---------- 头部 ---------- */
 .sp-head {
+  position: relative;
+  z-index: 2;
   display: flex;
   align-items: center;
-  gap: 20px;
-  padding: 14px 26px;
-  background: var(--bg-surface);
+  gap: 18px;
+  padding: 15px 28px;
+  background: rgba(10, 11, 15, 0.62);
   border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(20px);
   flex-shrink: 0;
 }
 
 .back {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
-  background: var(--bg-surface-2);
+  gap: 7px;
+  background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--border);
   color: var(--text-muted);
-  border-radius: var(--radius-sm);
-  padding: 7px 14px;
-  font-size: 13px;
+  border-radius: 10px;
+  padding: 8px 14px;
+  font-size: 12.5px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
 .back:hover {
   color: var(--text);
-  border-color: var(--accent);
+  border-color: var(--border-strong);
+  background: rgba(255, 255, 255, 0.07);
 }
 
 .sp-title {
@@ -513,42 +545,59 @@ async function save() {
   align-items: center;
   gap: 12px;
   flex: 1;
+  min-width: 0;
 }
 
 .sp-icon {
-  font-size: 24px;
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(145deg, rgba(255, 154, 61, 0.16), rgba(255, 154, 61, 0.05));
+  border: 1px solid rgba(255, 154, 61, 0.2);
+  color: var(--accent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
 }
 
 .sp-name {
   font-size: 16px;
   font-weight: 700;
+  letter-spacing: -0.01em;
 }
 
 .sp-desc {
-  font-size: 12px;
+  margin-top: 1px;
+  font-size: 11.5px;
   color: var(--text-faint);
 }
 
 .save-btn {
-  background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--accent-gradient);
   color: var(--accent-text);
   border: none;
-  border-radius: var(--radius-sm);
-  padding: 9px 20px;
-  font-size: 13px;
-  font-weight: 600;
+  border-radius: 10px;
+  padding: 10px 20px;
+  font-size: 12.5px;
+  font-weight: 700;
   cursor: pointer;
-  box-shadow: 0 2px 10px rgba(242, 106, 27, 0.35);
-  transition: transform 0.12s ease, box-shadow 0.12s ease;
+  box-shadow: var(--shadow-accent);
+  transition: transform 0.15s var(--ease), filter 0.15s ease;
 }
 
 .save-btn:hover:not(:disabled) {
   transform: translateY(-1px);
-  box-shadow: 0 4px 16px rgba(242, 106, 27, 0.45);
+  filter: brightness(1.04);
 }
 
 .save-btn:disabled {
-  opacity: 0.6;
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .loading {
@@ -565,14 +614,14 @@ async function save() {
 }
 
 .sp-nav {
-  width: 210px;
+  width: 222px;
   flex-shrink: 0;
-  padding: 18px 14px;
+  padding: 20px 14px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
   border-right: 1px solid var(--border);
-  background: var(--bg-surface);
+  background: rgba(9, 10, 14, 0.4);
   overflow-y: auto;
 }
 
@@ -580,27 +629,41 @@ async function save() {
   display: flex;
   align-items: center;
   gap: 11px;
-  padding: 10px 13px;
-  border-radius: var(--radius);
+  padding: 10px 12px;
+  border-radius: 11px;
   border: 1px solid transparent;
   background: none;
   cursor: pointer;
   text-align: left;
-  transition: background 0.13s ease, border-color 0.13s ease;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
 
 .nav-item:hover {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .nav-item.active {
-  background: var(--accent-soft);
-  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: linear-gradient(90deg, rgba(255, 154, 61, 0.12), rgba(255, 154, 61, 0.03));
+  border-color: rgba(255, 154, 61, 0.16);
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .nav-icon {
-  font-size: 17px;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--text-muted);
   flex-shrink: 0;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.nav-item.active .nav-icon {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .nav-text {
@@ -610,32 +673,31 @@ async function save() {
 }
 
 .nav-label {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
   color: var(--text);
 }
 
 .nav-desc {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-faint);
-}
-
-.nav-item.active .nav-label {
-  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sp-content {
   flex: 1;
   min-width: 0;
   overflow-y: auto;
-  padding: 26px 32px 40px;
+  padding: 28px 36px 48px;
   display: flex;
   flex-direction: column;
 }
 
 /* ---------- 面板 ---------- */
 .panel {
-  max-width: 860px;
+  max-width: 880px;
   width: 100%;
   display: flex;
   flex-direction: column;
@@ -647,13 +709,14 @@ async function save() {
   align-items: center;
   gap: 14px;
   flex-wrap: wrap;
-  margin-bottom: 4px;
+  margin-bottom: 2px;
 }
 
 .panel-head h2 {
   margin: 0;
-  font-size: 17px;
+  font-size: 19px;
   font-weight: 700;
+  letter-spacing: -0.02em;
 }
 
 .panel-head p {
@@ -661,23 +724,32 @@ async function save() {
   font-size: 12px;
   color: var(--text-faint);
   flex: 1;
+  min-width: 200px;
+  line-height: 1.6;
 }
 
 .card {
-  background: var(--bg-surface);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012));
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 16px 18px;
+  border-radius: 16px;
+  padding: 17px 19px;
   display: flex;
   flex-direction: column;
-  gap: 9px;
+  gap: 10px;
+  box-shadow: var(--shadow-sm), var(--ring-inset);
+  transition: border-color 0.18s ease;
+}
+
+.card:hover {
+  border-color: var(--border-strong);
 }
 
 .card-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-muted);
-  letter-spacing: 0.4px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-faint);
 }
 
 .grid {
@@ -687,18 +759,24 @@ async function save() {
 }
 
 .inp {
-  background: var(--bg);
+  background: rgba(0, 0, 0, 0.26);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 10px;
   color: var(--text);
-  padding: 9px 12px;
-  font-size: 13px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .inp:focus {
   outline: none;
-  border-color: var(--accent);
+  border-color: var(--border-accent);
   box-shadow: var(--focus-ring);
+}
+
+textarea.inp {
+  line-height: 1.6;
+  resize: vertical;
 }
 
 .preset-row {
@@ -708,19 +786,20 @@ async function save() {
 }
 
 .chip {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--border);
   color: var(--text-muted);
   border-radius: 999px;
-  padding: 5px 14px;
-  font-size: 12px;
+  padding: 6px 14px;
+  font-size: 11.5px;
   cursor: pointer;
-  transition: all 0.13s ease;
+  transition: all 0.15s ease;
 }
 
 .chip:hover {
-  border-color: var(--accent);
+  border-color: var(--border-accent);
   color: var(--text);
+  background: rgba(255, 154, 61, 0.08);
 }
 
 .key-row {
@@ -737,7 +816,7 @@ async function save() {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-muted);
   cursor: pointer;
   flex-shrink: 0;
@@ -750,14 +829,16 @@ async function save() {
 .model-line {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .model-line .inp {
   flex: 1;
+  min-width: 160px;
 }
 
 .test {
-  font-size: 12px;
+  font-size: 11.5px;
 }
 
 .test.ok {
@@ -769,70 +850,92 @@ async function save() {
 }
 
 .note {
-  font-size: 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  font-size: 11.5px;
   color: var(--text-faint);
-  background: var(--bg-surface);
+  background: rgba(255, 255, 255, 0.02);
   border: 1px dashed var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px 14px;
+  border-radius: 10px;
+  padding: 11px 14px;
+  line-height: 1.6;
+}
+
+.note :deep(.ic) {
+  margin-top: 2px;
+  color: var(--accent);
 }
 
 .hint {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-faint);
-  line-height: 1.5;
+  line-height: 1.55;
 }
 
 /* MCP */
 .mcp-card {
-  background: var(--bg-surface);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.012));
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 13px 16px;
+  border-radius: 14px;
+  padding: 14px 16px;
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 9px;
+  box-shadow: var(--shadow-sm), var(--ring-inset);
 }
 
 .mcp-card.off {
-  opacity: 0.6;
+  opacity: 0.55;
 }
 
 .mcp-top {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
 }
 
 .mcp-name {
-  font-size: 13px;
+  font-size: 12.5px;
+  font-weight: 600;
   flex: 1;
+  min-width: 100px;
 }
 
 .mcp-cmd {
-  font-size: 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
   color: var(--text-muted);
-  background: var(--bg-inset);
+  background: rgba(0, 0, 0, 0.24);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 7px 10px;
+  border-radius: 8px;
+  padding: 8px 10px;
   word-break: break-all;
 }
 
 .mcp-args {
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 12px;
-  line-height: 1.5;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.55;
   resize: vertical;
 }
 
-.mcp-ro {
-  color: var(--text-faint);
-  margin-left: 6px;
+.mcp-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
 }
 
-.mcp-status {
-  font-size: 12px;
+.mcp-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 8px currentColor;
+  flex-shrink: 0;
 }
 
 .mcp-status.ok {
@@ -843,12 +946,27 @@ async function save() {
   color: var(--danger);
 }
 
-.empty-box {
-  font-size: 12px;
+.mcp-hint {
   color: var(--text-faint);
-  padding: 12px 14px;
+}
+
+.mcp-ro {
+  margin-left: auto;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 7px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.empty-box {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  padding: 13px 15px;
   border: 1px dashed var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 10px;
 }
 
 .add-row {
@@ -876,43 +994,63 @@ async function save() {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  background: var(--bg);
+  background: rgba(0, 0, 0, 0.2);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 9px;
   padding: 9px 12px;
 }
 
 .dir-row code {
-  font-size: 12px;
+  font-size: 11px;
   word-break: break-all;
+  color: var(--text-muted);
 }
 
 /* 按钮 */
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 8px 15px;
-  font-size: 13px;
+  border-radius: 9px;
+  padding: 9px 14px;
+  font-size: 12px;
   cursor: pointer;
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.04);
   color: var(--text);
-  transition: all 0.13s ease;
+  transition: all 0.15s ease;
   white-space: nowrap;
+  text-decoration: none;
+}
+
+.backup-card {
+  margin-top: 14px;
+}
+
+.backup-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 12px;
 }
 
 .btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--accent-gradient);
+  border-color: transparent;
   color: var(--accent-text);
-  font-weight: 600;
+  font-weight: 700;
+  box-shadow: var(--shadow-accent);
 }
 
 .btn.primary:hover:not(:disabled) {
-  background: var(--accent-hover);
+  filter: brightness(1.04);
+  transform: translateY(-1px);
 }
 
 .btn.primary:disabled {
-  opacity: 0.6;
+  opacity: 0.55;
   cursor: not-allowed;
 }
 
@@ -921,13 +1059,13 @@ async function save() {
 }
 
 .btn.ghost:hover:not(:disabled) {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--border-strong);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .btn.tiny {
-  padding: 4px 11px;
-  font-size: 12px;
+  padding: 6px 10px;
+  font-size: 11px;
 }
 
 .btn.danger-ghost {
@@ -938,38 +1076,44 @@ async function save() {
 
 .btn.danger-ghost:hover {
   color: var(--danger);
-  border-color: var(--danger);
+  border-color: rgba(251, 113, 133, 0.25);
+  background: var(--danger-soft);
 }
 
 .btn.danger {
   background: transparent;
-  border-color: color-mix(in srgb, var(--danger) 50%, transparent);
+  border-color: rgba(251, 113, 133, 0.3);
   color: var(--danger);
 }
 
 .btn.danger:hover:not(:disabled) {
-  background: rgba(255, 107, 107, 0.1);
+  background: var(--danger-soft);
 }
 
 .err-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   color: var(--danger);
-  font-size: 13px;
+  font-size: 12px;
   padding: 8px 0;
 }
 
 /* Toast */
 .toast {
   position: fixed;
-  top: 70px;
+  top: 78px;
   left: 50%;
   transform: translateX(-50%);
-  background: var(--ok);
-  color: #06281c;
+  background: rgba(74, 222, 128, 0.12);
+  border: 1px solid rgba(74, 222, 128, 0.28);
+  color: var(--ok);
   font-weight: 600;
-  font-size: 13px;
-  padding: 9px 22px;
+  font-size: 12px;
+  padding: 10px 22px;
   border-radius: 999px;
   box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
   z-index: 60;
 }
 
@@ -984,14 +1128,25 @@ async function save() {
   transform: translateX(-50%) translateY(-8px);
 }
 
-@media (max-width: 860px) {
+@media (max-width: 900px) {
   .sp-nav {
-    width: 64px;
+    width: 76px;
+    padding: 16px 10px;
   }
+
   .nav-text {
     display: none;
   }
+
+  .sp-content {
+    padding: 22px 18px 36px;
+  }
+
   .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .manual-grid {
     grid-template-columns: 1fr;
   }
 }

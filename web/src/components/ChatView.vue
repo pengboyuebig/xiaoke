@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { Agent, Message, Project, Turn } from '../types'
 import TurnView from './TurnView.vue'
+import Icon from './Icon.vue'
 import { renderMarkdown } from '../lib/markdown'
 
 const props = defineProps<{
@@ -19,7 +20,10 @@ const props = defineProps<{
   awaitingApproval?: boolean
 }>()
 
-const emit = defineEmits<{ approve: []; approveCustom: [text: string]; adjustPlan: [] }>()
+const emit = defineEmits<{ approve: []; approveCustom: [text: string]; adjustPlan: []; quick: [text: string] }>()
+
+// 空状态快捷提问：让欢迎页不只是一个大头像
+const quickPrompts = ['帮我分析一下这个项目', '写一个网页小游戏', '帮我写一篇文章']
 
 const scroller = ref<HTMLElement | null>(null)
 const threadEl = ref<HTMLElement | null>(null)
@@ -122,8 +126,11 @@ function onScroll() {
 async function stick() {
   if (!pinned.value) return
   await nextTick()
-  const el = scroller.value
-  if (el) el.scrollTop = el.scrollHeight
+  // 用 threadEnd.scrollIntoView 而不是直接写 scrollTop：
+  // 长会话首次渲染高度会分几帧增长，直接写 scrollHeight 容易停在半路
+  const end = threadEnd.value
+  if (end) end.scrollIntoView({ block: 'end', behavior: 'instant' })
+  else if (scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight
 }
 
 // 依赖均为基本类型，避免返回新数组导致监听器永不触发
@@ -159,6 +166,12 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
       </p>
       <p v-else class="hero-sub">你的专属智能体 · 有什么想问的尽管说</p>
       <div class="hero-greeting md" v-html="renderMarkdown(greetingForAgent())"></div>
+      <div class="hero-actions">
+        <button v-for="q in quickPrompts" :key="q" class="hero-chip" @click="emit('quick', q)">
+          <Icon name="sparkles" :size="13" />
+          {{ q }}
+        </button>
+      </div>
       <p v-if="!props.currentProject && props.emptyProjectHint" class="hero-hint">{{ props.emptyProjectHint }}</p>
     </div>
 
@@ -186,7 +199,7 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
       <!-- 计划已生成：批准后切开发模式并立即按计划开工；也可用自己的方式实现 -->
       <div v-if="props.awaitingApproval" class="approve-bar">
         <div class="ab-main">
-          <span class="ab-icon">📋</span>
+          <span class="ab-icon"><Icon name="clipboard" :size="17" /></span>
           <span class="ab-text">计划已生成。批准后我会切到<b>开发模式</b>并立即按计划开工。</span>
         </div>
         <div class="ab-actions">
@@ -273,13 +286,14 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
   flex: 1;
   overflow-y: auto;
   scroll-behavior: smooth;
+  scroll-padding-bottom: 32px;
 }
 
 /* ---------- 我的消息导航 ---------- */
 .jump-wrap {
   position: absolute;
-  right: 24px;
-  bottom: 16px;
+  right: 28px;
+  bottom: 18px;
   z-index: 8;
   display: flex;
   flex-direction: column;
@@ -288,11 +302,11 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
 }
 
 .jump-list {
-  width: 300px;
-  max-height: 46vh;
+  width: 320px;
+  max-height: 48vh;
   display: flex;
   flex-direction: column;
-  background: var(--bg-surface);
+  background: linear-gradient(180deg, #1c202a 0%, #14171f 100%);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow);
@@ -300,16 +314,18 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
 }
 
 .jl-head {
-  padding: 9px 14px;
-  font-size: 12px;
+  padding: 11px 15px;
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
   color: var(--text-faint);
   border-bottom: 1px solid var(--border);
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.025);
 }
 
 .jl-body {
   overflow-y: auto;
-  padding: 5px;
+  padding: 6px;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -319,30 +335,31 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
   display: flex;
   align-items: baseline;
   gap: 9px;
-  padding: 8px 10px;
-  border-radius: var(--radius-sm);
+  padding: 9px 10px;
+  border-radius: 9px;
   border: none;
   background: none;
   cursor: pointer;
   text-align: left;
-  transition: background 0.12s ease;
+  transition: background 0.15s ease;
 }
 
 .jl-item:hover {
-  background: var(--accent-soft);
+  background: rgba(255, 255, 255, 0.055);
 }
 
 .jl-idx {
   flex-shrink: 0;
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 50%;
-  background: var(--bg-surface-2);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
   color: var(--text-faint);
   font-size: 10px;
+  font-variant-numeric: tabular-nums;
 }
 
 .jl-text {
@@ -357,50 +374,37 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
 
 .jl-time {
   flex-shrink: 0;
-  font-size: 10.5px;
+  font-size: 10px;
   color: var(--text-faint);
 }
 
-.jump-my {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 14px;
-  border-radius: 999px;
-  background: var(--bg-surface-2);
-  border: 1px solid var(--border-strong);
-  color: var(--text-muted);
-  font-size: 12.5px;
-  cursor: pointer;
-  box-shadow: var(--shadow);
-  transition: all 0.15s ease;
-}
-
-.jump-my:hover,
-.jump-my.open {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-/* 回到底部按钮 */
+.jump-my,
 .jump-bottom {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 8px 14px;
+  gap: 7px;
+  padding: 9px 15px;
   border-radius: 999px;
-  background: var(--bg-surface-2);
+  background: var(--bg-glass-strong);
   border: 1px solid var(--border-strong);
   color: var(--text-muted);
-  font-size: 12.5px;
+  font-size: 12px;
   cursor: pointer;
-  box-shadow: var(--shadow);
-  transition: all 0.15s ease;
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(18px);
+  transition:
+    transform 0.15s var(--ease),
+    border-color 0.15s ease,
+    color 0.15s ease,
+    background 0.15s ease;
 }
 
+.jump-my:hover,
+.jump-my.open,
 .jump-bottom:hover {
-  border-color: var(--accent);
+  border-color: var(--border-accent);
   color: var(--accent);
+  background: var(--bg-surface-2);
   transform: translateY(-1px);
 }
 
@@ -412,9 +416,9 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
   align-items: center;
   justify-content: center;
   border-radius: 999px;
-  background: var(--accent);
+  background: var(--accent-gradient);
   color: var(--accent-text);
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 700;
 }
 
@@ -425,186 +429,311 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
 
 @keyframes jumpGlow {
   0% {
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 55%, transparent);
+    box-shadow: 0 0 0 4px rgba(255, 154, 61, 0.35), 0 10px 30px rgba(255, 154, 61, 0.16);
   }
   100% {
-    box-shadow: 0 0 0 0 transparent;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
   }
 }
 
+/* ---------- 欢迎页 ---------- */
 .hero {
+  position: relative;
   max-width: var(--content-w);
   margin: 0 auto;
   padding: 12vh 24px 0;
   text-align: center;
 }
 
+.hero::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 3vh;
+  width: 460px;
+  height: 460px;
+  transform: translateX(-50%);
+  background: radial-gradient(
+    circle,
+    rgba(255, 154, 61, 0.15),
+    rgba(167, 139, 250, 0.05) 45%,
+    transparent 68%
+  );
+  filter: blur(10px);
+  pointer-events: none;
+}
+
+.hero > * {
+  position: relative;
+  z-index: 1;
+}
+
 .hero-avatar {
-  width: 96px;
-  height: 96px;
+  width: 104px;
+  height: 104px;
   border-radius: 50%;
   object-fit: cover;
   object-position: center 26%;
-  border: 2px solid var(--accent);
-  box-shadow: var(--shadow);
+  border: 2px solid rgba(255, 154, 61, 0.6);
+  box-shadow:
+    0 0 0 8px rgba(255, 154, 61, 0.05),
+    0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 24px 60px rgba(0, 0, 0, 0.5),
+    0 0 70px rgba(255, 154, 61, 0.14);
 }
 
 .emoji-hero {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 48px;
-  background: var(--bg-surface-2);
+  font-size: 52px;
+  background: linear-gradient(150deg, var(--bg-surface-2), var(--bg-inset));
 }
 
 .hero-title {
-  margin: 16px 0 2px;
-  font-size: 26px;
-  letter-spacing: 2px;
+  margin: 18px 0 4px;
+  font-size: 32px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  background: linear-gradient(135deg, #fff 10%, #ffe0bd 55%, #ff9a3d 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
 
 .hero-sub {
-  margin: 0 0 18px;
+  margin: 0 0 22px;
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: 12.5px;
+  letter-spacing: 0.02em;
 }
 
 .proj {
   color: var(--accent);
+  font-weight: 600;
 }
 
 .hero-greeting {
-  display: inline-block;
+  display: block;
+  max-width: 560px;
+  margin: 0 auto;
   text-align: left;
-  background: var(--bg-surface);
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018));
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: 10px 16px;
+  padding: 15px 20px;
   color: var(--text-muted);
+  box-shadow: var(--shadow-soft), var(--ring-inset);
+  backdrop-filter: blur(16px);
+  font-size: 13.5px;
+  line-height: 1.7;
+}
+
+.hero-actions {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.hero-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-muted);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease,
+    transform 0.15s var(--ease);
+}
+
+.hero-chip:hover {
+  border-color: var(--border-accent);
+  background: rgba(255, 154, 61, 0.07);
+  color: var(--text);
+  transform: translateY(-1px);
+}
+
+.hero-chip :deep(.ic) {
+  color: var(--accent);
 }
 
 .hero-hint {
+  display: inline-block;
   margin: 14px 0 0;
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: 11.5px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.02);
 }
 
+/* ---------- 消息流 ---------- */
 .thread {
   max-width: var(--content-w);
   margin: 0 auto;
-  padding: 16px 24px 8px;
+  padding: 26px 28px 10px;
 }
 
 .turn-item {
-  margin-bottom: 8px;
+  margin-bottom: 10px;
 }
 
 /* 用户问题气泡（右对齐） */
 .msg.user {
   display: flex;
   justify-content: flex-end;
-  padding: 10px 0 4px;
+  padding: 18px 0 6px;
 }
 
 .msg.user .body {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  max-width: 72%;
+  max-width: 78%;
 }
 
 .msg.user .meta {
   text-align: right;
-  margin-bottom: 2px;
+  margin-bottom: 4px;
 }
 
 .msg.user .name {
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
   color: var(--accent);
+  opacity: 0.85;
 }
 
 .user-bubble {
   display: inline-block;
-  background: color-mix(in srgb, var(--accent) 16%, var(--bg-surface));
-  border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
+  background: linear-gradient(135deg, rgba(255, 154, 61, 0.17), rgba(255, 154, 61, 0.065));
+  border: 1px solid rgba(255, 154, 61, 0.23);
   color: var(--text);
-  border-radius: var(--radius-lg);
-  border-top-right-radius: var(--radius-sm);
-  padding: 8px 14px;
+  border-radius: 18px 18px 6px 18px;
+  padding: 11px 16px;
+  font-size: 13.5px;
+  line-height: 1.68;
   white-space: pre-wrap;
   word-break: break-word;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
 .thread-end {
-  height: 12px;
+  height: 16px;
 }
 
 /* ---------- 计划批准条 ---------- */
 .approve-bar {
-  margin: 6px 0 10px;
-  padding: 13px 16px;
-  border: 1px solid color-mix(in srgb, #56c2e6 45%, var(--border));
+  position: relative;
+  overflow: hidden;
+  margin: 8px 0 12px;
+  padding: 16px 18px;
+  border: 1px solid rgba(103, 232, 249, 0.22);
   border-radius: var(--radius-lg);
-  background: linear-gradient(180deg, rgba(86, 194, 230, 0.12), rgba(86, 194, 230, 0.04));
+  background: linear-gradient(
+    155deg,
+    rgba(103, 232, 249, 0.095),
+    rgba(167, 139, 250, 0.05) 55%,
+    rgba(255, 255, 255, 0.02)
+  );
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
+  gap: 13px;
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(16px);
+}
+
+.approve-bar::before {
+  content: '';
+  position: absolute;
+  left: -40px;
+  top: -60px;
+  width: 180px;
+  height: 180px;
+  background: radial-gradient(circle, rgba(103, 232, 249, 0.18), transparent 70%);
+  pointer-events: none;
 }
 
 .ab-main {
+  position: relative;
   flex: 1;
   min-width: 220px;
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 11px;
   font-size: 13px;
   color: var(--text);
 }
 
 .ab-icon {
-  font-size: 18px;
+  width: 36px;
+  height: 36px;
+  border-radius: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(103, 232, 249, 0.12);
+  border: 1px solid rgba(103, 232, 249, 0.18);
+  color: var(--cyan);
   flex-shrink: 0;
 }
 
 .ab-text b {
-  color: #56c2e6;
+  color: var(--cyan);
 }
 
 .ab-actions {
+  position: relative;
   display: flex;
   gap: 9px;
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
 
 .ab-btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  border-radius: var(--radius-sm);
-  padding: 8px 16px;
-  font-size: 13px;
+  gap: 7px;
+  border-radius: 10px;
+  padding: 9px 16px;
+  font-size: 12.5px;
   cursor: pointer;
   border: 1px solid transparent;
-  transition: all 0.15s ease;
+  transition:
+    transform 0.15s var(--ease),
+    border-color 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease;
   white-space: nowrap;
 }
 
 .ab-btn.primary {
-  background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+  background: var(--accent-gradient);
   color: var(--accent-text);
-  font-weight: 600;
-  box-shadow: 0 2px 10px rgba(242, 106, 27, 0.3);
+  font-weight: 700;
+  box-shadow: var(--shadow-accent);
 }
 
 .ab-btn.primary:hover {
   transform: translateY(-1px);
-  box-shadow: 0 4px 14px rgba(242, 106, 27, 0.42);
+  filter: brightness(1.04);
 }
 
 .ab-btn.ghost {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.04);
   border-color: var(--border);
   color: var(--text-muted);
 }
@@ -612,11 +741,13 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
 .ab-btn.ghost:hover {
   border-color: var(--border-strong);
   color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .ab-btn.ghost.active {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: rgba(103, 232, 249, 0.35);
+  color: var(--cyan);
+  background: rgba(103, 232, 249, 0.08);
 }
 
 /* 自定义实现方式输入区 */
@@ -624,30 +755,30 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
   flex-basis: 100%;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding-top: 10px;
-  border-top: 1px dashed color-mix(in srgb, #56c2e6 35%, var(--border));
+  gap: 9px;
+  padding-top: 12px;
+  border-top: 1px dashed rgba(103, 232, 249, 0.22);
 }
 
 .ab-input {
   width: 100%;
   box-sizing: border-box;
-  background: var(--bg);
+  background: rgba(0, 0, 0, 0.28);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 10px;
   color: var(--text);
-  padding: 9px 12px;
+  padding: 11px 13px;
   font-size: 13px;
-  line-height: 1.6;
+  line-height: 1.65;
   resize: vertical;
-  min-height: 70px;
+  min-height: 74px;
   font-family: inherit;
 }
 
 .ab-input:focus {
   outline: none;
-  border-color: var(--accent);
-  box-shadow: var(--focus-ring);
+  border-color: rgba(103, 232, 249, 0.4);
+  box-shadow: 0 0 0 3px rgba(103, 232, 249, 0.12);
 }
 
 .ab-custom-foot {
@@ -658,14 +789,37 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
 }
 
 .ab-hint {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-faint);
 }
 
 .ab-btn.primary:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
   transform: none;
   box-shadow: none;
+}
+
+@media (max-width: 760px) {
+  .thread {
+    padding: 18px 16px 8px;
+  }
+
+  .msg.user .body {
+    max-width: 88%;
+  }
+
+  .jump-wrap {
+    right: 14px;
+    bottom: 12px;
+  }
+
+  .hero {
+    padding-top: 8vh;
+  }
+
+  .hero-title {
+    font-size: 27px;
+  }
 }
 </style>

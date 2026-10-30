@@ -1,13 +1,16 @@
 package chat
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,7 +50,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/sessions", h.listSessions)
 	mux.HandleFunc("POST /api/sessions", h.createSession)
 	mux.HandleFunc("GET /api/sessions/{id}", h.getSession)
+	mux.HandleFunc("GET /api/sessions/{id}/export", h.exportSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", h.deleteSession)
+	mux.HandleFunc("GET /api/backup/sessions", h.backupSessions)
 	mux.HandleFunc("POST /api/chat", h.chat)
 }
 
@@ -107,6 +112,82 @@ func (h *Handler) deleteSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "1"})
 }
 
+// exportSession 下载单个会话的完整 JSON（含未合并日志里的消息）。
+func (h *Handler) exportSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	data, err := h.store.Export(id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	filename := fmt.Sprintf("session-%s.json", id)
+	if sess, err := h.store.Get(id); err == nil && strings.TrimSpace(sess.Title) != "" {
+		filename = fmt.Sprintf("session-%s-%s.json", id, sanitizeFilename(sess.Title))
+	}
+	serveDownload(w, filename, "application/json; charset=utf-8", data)
+}
+
+// backupSessions 把所有会话打包成 zip 下载。
+func (h *Handler) backupSessions(w http.ResponseWriter, r *http.Request) {
+	var buf bytes.Buffer
+	if err := h.store.WriteBackup(&buf); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	filename := "sessions-" + time.Now().Format("20060102-150405") + ".zip"
+	serveDownload(w, filename, "application/zip", buf.Bytes())
+}
+
+// serveDownload 以附件形式返回数据（浏览器直接触发下载）。
+// 文件名可能含中文：ASCII 版走 filename，UTF-8 版走 filename*（RFC 5987）。
+func serveDownload(w http.ResponseWriter, filename, contentType string, data []byte) {
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", asciiFallback(filename), url.PathEscape(filename)))
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(data)
+}
+
+// asciiFallback 把非 ASCII 字符换成 '-'，给不支持 filename* 的客户端一个可用名。
+func asciiFallback(s string) string {
+	out := strings.Map(func(r rune) rune {
+		if r < 0x20 || r > 0x7e || r == '"' || r == '\\' {
+			return '-'
+		}
+		return r
+	}, s)
+	out = strings.Trim(out, " .-")
+	if out == "" {
+		return "download"
+	}
+	return out
+}
+
+// sanitizeFilename 去掉文件名里不允许的字符，避免响应头注入或非法文件名。
+func sanitizeFilename(s string) string {
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|', '\r', '\n', '\t':
+			return '-'
+		}
+		return r
+	}, s)
+	rs := []rune(strings.TrimSpace(s))
+	if len(rs) > 40 {
+		rs = rs[:40]
+	}
+	out := strings.Trim(string(rs), " .-")
+	if out == "" {
+		return "untitled"
+	}
+	return out
+}
+
 type chatRequest struct {
 	SessionID string `json:"sessionId"`
 	Content   string `json:"content"`
@@ -159,9 +240,8 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if agent == nil {
-		list := h.agents.List()
-		if len(list) > 0 {
-			agent = &list[0]
+		if def, ok := h.agents.Default(); ok {
+			agent = &def
 		}
 	}
 

@@ -125,6 +125,8 @@ export interface Agent {
   avatar?: string // /assets/... 或 emoji
   systemPrompt?: string
   tools: boolean
+  /** 内置人格（小柯）：对用户隐藏，不可编辑或删除 */
+  builtin?: boolean
   createdAt: string
   updatedAt: string
 }

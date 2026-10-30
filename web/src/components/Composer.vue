@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
+import Icon from './Icon.vue'
 
 const props = defineProps<{ busy: boolean; reasoning: string; mode?: string }>()
 const emit = defineEmits<{
@@ -73,20 +74,20 @@ function onLevelChange(e: Event) {
       <div ref="modeWrap" class="mode-wrap">
         <div v-if="modeMenuOpen" class="mode-menu">
           <button class="mode-opt" :class="{ active: isPlan() }" @click="pickMode('plan')">
-            <span class="mo-icon">📋</span>
+            <span class="mo-icon"><Icon name="plan" :size="16" /></span>
             <span class="mo-text">
               <b>计划模式</b>
               <i>先调研出计划，只读不改，确认后才开发</i>
             </span>
-            <span v-if="isPlan()" class="mo-check">✓</span>
+            <span v-if="isPlan()" class="mo-check"><Icon name="check" :size="13" /></span>
           </button>
           <button class="mode-opt" :class="{ active: !isPlan() }" @click="pickMode('build')">
-            <span class="mo-icon">🛠️</span>
+            <span class="mo-icon"><Icon name="build" :size="16" /></span>
             <span class="mo-text">
               <b>开发模式</b>
               <i>完整能力：读写文件、执行命令</i>
             </span>
-            <span v-if="!isPlan()" class="mo-check">✓</span>
+            <span v-if="!isPlan()" class="mo-check"><Icon name="check" :size="13" /></span>
           </button>
         </div>
         <button
@@ -95,7 +96,7 @@ function onLevelChange(e: Event) {
           :title="isPlan() ? '计划模式：先调研再开发（点击切换）' : '开发模式：完整能力（点击切换）'"
           @click="modeMenuOpen = !modeMenuOpen"
         >
-          <span class="mb-icon">{{ isPlan() ? '📋' : '🛠️' }}</span>
+          <span class="mb-icon"><Icon :name="isPlan() ? 'plan' : 'build'" :size="15" /></span>
           <span class="mb-label">{{ isPlan() ? '计划' : '开发' }}</span>
         </button>
       </div>
@@ -113,16 +114,14 @@ function onLevelChange(e: Event) {
         <span class="stop-icon"></span>
       </button>
       <button v-else class="btn send" title="发送" :disabled="!text.trim()" @click="submit">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 19V5M5 12l7-7 7 7" />
-        </svg>
+        <Icon name="arrow-up" :size="17" :stroke="2.2" />
       </button>
     </div>
     <div class="hint-row">
       <span class="hint">小柯可能也会犯错，重要信息请自行核实。</span>
       <!-- 右下角：思考程度（当前会话的下一条消息生效，浏览器本地记住） -->
       <label class="level" title="模型思考程度（reasoning_effort），下一条消息生效">
-        <span class="level-icon">🧠</span>
+        <span class="level-icon"><Icon name="brain" :size="14" /></span>
         <select :value="props.reasoning" @change="onLevelChange">
           <option v-for="l in LEVELS" :key="l.value" :value="l.value">{{ l.label }}</option>
         </select>
@@ -133,26 +132,44 @@ function onLevelChange(e: Event) {
 
 <style scoped>
 .composer-wrap {
+  position: relative;
   max-width: var(--content-w);
   width: 100%;
   margin: 0 auto;
-  padding: 0 24px 14px;
+  padding: 0 28px 16px;
+}
+
+.composer-wrap::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -48px;
+  height: 48px;
+  background: linear-gradient(180deg, transparent, rgba(10, 11, 15, 0.72));
+  pointer-events: none;
 }
 
 .composer {
+  position: relative;
   display: flex;
   align-items: flex-end;
-  gap: 8px;
-  background: var(--bg-surface);
+  gap: 7px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.022));
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 10px 10px 10px 16px;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  border-radius: 20px;
+  padding: 9px;
+  box-shadow: var(--shadow-soft), var(--ring-inset);
+  backdrop-filter: blur(20px);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
 }
 
 .composer:focus-within {
-  border-color: var(--accent);
-  box-shadow: var(--focus-ring);
+  border-color: rgba(255, 154, 61, 0.35);
+  box-shadow:
+    0 0 0 3px rgba(255, 154, 61, 0.09),
+    0 18px 44px rgba(0, 0, 0, 0.35),
+    var(--ring-inset);
 }
 
 /* ---------- 输入框左侧：工作模式 ---------- */
@@ -165,84 +182,101 @@ function onLevelChange(e: Event) {
 .mode-btn {
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 7px 11px;
-  border-radius: 999px;
+  gap: 6px;
+  padding: 8px 11px;
+  border-radius: 12px;
   border: 1px solid var(--border);
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.045);
   color: var(--text-muted);
   font-size: 12px;
   cursor: pointer;
   white-space: nowrap;
-  transition: all 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease;
 }
 
 .mode-btn:hover {
   border-color: var(--border-strong);
   color: var(--text);
+  background: rgba(255, 255, 255, 0.07);
 }
 
 .mode-btn.plan {
-  border-color: color-mix(in srgb, #56c2e6 45%, transparent);
-  background: rgba(86, 194, 230, 0.1);
-  color: #56c2e6;
+  border-color: rgba(103, 232, 249, 0.28);
+  background: rgba(103, 232, 249, 0.09);
+  color: var(--cyan);
 }
 
 .mode-btn.build {
-  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  border-color: rgba(255, 154, 61, 0.26);
   background: var(--accent-soft);
   color: var(--accent);
 }
 
 .mb-icon {
-  font-size: 13px;
+  display: flex;
 }
 
 .mb-label {
   font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
 .mode-menu {
   position: absolute;
   bottom: calc(100% + 10px);
   left: 0;
-  width: 268px;
-  background: var(--bg-surface);
+  width: 290px;
+  background: linear-gradient(180deg, #1c202a 0%, #14171f 100%);
   border: 1px solid var(--border-strong);
-  border-radius: var(--radius-lg);
+  border-radius: 16px;
   box-shadow: var(--shadow);
   padding: 6px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
   z-index: 30;
 }
 
 .mode-opt {
   display: flex;
   align-items: flex-start;
-  gap: 9px;
-  padding: 9px 10px;
-  border-radius: var(--radius-sm);
+  gap: 10px;
+  padding: 11px;
+  border-radius: 11px;
   border: 1px solid transparent;
   background: none;
   cursor: pointer;
   text-align: left;
-  transition: background 0.12s ease;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
 
 .mode-opt:hover {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.055);
 }
 
 .mode-opt.active {
-  background: var(--accent-soft);
-  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  background: linear-gradient(135deg, rgba(255, 154, 61, 0.12), rgba(255, 154, 61, 0.04));
+  border-color: rgba(255, 154, 61, 0.18);
 }
 
 .mo-icon {
-  font-size: 15px;
-  margin-top: 1px;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.mode-opt.active .mo-icon {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .mo-text {
@@ -266,20 +300,24 @@ function onLevelChange(e: Event) {
 }
 
 .mo-check {
+  display: flex;
   color: var(--accent);
-  font-size: 13px;
+  margin-top: 5px;
 }
 
 textarea {
   flex: 1;
+  min-width: 0;
   background: none;
   border: none;
   outline: none;
   resize: none;
   color: var(--text);
-  line-height: 1.55;
-  padding: 4px 0;
-  max-height: 150px;
+  font-size: 14px;
+  line-height: 1.6;
+  padding: 8px 4px 7px;
+  min-height: 36px;
+  max-height: 160px;
 }
 
 textarea::placeholder {
@@ -288,47 +326,51 @@ textarea::placeholder {
 
 .btn {
   flex-shrink: 0;
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
+  width: 38px;
+  height: 38px;
+  border-radius: 13px;
   border: none;
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background 0.15s ease, transform 0.1s ease;
+  transition: transform 0.12s ease, filter 0.15s ease, background 0.15s ease;
 }
 
 .btn.send {
-  background: var(--accent);
+  background: var(--accent-gradient);
   color: var(--accent-text);
+  box-shadow: var(--shadow-accent), inset 0 1px 0 rgba(255, 255, 255, 0.35);
 }
 
 .btn.send:hover:not(:disabled) {
-  background: var(--accent-hover);
+  filter: brightness(1.05);
+  transform: translateY(-1px);
 }
 
 .btn.send:active {
-  transform: scale(0.94);
+  transform: scale(0.95);
 }
 
 .btn.send:disabled {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.05);
   color: var(--text-faint);
+  box-shadow: none;
   cursor: not-allowed;
 }
 
 .btn.stop {
-  background: var(--bg-surface-2);
-  border: 1px solid var(--border-strong);
+  background: rgba(251, 113, 133, 0.1);
+  border: 1px solid rgba(251, 113, 133, 0.25);
 }
 
 .btn.stop:hover {
-  border-color: var(--danger);
+  background: rgba(251, 113, 133, 0.16);
+  border-color: rgba(251, 113, 133, 0.45);
 }
 
 .stop-icon {
-  width: 11px;
-  height: 11px;
+  width: 10px;
+  height: 10px;
   background: var(--danger);
   border-radius: 2px;
 }
@@ -339,45 +381,80 @@ textarea::placeholder {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-top: 8px;
+  margin-top: 9px;
+  padding: 0 4px;
 }
 
 .hint {
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: 10.5px;
 }
 
 .level {
   display: flex;
   align-items: center;
-  gap: 5px;
-  font-size: 12px;
+  gap: 6px;
+  font-size: 11px;
   color: var(--text-muted);
   flex-shrink: 0;
   cursor: pointer;
 }
 
 .level-icon {
-  font-size: 13px;
+  display: flex;
+  color: var(--text-faint);
 }
 
 .level select {
-  background: var(--bg-surface);
+  appearance: none;
+  -webkit-appearance: none;
+  background-color: rgba(255, 255, 255, 0.04);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--text-faint) 50%),
+    linear-gradient(135deg, var(--text-faint) 50%, transparent 50%);
+  background-position:
+    calc(100% - 12px) 50%,
+    calc(100% - 8px) 50%;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 999px;
-  padding: 3px 10px;
-  font-size: 12px;
+  padding: 4px 24px 4px 10px;
+  font-size: 11px;
   cursor: pointer;
   outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .level select:hover {
-  border-color: var(--accent);
+  border-color: var(--border-strong);
 }
 
 .level select:focus {
-  border-color: var(--accent);
+  border-color: var(--border-accent);
   box-shadow: var(--focus-ring);
+}
+
+@media (max-width: 760px) {
+  .composer-wrap {
+    padding: 0 14px 12px;
+  }
+
+  .mode-btn {
+    padding: 8px 10px;
+  }
+
+  .mb-label {
+    display: none;
+  }
+
+  .hint {
+    display: none;
+  }
+
+  .hint-row {
+    justify-content: flex-end;
+  }
 }
 </style>

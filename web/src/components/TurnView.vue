@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, onUpdated, ref, watch } from 'vue'
 import hljs from 'highlight.js/lib/common'
 import type { MsgGroup, ToolPair } from '../types'
+import Icon from './Icon.vue'
 import { renderMarkdownCollapsed } from '../lib/markdown'
 
 const props = defineProps<{
@@ -62,6 +63,26 @@ const toolRounds = computed(() => {
   }
   return rounds.size
 })
+
+// 是否有可见正文（忽略只有空白字符的 delta）
+const hasSections = computed(() =>
+  allGroups.value.some((g) => (g.sections || []).some((s) => s.trim() !== '')),
+)
+
+// 流式中且没有工具/错误时显示状态胶囊：
+// 首 token 前显示「正在思考」，文本开始输出后显示「正在输入」。
+const showStatus = computed(() => props.streaming && !hasWork.value && !turnError.value)
+const statusText = computed(() => (hasSections.value ? '正在输入' : '正在思考'))
+
+// 流式结束但既没有正文也没有工具（模型空回复 / 首 token 前停止）
+const isEmptyReply = computed(
+  () =>
+    !props.streaming &&
+    !turnError.value &&
+    toolCount.value === 0 &&
+    !hasSections.value &&
+    !!props.startTime,
+)
 
 // 工作时长（首条→末条；流式中实时走秒）
 const now = ref(Date.now())
@@ -170,11 +191,13 @@ function resultLabel(t: ToolPair): string {
 }
 
 function toolIcon(name: string): string {
-  if (name.startsWith('mcp_')) return '🔌'
-  if (name === 'run_command') return '⌨'
-  if (name === 'write_file') return '✏️'
-  if (name === 'read_file' || name === 'list_files' || name === 'search_files') return '🔍'
-  return '⚙'
+  if (name.startsWith('mcp_')) return 'plug'
+  if (name === 'run_command') return 'terminal'
+  if (name === 'write_file') return 'edit'
+  if (name === 'read_file') return 'file'
+  if (name === 'list_files') return 'folder'
+  if (name === 'search_files') return 'search'
+  return 'settings'
 }
 
 // 代码高亮（内容为 v-html 注入，需要在挂载/更新后处理）
@@ -196,26 +219,32 @@ onUpdated(highlight)
         <span class="live-dot"></span>
         工作中 · {{ durText }}
       </span>
-      <span v-else-if="turnError" class="th-err">⚠ 出错了 · 点击查看详情</span>
+      <span v-else-if="turnError" class="th-err"><Icon name="warning" :size="14" /> 出错了 · 点击查看详情</span>
       <span v-else class="th-done">已工作 {{ durText }}</span>
       <span class="th-meta" v-if="toolCount">{{ toolRounds }} 轮 · {{ toolCount }} 次工具</span>
-      <span class="th-chevron">{{ expanded ? '▲' : '▼' }}</span>
+      <span class="th-chevron" :class="{ up: expanded }">
+        <Icon :name="expanded ? 'chevron-up' : 'chevron-down'" :size="14" />
+      </span>
     </button>
 
     <!-- 错误全文常显（不随明细收起） -->
-    <div v-if="turnError && !expanded" class="err-inline">⚠ {{ turnError }}</div>
+    <div v-if="turnError && !expanded" class="err-inline">
+      <Icon name="warning" :size="14" />
+      <span>{{ turnError }}</span>
+    </div>
 
-    <!-- 工作过程（可折叠）：工具时间线 + 完整参数结果 + 错误 -->
-    <div v-if="expanded" class="turn-detail">
+    <!-- 工作过程（可折叠）：工具时间线 + 完整参数结果 + 错误；没有内容时不渲染空框 -->
+    <div v-if="expanded && (toolCount || turnError)" class="turn-detail">
       <!-- 工具时间线 -->
       <div v-if="toolCount" class="tl">
         <div v-for="(t, i) in allTools" :key="'t' + i" class="tl-row">
-          <span class="tl-icon">{{ toolIcon(t.name) }}</span>
+          <span class="tl-icon"><Icon :name="toolIcon(t.name)" :size="14" /></span>
           <span class="tl-tool">{{ t.name }}</span>
           <span v-if="argLabel(t)" class="tl-arg">{{ argLabel(t) }}</span>
-          <span v-if="t.result !== undefined" class="tl-arrow">→</span>
+          <span v-if="t.result !== undefined" class="tl-arrow"><Icon name="arrow-right" :size="12" /></span>
           <span v-if="t.result !== undefined" class="tl-res" :class="t.ok ? 'ok' : 'bad'">
-            {{ t.ok ? resultLabel(t) : '✗ 失败' }}
+            <Icon v-if="!t.ok" name="x" :size="12" />
+            {{ t.ok ? resultLabel(t) : '失败' }}
           </span>
           <span v-else class="tl-run">运行中…</span>
         </div>
@@ -226,9 +255,10 @@ onUpdated(highlight)
         <summary>查看完整参数与结果</summary>
         <div v-for="(t, i) in allTools" :key="'r' + i" class="raw-item">
           <div class="ri-head">
-            <span class="ri-tool">⚙ {{ t.name }}</span>
+            <span class="ri-tool"><Icon name="settings" :size="12" /> {{ t.name }}</span>
             <span class="ri-status" :class="t.ok === false ? 'bad' : t.ok === true ? 'ok' : ''">
-              {{ t.result === undefined ? '执行中…' : t.ok ? '✓ 成功' : '✗ 失败' }}
+              <Icon :name="t.result === undefined ? 'clock' : t.ok ? 'check' : 'x'" :size="12" />
+              {{ t.result === undefined ? '执行中…' : t.ok ? '成功' : '失败' }}
             </span>
           </div>
           <pre v-if="t.arguments" class="ri-args">{{ t.arguments }}</pre>
@@ -238,7 +268,10 @@ onUpdated(highlight)
 
       <!-- 错误（展开态内） -->
       <div v-for="(g, gi) in allGroups" :key="'e' + gi">
-        <div v-if="g.error" class="error-box">⚠ {{ g.error }}</div>
+        <div v-if="g.error" class="error-box">
+          <Icon name="warning" :size="14" />
+          <span>{{ g.error }}</span>
+        </div>
       </div>
     </div>
 
@@ -248,12 +281,22 @@ onUpdated(highlight)
         <div v-for="(s, si) in g.sections || []" :key="'s' + si" class="turn-text md" v-html="render(s)"></div>
       </div>
     </div>
+
+    <!-- 流式状态：首 token 前「正在思考」，出字后「正在输入」 -->
+    <div v-if="showStatus" class="turn-status" role="status" aria-live="polite">
+      <span class="ts-agent">{{ agentNameLabel() }}</span>
+      <span>{{ statusText }}</span>
+      <span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+    </div>
+
+    <!-- 空回复兜底：模型没返回内容 / 首 token 前停止 -->
+    <div v-if="isEmptyReply" class="turn-empty">没有收到内容，请重试</div>
   </div>
 </template>
 
 <style scoped>
 .turn {
-  margin: 6px 0 14px;
+  margin: 4px 0 18px;
 }
 
 /* 回答正文区（始终可见） */
@@ -265,25 +308,91 @@ onUpdated(highlight)
   margin-top: 10px;
 }
 
+/* ---------- 流式状态 ---------- */
+.turn-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: var(--shadow-sm);
+}
+
+.ts-agent {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.typing-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.3;
+  animation: typingBounce 1.2s infinite ease-in-out;
+}
+
+.typing-dots i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.typing-dots i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes typingBounce {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+.turn-empty {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
 /* ---------- 顶栏 ---------- */
 .turn-head {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   width: 100%;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 9px 14px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  padding: 7px 10px;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--text-muted);
-  transition: border-color 0.15s ease, background 0.15s ease;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
 
 .turn-head:hover {
-  border-color: var(--border-strong);
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.035);
+  border-color: var(--border);
 }
 
 .th-live {
@@ -295,11 +404,12 @@ onUpdated(highlight)
 }
 
 .live-dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--accent);
-  animation: pulse 1.1s infinite ease-in-out;
+  box-shadow: 0 0 10px rgba(255, 154, 61, 0.65);
+  animation: pulse 1.4s infinite ease-in-out;
 }
 
 @keyframes pulse {
@@ -309,8 +419,8 @@ onUpdated(highlight)
     transform: scale(1);
   }
   50% {
-    opacity: 0.4;
-    transform: scale(0.8);
+    opacity: 0.35;
+    transform: scale(0.72);
   }
 }
 
@@ -320,74 +430,118 @@ onUpdated(highlight)
 }
 
 .th-err {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   color: var(--danger);
   font-weight: 600;
 }
 
 .err-inline {
-  margin-top: 6px;
-  padding: 8px 14px;
-  border: 1px solid var(--danger);
-  border-radius: var(--radius);
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 6px 10px 0;
+  padding: 9px 12px;
+  border: 1px solid rgba(251, 113, 133, 0.24);
+  border-radius: 10px;
   color: var(--danger);
-  background: rgba(255, 107, 107, 0.08);
-  font-size: 13px;
+  background: var(--danger-soft);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.err-inline :deep(.ic) {
+  margin-top: 2px;
 }
 
 .th-meta {
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
 .th-chevron {
   margin-left: auto;
+  display: flex;
   color: var(--text-faint);
-  font-size: 11px;
 }
 
 /* ---------- 明细 ---------- */
 .turn-detail {
   margin-top: 8px;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg-inset);
-  padding: 10px 14px;
-  max-height: 420px;
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.028), rgba(255, 255, 255, 0.01));
+  padding: 13px 16px;
+  max-height: 460px;
   overflow-y: auto;
+  box-shadow: var(--shadow-sm), var(--ring-inset);
 }
 
 /* 时间线 */
 .tl {
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 5px;
+  padding-left: 18px;
+}
+
+.tl::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 6px;
+  bottom: 6px;
+  width: 1px;
+  background: linear-gradient(180deg, rgba(255, 154, 61, 0.32), rgba(255, 255, 255, 0.05));
 }
 
 .tl-row {
+  position: relative;
   display: flex;
   align-items: baseline;
   gap: 7px;
-  font-size: 12.5px;
+  font-size: 12px;
   line-height: 1.75;
   min-width: 0;
+}
+
+.tl-row::before {
+  content: '';
+  position: absolute;
+  left: -16px;
+  top: 8px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--bg-surface-3);
+  border: 1px solid rgba(255, 255, 255, 0.18);
 }
 
 .tl-icon {
   flex-shrink: 0;
   width: 16px;
-  text-align: center;
-  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  align-self: center;
 }
 
 .tl-tool {
   color: var(--accent);
-  font-family: 'Cascadia Code', Consolas, monospace;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
   flex-shrink: 0;
 }
 
 .tl-arg {
   color: var(--text-muted);
-  font-family: 'Cascadia Code', Consolas, monospace;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -395,15 +549,22 @@ onUpdated(highlight)
 }
 
 .tl-arrow {
+  display: flex;
+  align-items: center;
   color: var(--text-faint);
   flex-shrink: 0;
+  align-self: center;
 }
 
 .tl-res {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+  font-size: 11.5px;
 }
 
 .tl-res.ok {
@@ -416,82 +577,133 @@ onUpdated(highlight)
 
 .tl-run {
   color: var(--text-faint);
-  font-size: 11.5px;
+  font-size: 11px;
 }
 
 /* 正文 */
 .turn-text {
-  margin-top: 8px;
+  margin-top: 9px;
   color: var(--text);
+  font-size: 14.5px;
+  line-height: 1.78;
 }
 
 .turn-text :deep(p) {
-  margin: 6px 0;
+  margin: 8px 0;
+}
+
+.turn-text :deep(p:first-child) {
+  margin-top: 0;
+}
+
+.turn-text :deep(strong) {
+  color: #fff;
+  font-weight: 600;
 }
 
 .turn-text :deep(ul),
 .turn-text :deep(ol) {
-  margin: 6px 0;
+  margin: 8px 0;
   padding-left: 22px;
 }
 
 .turn-text :deep(li) {
-  margin: 3px 0;
+  margin: 4px 0;
+}
+
+.turn-text :deep(li::marker) {
+  color: var(--accent);
 }
 
 .turn-text :deep(h1),
 .turn-text :deep(h2),
+.turn-text :deep(h3),
+.turn-text :deep(h4) {
+  margin: 16px 0 8px;
+  line-height: 1.42;
+  color: #fff;
+  font-weight: 700;
+}
+
+.turn-text :deep(h1) {
+  font-size: 20px;
+}
+
+.turn-text :deep(h2) {
+  font-size: 17px;
+}
+
 .turn-text :deep(h3) {
-  margin: 12px 0 6px;
-  line-height: 1.4;
+  font-size: 15px;
 }
 
 .turn-text :deep(a) {
   color: var(--accent-hover);
   text-decoration: none;
+  border-bottom: 1px solid rgba(255, 176, 102, 0.28);
+  transition: border-color 0.15s ease;
+}
+
+.turn-text :deep(a:hover) {
+  border-bottom-color: var(--accent-hover);
 }
 
 .turn-text :deep(code) {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 1px 5px;
+  background: rgba(255, 255, 255, 0.055);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 6px;
+  padding: 1px 6px;
   font-size: 12.5px;
-  font-family: 'Cascadia Code', Consolas, monospace;
+  color: #ffd7b0;
 }
 
 .turn-text :deep(pre) {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
+  background: #0b0d12;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 14px 16px;
   overflow-x: auto;
-  margin: 8px 0;
+  margin: 10px 0;
+  box-shadow: var(--shadow-sm);
 }
 
 .turn-text :deep(pre code) {
   background: none;
   border: none;
   padding: 0;
+  color: inherit;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.turn-text :deep(hr) {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 16px 0;
+}
+
+.turn-text :deep(img) {
+  max-width: 100%;
+  border-radius: 10px;
 }
 
 /* 长代码块折叠：默认只显示一行摘要 */
 .turn-text :deep(.code-collapse) {
-  margin: 8px 0;
+  margin: 10px 0;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg-surface);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.025);
   overflow: hidden;
 }
 
 .turn-text :deep(.code-collapse > summary) {
   cursor: pointer;
-  padding: 8px 12px;
-  font-size: 12px;
+  padding: 9px 13px;
+  font-size: 11.5px;
   color: var(--text-muted);
   list-style: none;
   user-select: none;
-  transition: background 0.12s ease;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
 .turn-text :deep(.code-collapse > summary::-webkit-details-marker) {
@@ -499,16 +711,19 @@ onUpdated(highlight)
 }
 
 .turn-text :deep(.code-collapse > summary::before) {
-  content: '▸ ';
+  content: '›';
+  display: inline-block;
+  margin-right: 7px;
   color: var(--text-faint);
+  transition: transform 0.15s ease;
 }
 
 .turn-text :deep(.code-collapse[open] > summary::before) {
-  content: '▾ ';
+  transform: rotate(90deg);
 }
 
 .turn-text :deep(.code-collapse > summary:hover) {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.04);
   color: var(--text);
 }
 
@@ -517,42 +732,73 @@ onUpdated(highlight)
   border: none;
   border-top: 1px solid var(--border);
   border-radius: 0;
-  max-height: 420px;
+  max-height: 440px;
   overflow: auto;
+  box-shadow: none;
+  background: #090b10;
 }
 
 .turn-text :deep(blockquote) {
-  margin: 8px 0;
-  padding: 2px 12px;
+  margin: 10px 0;
+  padding: 9px 14px;
   border-left: 3px solid var(--accent);
   background: var(--accent-soft);
-  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  border-radius: 0 10px 10px 0;
   color: var(--text-muted);
 }
 
 .turn-text :deep(table) {
-  border-collapse: collapse;
-  margin: 8px 0;
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  margin: 10px 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  font-size: 13px;
 }
 
 .turn-text :deep(th),
 .turn-text :deep(td) {
-  border: 1px solid var(--border);
-  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.turn-text :deep(th:last-child),
+.turn-text :deep(td:last-child) {
+  border-right: none;
+}
+
+.turn-text :deep(tr:last-child td) {
+  border-bottom: none;
+}
+
+.turn-text :deep(th) {
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text-muted);
+  font-weight: 600;
 }
 
 /* 完整原文折叠 */
 .raw {
-  margin-top: 10px;
+  margin-top: 12px;
   border-top: 1px solid var(--border);
-  padding-top: 8px;
+  padding-top: 10px;
 }
 
 .raw summary {
   cursor: pointer;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-faint);
   list-style: none;
+  user-select: none;
+  transition: color 0.15s ease;
+}
+
+.raw summary:hover {
+  color: var(--text-muted);
 }
 
 .raw summary::-webkit-details-marker {
@@ -560,18 +806,21 @@ onUpdated(highlight)
 }
 
 .raw summary::before {
-  content: '▸ ';
+  content: '›';
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s ease;
 }
 
 .raw[open] summary::before {
-  content: '▾ ';
+  transform: rotate(90deg);
 }
 
 .raw-item {
-  margin-top: 8px;
+  margin-top: 9px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 5px;
 }
 
 .ri-head {
@@ -581,13 +830,19 @@ onUpdated(highlight)
 }
 
 .ri-tool {
-  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
   color: var(--accent);
   font-weight: 600;
 }
 
 .ri-status {
-  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
   color: var(--text-faint);
 }
 
@@ -602,14 +857,16 @@ onUpdated(highlight)
 .ri-args,
 .ri-res {
   margin: 0;
-  background: var(--bg-surface);
+  background: rgba(255, 255, 255, 0.025);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 7px 10px;
-  font-size: 11.5px;
+  border-radius: 9px;
+  padding: 8px 11px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 160px;
+  max-height: 180px;
   overflow-y: auto;
   color: var(--text-muted);
 }
@@ -624,12 +881,30 @@ onUpdated(highlight)
 }
 
 .error-box {
-  margin-top: 8px;
-  padding: 8px 12px;
-  border: 1px solid var(--danger);
-  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 9px;
+  padding: 9px 12px;
+  border: 1px solid rgba(251, 113, 133, 0.24);
+  border-radius: 9px;
   color: var(--danger);
-  background: rgba(255, 107, 107, 0.08);
-  font-size: 13px;
+  background: var(--danger-soft);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.error-box :deep(.ic) {
+  margin-top: 2px;
+}
+
+@media (max-width: 760px) {
+  .turn-text {
+    font-size: 14px;
+  }
+
+  .turn-detail {
+    padding: 11px 12px;
+  }
 }
 </style>

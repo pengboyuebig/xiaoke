@@ -69,6 +69,10 @@ func (h *Handler) updateAgent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "智能体不存在"})
 		return
 	}
+	if errors.Is(err, agents.ErrBuiltin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		return
+	}
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -80,6 +84,10 @@ func (h *Handler) deleteAgent(w http.ResponseWriter, r *http.Request) {
 	err := h.Res.Agents.Delete(r.PathValue("id"))
 	if errors.Is(err, agents.ErrNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "智能体不存在"})
+		return
+	}
+	if errors.Is(err, agents.ErrBuiltin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 		return
 	}
 	if err != nil {
@@ -99,6 +107,10 @@ func (h *Handler) toggleAgentTools(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if a.Builtin {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": agents.ErrBuiltin.Error()})
 		return
 	}
 	a.Tools = !a.Tools

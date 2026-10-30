@@ -1,11 +1,13 @@
 package store
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -133,6 +135,123 @@ func TestDeleteRemovesAllFiles(t *testing.T) {
 		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("删除后文件仍存在: %s (%v)", p, err)
 		}
+	}
+}
+
+func TestDeleteKeepsTrashCopy(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := s.Create("我的会话", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(sess.ID, Message{Role: "user", Content: "重要内容"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(sess.ID); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(s.TrashDir())
+	if err != nil {
+		t.Fatalf("回收站目录应存在: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("回收站应有 1 个目录，实际 %d", len(entries))
+	}
+	trashID := entries[0].Name()
+	if !strings.HasPrefix(trashID, sess.ID+"-") {
+		t.Fatalf("回收站目录名应含会话 ID: %s", trashID)
+	}
+	// 快照副本应能完整读回消息
+	data, err := os.ReadFile(filepath.Join(s.TrashDir(), trashID, sess.ID+".json"))
+	if err != nil {
+		t.Fatalf("回收站快照应存在: %v", err)
+	}
+	var snap Session
+	if err := json.Unmarshal(data, &snap); err != nil || snap.ID != sess.ID {
+		t.Fatalf("回收站快照异常: %v", err)
+	}
+}
+
+func TestExportContainsLogMessages(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := s.Create("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := s.Append(sess.ID, Message{Role: "user", Content: fmt.Sprintf("m%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := s.Export(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Session
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("导出 JSON 不可解析: %v", err)
+	}
+	if got.ID != sess.ID || len(got.Messages) != 3 {
+		t.Fatalf("导出内容不完整: %+v", got)
+	}
+}
+
+func TestBackupAndPrune(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := s.Create("备份会话", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(sess.ID, Message{Role: "user", Content: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path, err := s.Backup(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatalf("备份不是合法 zip: %v", err)
+	}
+	defer zr.Close()
+	names := map[string]bool{}
+	for _, f := range zr.File {
+		names[f.Name] = true
+	}
+	for _, want := range []string{"manifest.json", sess.ID + ".json", sess.ID + ".meta.json"} {
+		if !names[want] {
+			t.Fatalf("备份缺少 %s，实际: %v", want, names)
+		}
+	}
+
+	// 保留策略：只留最近 2 份
+	for i := 0; i < 4; i++ {
+		if _, err := s.Backup(dir, 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zips := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".zip") {
+			zips++
+		}
+	}
+	if zips > 2 {
+		t.Fatalf("备份保留策略失效，剩余 %d 份", zips)
 	}
 }
 

@@ -9,6 +9,7 @@
 package store
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"crypto/rand"
@@ -16,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -89,6 +91,9 @@ type logEntry struct {
 type Store struct {
 	dir string
 	mu  sync.Mutex
+
+	// backupMu 串行化写备份文件（否则并发备份时清理临时文件会误删对方正在写的 .tmp）
+	backupMu sync.Mutex
 
 	lockMapMu   sync.Mutex
 	sessionLock map[string]*sync.Mutex
@@ -341,6 +346,8 @@ func (s *Store) SetProject(id, projectID string) error {
 	return s.saveMeta(meta)
 }
 
+// Delete 删除会话。删除前先把三个文件复制到 trash 目录，
+// 复制失败则中止删除（宁可删不掉，也不能悄悄丢数据）。
 func (s *Store) Delete(id string) error {
 	if !validID.MatchString(id) {
 		return ErrNotFound
@@ -353,8 +360,222 @@ func (s *Store) Delete(id string) error {
 		}
 		return err
 	}
+	if _, err := s.moveToTrashLocked(id); err != nil {
+		return fmt.Errorf("删除前备份失败，已取消删除: %w", err)
+	}
 	for _, p := range []string{s.logPath(id), s.metaPath(id), s.path(id)} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// TrashDir 是删除会话时保留副本的目录（位于会话目录下的 trash/）。
+func (s *Store) TrashDir() string { return filepath.Join(s.dir, "trash") }
+
+// moveToTrashLocked 把会话文件复制到 trash/<id>-<时间戳>/。调用方需持有 s.mu。
+func (s *Store) moveToTrashLocked(id string) (string, error) {
+	dst := filepath.Join(s.TrashDir(), id+"-"+time.Now().Format("20060102-150405"))
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return "", err
+	}
+	copied := 0
+	for _, p := range []string{s.path(id), s.logPath(id), s.metaPath(id)} {
+		if err := copyFile(p, filepath.Join(dst, filepath.Base(p))); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // 日志/摘要可能本来就没有
+			}
+			return "", err
+		}
+		copied++
+	}
+	if copied == 0 {
+		return "", fmt.Errorf("没有可备份的文件")
+	}
+	return dst, nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// Export 返回完整会话的 JSON（快照 + 未合并日志），用于单会话导出。
+func (s *Store) Export(id string) ([]byte, error) {
+	sess, err := s.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	return json.MarshalIndent(sess, "", "  ")
+}
+
+// backupManifest 是整包备份里的说明文件，便于人工核对。
+type backupManifest struct {
+	CreatedAt time.Time `json:"createdAt"`
+	Count     int       `json:"count"`
+	Sessions  []string  `json:"sessions"`
+}
+
+// WriteBackup 把全部会话文件打包成 zip 写到 w（不包含 trash/）。
+func (s *Store) WriteBackup(w io.Writer) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return err
+	}
+	zw := zip.NewWriter(w)
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			continue
+		}
+		id := ""
+		switch {
+		case strings.HasSuffix(name, ".meta.json"):
+			id = strings.TrimSuffix(name, ".meta.json")
+		case strings.HasSuffix(name, ".json"):
+			id = strings.TrimSuffix(name, ".json")
+		case strings.HasSuffix(name, ".log"):
+			id = strings.TrimSuffix(name, ".log")
+		}
+		if !validID.MatchString(id) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(s.dir, name))
+		if err != nil {
+			return err
+		}
+		fw, err := zw.Create(name)
+		if err != nil {
+			return err
+		}
+		if _, err := fw.Write(data); err != nil {
+			return err
+		}
+	}
+	ids := s.listIDsLocked(entries)
+	manifest, err := json.MarshalIndent(backupManifest{
+		CreatedAt: time.Now(), Count: len(ids), Sessions: ids,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	mw, err := zw.Create("manifest.json")
+	if err != nil {
+		return err
+	}
+	if _, err := mw.Write(manifest); err != nil {
+		return err
+	}
+	return zw.Close()
+}
+
+// listIDsLocked 列出目录里所有合法会话 ID（快照存在才算）。调用方需持有 s.mu。
+func (s *Store) listIDsLocked(entries []os.DirEntry) []string {
+	ids := []string{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || strings.HasSuffix(e.Name(), ".meta.json") {
+			continue
+		}
+		id := strings.TrimSuffix(e.Name(), ".json")
+		if validID.MatchString(id) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// Backup 在 dir 下生成 sessions-<时间戳>.zip，并只保留最近 keep 份（keep<=0 表示不清理）。
+func (s *Store) Backup(dir string, keep int) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	cleanStaleTemps(dir) // 上次进程被强杀可能留下半截 .tmp
+	name := "sessions-" + time.Now().Format("20060102-150405") + ".zip"
+	path := filepath.Join(dir, name)
+	// 同一秒内重复备份时避免覆盖
+	for i := 2; ; i++ {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		path = filepath.Join(dir, fmt.Sprintf("sessions-%s-%d.zip", time.Now().Format("20060102-150405"), i))
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return "", err
+	}
+	if err := s.WriteBackup(f); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if keep > 0 {
+		_ = pruneBackups(dir, keep) // 清理失败不影响本次备份
+	}
+	return path, nil
+}
+
+// cleanStaleTemps 清理上次被强杀留下的半截备份临时文件。
+func cleanStaleTemps(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasPrefix(n, "sessions-") || !strings.HasSuffix(n, ".zip.tmp") {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, n))
+	}
+}
+
+// pruneBackups 只保留最近 keep 份备份（按文件名里的时间戳排序）。
+func pruneBackups(dir string, keep int) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	names := []string{}
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasPrefix(n, "sessions-") || !strings.HasSuffix(n, ".zip") {
+			continue
+		}
+		names = append(names, n)
+	}
+	if len(names) <= keep {
+		return nil
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	for _, n := range names[keep:] {
+		if err := os.Remove(filepath.Join(dir, n)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}

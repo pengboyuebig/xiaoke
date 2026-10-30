@@ -92,6 +92,10 @@ func main() {
 		log.Fatalf("初始化会话存储失败: %v", err)
 	}
 
+	// 自动备份：启动时立即备份一份，之后每 24 小时一次，只保留最近 14 份。
+	// 备份失败只记日志，不影响服务启动。
+	go autoBackup(st, filepath.Join(cfg.DataDir, "backups"))
+
 	mux := http.NewServeMux()
 	chat.NewHandler(cfg, st, setStore, projectsMgr, mcpMgr, agentsStore, skillsStore).Register(mux)
 	res := &api.Resources{
@@ -151,6 +155,30 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 	mcpMgr.Close()
+}
+
+// 自动备份保留份数与间隔（14 份 ≈ 两周历史）。
+const (
+	backupKeep  = 14
+	backupEvery = 24 * time.Hour
+)
+
+// autoBackup 启动时先备份一份，之后按 backupEvery 周期备份。
+func autoBackup(st *store.Store, dir string) {
+	run := func() {
+		p, err := st.Backup(dir, backupKeep)
+		if err != nil {
+			log.Printf("自动备份失败: %v", err)
+			return
+		}
+		log.Printf("会话已自动备份: %s", p)
+	}
+	run()
+	t := time.NewTicker(backupEvery)
+	defer t.Stop()
+	for range t.C {
+		run()
+	}
 }
 
 // noDirList 包装 FileSystem，禁止目录列表（避免 /assets/ 暴露上传文件名）。

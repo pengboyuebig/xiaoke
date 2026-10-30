@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import { api } from '../lib/api'
 import type { Skill } from '../types'
+import Icon from './Icon.vue'
 
 const props = defineProps<{ skills: Skill[] }>()
 const emit = defineEmits<{ changed: [] }>()
@@ -125,7 +126,10 @@ function onEnabledChange(e: Event) {
     <div class="list-col">
       <div class="col-head">
         <span class="col-title">技能 <span class="count">{{ enabledCount }}/{{ props.skills.length }} 启用</span></span>
-        <button class="btn tiny primary" @click="startCreate">＋ 新建</button>
+        <button class="btn tiny primary" @click="startCreate">
+          <Icon name="plus" :size="12" :stroke="2.2" />
+          新建
+        </button>
       </div>
       <div class="skill-list">
         <div
@@ -148,7 +152,7 @@ function onEnabledChange(e: Event) {
             <span class="knob"></span>
           </button>
         </div>
-        <div v-if="!props.skills.length" class="empty-list">还没有技能，点「＋ 新建」写一条。</div>
+        <div v-if="!props.skills.length" class="empty-list">还没有技能，点「新建」写一条。</div>
       </div>
       <div class="tip">启用的技能会注入小柯的系统提示词，随时生效。</div>
     </div>
@@ -200,7 +204,7 @@ function onEnabledChange(e: Event) {
           </button>
         </div>
       </div>
-      <div v-else class="empty-edit">选择左侧技能开始编辑，或点「＋ 新建」。</div>
+      <div v-else class="empty-edit">选择左侧技能开始编辑，或点「新建」。</div>
     </div>
   </div>
 </template>
@@ -218,7 +222,7 @@ function onEnabledChange(e: Event) {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   min-height: 0;
 }
 
@@ -229,13 +233,15 @@ function onEnabledChange(e: Event) {
 }
 
 .col-title {
-  font-size: 13px;
+  font-size: 10.5px;
   font-weight: 700;
-  color: var(--text);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-faint);
 }
 
 .count {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--text-faint);
   font-weight: 400;
   margin-left: 4px;
@@ -254,20 +260,22 @@ function onEnabledChange(e: Event) {
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
-  background: var(--bg);
+  background: rgba(255, 255, 255, 0.025);
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: 12px;
   cursor: pointer;
-  transition: border-color 0.15s ease;
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
 
 .skill-item:hover {
   border-color: var(--border-strong);
+  background: rgba(255, 255, 255, 0.045);
 }
 
 .skill-item.active {
-  border-color: var(--accent);
-  background: var(--accent-soft);
+  border-color: rgba(255, 154, 61, 0.22);
+  background: linear-gradient(90deg, var(--accent-soft), rgba(255, 154, 61, 0.02));
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .skill-item.off .si-name {
@@ -281,13 +289,13 @@ function onEnabledChange(e: Event) {
 }
 
 .si-name {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
   color: var(--text);
 }
 
 .si-desc {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -299,28 +307,31 @@ function onEnabledChange(e: Event) {
   width: 34px;
   height: 19px;
   border-radius: 999px;
-  border: none;
-  background: var(--bg-surface-2);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.06);
   position: relative;
   cursor: pointer;
   flex-shrink: 0;
-  transition: background 0.15s ease;
+  transition: background 0.18s ease, border-color 0.18s ease;
   padding: 0;
 }
 
 .toggle.on {
-  background: var(--accent);
+  background: var(--accent-gradient);
+  border-color: transparent;
+  box-shadow: 0 0 14px rgba(255, 154, 61, 0.22);
 }
 
 .knob {
   position: absolute;
   top: 2px;
   left: 2px;
-  width: 15px;
-  height: 15px;
+  width: 13px;
+  height: 13px;
   border-radius: 50%;
   background: #fff;
-  transition: transform 0.15s ease;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  transition: transform 0.18s var(--ease);
 }
 
 .toggle.on .knob {
@@ -328,31 +339,32 @@ function onEnabledChange(e: Event) {
 }
 
 .tip {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-faint);
-  line-height: 1.5;
+  line-height: 1.55;
 }
 
 .empty-list {
   padding: 12px;
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: 11.5px;
 }
 
 .edit-col {
   flex: 1;
   min-width: 0;
   overflow-y: auto;
-  background: var(--bg);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.01));
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 20px 22px;
+  border-radius: 18px;
+  padding: 22px 24px;
+  box-shadow: var(--shadow-sm), var(--ring-inset);
 }
 
 .editor {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 16px;
   max-width: 680px;
 }
 
@@ -360,17 +372,19 @@ function onEnabledChange(e: Event) {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding-bottom: 6px;
+  padding-bottom: 12px;
   border-bottom: 1px solid var(--border);
 }
 
 .ed-name {
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 700;
+  letter-spacing: -0.01em;
 }
 
 .ed-sub {
-  font-size: 12px;
+  margin-top: 2px;
+  font-size: 11.5px;
   color: var(--text-faint);
 }
 
@@ -394,37 +408,39 @@ function onEnabledChange(e: Event) {
 }
 
 .field label {
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-muted);
 }
 
 .inp {
-  background: var(--bg-surface);
+  background: rgba(0, 0, 0, 0.26);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 10px;
   color: var(--text);
-  padding: 9px 12px;
-  font-size: 13px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .inp:focus {
   outline: none;
-  border-color: var(--accent);
+  border-color: var(--border-accent);
   box-shadow: var(--focus-ring);
 }
 
 .area {
   resize: vertical;
-  min-height: 220px;
-  line-height: 1.65;
-  font-family: inherit;
+  min-height: 240px;
+  line-height: 1.7;
+  font-family: var(--font-mono);
+  font-size: 12px;
 }
 
 .switch {
   display: flex;
   align-items: center;
   gap: 7px;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-muted);
   cursor: pointer;
   flex-shrink: 0;
@@ -438,14 +454,14 @@ function onEnabledChange(e: Event) {
 
 .err {
   color: var(--danger);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .ed-foot {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding-top: 8px;
+  padding-top: 14px;
   border-top: 1px solid var(--border);
 }
 
@@ -455,8 +471,8 @@ function onEnabledChange(e: Event) {
 
 .empty-edit {
   color: var(--text-faint);
-  font-size: 13px;
-  padding: 40px 0;
+  font-size: 12.5px;
+  padding: 48px 0;
   text-align: center;
 }
 </style>
