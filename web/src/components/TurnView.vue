@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, onUpdated, ref, watch } from 'vue'
+import hljs from 'highlight.js/lib/common'
 import type { MsgGroup, ToolPair } from '../types'
-import { renderMarkdown } from '../lib/markdown'
+import { renderMarkdownCollapsed } from '../lib/markdown'
 
 const props = defineProps<{
   /** 回合内的分组（assistant 工具块 + 正文；流式实时组已由 App 并入） */
@@ -134,12 +135,23 @@ function toolIcon(name: string): string {
 }
 
 function render(md: string): string {
-  return renderMarkdown(md)
+  // 长代码块默认折叠，只显示步骤标题与摘要行
+  return renderMarkdownCollapsed(md)
 }
+
+// 代码高亮（内容为 v-html 注入，需要在挂载/更新后处理）
+const rootEl = ref<HTMLElement | null>(null)
+function highlight() {
+  rootEl.value?.querySelectorAll('.turn-answer pre code:not([data-highlighted])').forEach((el) => {
+    hljs.highlightElement(el as HTMLElement)
+  })
+}
+onMounted(highlight)
+onUpdated(highlight)
 </script>
 
 <template>
-  <div class="turn">
+  <div ref="rootEl" class="turn">
     <!-- 顶栏：工作时长，点击展开/收起工作过程（纯问答回合无此项） -->
     <button v-if="hasWork" class="turn-head" type="button" @click="toggle()">
       <span v-if="props.streaming" class="th-live">
@@ -423,6 +435,52 @@ function render(md: string): string {
   background: none;
   border: none;
   padding: 0;
+}
+
+/* 长代码块折叠：默认只显示一行摘要 */
+.turn-text :deep(.code-collapse) {
+  margin: 8px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+
+.turn-text :deep(.code-collapse > summary) {
+  cursor: pointer;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+  list-style: none;
+  user-select: none;
+  transition: background 0.12s ease;
+}
+
+.turn-text :deep(.code-collapse > summary::-webkit-details-marker) {
+  display: none;
+}
+
+.turn-text :deep(.code-collapse > summary::before) {
+  content: '▸ ';
+  color: var(--text-faint);
+}
+
+.turn-text :deep(.code-collapse[open] > summary::before) {
+  content: '▾ ';
+}
+
+.turn-text :deep(.code-collapse > summary:hover) {
+  background: var(--bg-surface-2);
+  color: var(--text);
+}
+
+.turn-text :deep(.code-collapse pre) {
+  margin: 0;
+  border: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  max-height: 420px;
+  overflow: auto;
 }
 
 .turn-text :deep(blockquote) {
