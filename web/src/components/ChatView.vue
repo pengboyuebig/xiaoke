@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { Agent, Message, Project, Turn } from '../types'
 import TurnView from './TurnView.vue'
 import { renderMarkdown } from '../lib/markdown'
@@ -18,44 +18,58 @@ const props = defineProps<{
 }>()
 
 const scroller = ref<HTMLElement | null>(null)
+const threadEl = ref<HTMLElement | null>(null)
 const pinned = ref(true)
 // 头像由 Go 后端的 /assets 提供，动态绑定避免 Vite 构建期解析
 const AVATAR = '/assets/avatar.png'
 
-// ---- 跳转到「我」最近一条消息 ----
-const questionEls = ref<HTMLElement[]>([])
-function setQuestionRef(el: unknown, i: number) {
-  if (el instanceof HTMLElement) questionEls.value[i] = el
-}
-// 最后一条「我的问题」是否已滚出视口（在下方或上方都算）
-const lastQuestionHidden = ref(false)
+// ---- 「我的消息」导航：列出我发过的所有提问，点哪条跳哪条 ----
+const jumpOpen = ref(false)
+const jumpWrap = ref<HTMLElement | null>(null)
 
-function checkLastQuestion() {
-  const el = scroller.value
-  const list = questionEls.value.filter(Boolean)
-  const last = list[list.length - 1]
-  if (!el || !last) {
-    lastQuestionHidden.value = false
-    return
+function onDocClickJump(e: MouseEvent) {
+  if (!jumpOpen.value) return
+  if (jumpWrap.value && !jumpWrap.value.contains(e.target as Node)) jumpOpen.value = false
+}
+onMounted(() => document.addEventListener('mousedown', onDocClickJump))
+onUnmounted(() => document.removeEventListener('mousedown', onDocClickJump))
+
+// 我的提问列表（与 DOM 中 .msg.user 的渲染顺序一一对应）
+const questionList = computed(() => {
+  const list: { text: string; time: string }[] = []
+  for (const t of props.turns) {
+    const q = (t.question || '').trim()
+    if (!q) continue
+    list.push({ text: q, time: fmtClock(t.startTime) })
   }
-  const r = last.getBoundingClientRect()
-  const c = el.getBoundingClientRect()
-  lastQuestionHidden.value = r.top > c.bottom - 20 || r.bottom < c.top + 20
+  return list
+})
+
+// 至少 2 条提问才显示导航按钮（1 条时没有跳转必要）
+const showJump = computed(() => questionList.value.length >= 2)
+
+function fmtClock(iso?: string): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-async function jumpToMyLast() {
-  const list = questionEls.value.filter(Boolean)
-  const last = list[list.length - 1]
-  const el = scroller.value
-  if (!last || !el) return
+// 直接查 DOM，避免用 ref 数组时切会话残留旧节点导致跳错位置
+function questionEls(): HTMLElement[] {
+  const root = threadEl.value
+  if (!root) return []
+  return Array.from(root.querySelectorAll<HTMLElement>('.msg.user'))
+}
+
+function jumpTo(index: number) {
+  const el = questionEls()[index]
+  if (!el) return
   // behavior:'instant' 显式瞬时——'auto' 会被 CSS scroll-behavior:smooth 覆盖成动画
-  last.scrollIntoView({ block: 'center', behavior: 'instant' })
-  // 到位后短暂高亮，方便定位
-  last.classList.add('jump-flash')
-  setTimeout(() => last.classList.remove('jump-flash'), 1400)
-  // 滚动后重算按钮可见性（scroll 事件可能未触发）
-  await nextTick()
-  checkLastQuestion()
+  el.scrollIntoView({ block: 'center', behavior: 'instant' })
+  el.classList.add('jump-flash')
+  setTimeout(() => el.classList.remove('jump-flash'), 1400)
+  jumpOpen.value = false
 }
 
 const agentName = () => props.agent?.name || '小柯'
@@ -72,7 +86,6 @@ function onScroll() {
   const el = scroller.value
   if (!el) return
   pinned.value = el.scrollHeight - el.scrollTop - el.clientHeight < 90
-  checkLastQuestion()
 }
 
 async function stick() {
@@ -98,16 +111,7 @@ watch(
   { flush: 'post' },
 )
 
-// 消息变化后重算「我的消息」是否在视口内（含 DOM 更新后）
-watch(
-  () => props.turns.length,
-  async () => {
-    await nextTick()
-    checkLastQuestion()
-  },
-  { flush: 'post' },
-)
-
+// 消息变化后保持滚动跟随（不依赖 ref 数组）
 const isEmpty = computed(() => !props.turns.length && !props.streaming)
 </script>
 
@@ -128,10 +132,10 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
     </div>
 
     <!-- 回合流：每个回合 = 问题气泡 + 工作容器 -->
-    <div v-else class="thread">
+    <div v-else ref="threadEl" class="thread">
       <div v-for="(t, i) in props.turns" :key="i" class="turn-item">
         <!-- 我的问题 -->
-        <div v-if="t.question" :ref="(el) => setQuestionRef(el, i)" class="msg user">
+        <div v-if="t.question" class="msg user">
           <div class="body">
             <div class="meta"><span class="name">我</span></div>
             <div class="content user-bubble">{{ t.question }}</div>
@@ -152,18 +156,26 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
     </div>
     </div>
 
-    <!-- 快速跳转：回到「我」最近一条消息 -->
-    <button
-      v-if="!isEmpty && lastQuestionHidden"
-      class="jump-my"
-      title="跳到我最近说的消息"
-      @click="jumpToMyLast"
-    >
-      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 5v14M5 12l7-7 7 7" />
-      </svg>
-      我的消息
-    </button>
+    <!-- 我的消息导航：列出我发过的全部提问，点哪条跳哪条 -->
+    <div v-if="showJump" ref="jumpWrap" class="jump-wrap">
+      <div v-if="jumpOpen" class="jump-list">
+        <div class="jl-head">我的消息 · {{ questionList.length }} 条</div>
+        <div class="jl-body">
+          <button v-for="(q, i) in questionList" :key="i" class="jl-item" @click="jumpTo(i)">
+            <span class="jl-idx">{{ i + 1 }}</span>
+            <span class="jl-text">{{ q.text }}</span>
+            <span class="jl-time">{{ q.time }}</span>
+          </button>
+        </div>
+      </div>
+      <button class="jump-my" :class="{ open: jumpOpen }" title="查看我的全部消息" @click="jumpOpen = !jumpOpen">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+        </svg>
+        我的消息
+        <span class="jump-count">{{ questionList.length }}</span>
+      </button>
+    </div>
   </div>
 </template>
 
@@ -182,11 +194,93 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
   scroll-behavior: smooth;
 }
 
-/* 快速跳转按钮：浮在聊天区右下 */
-.jump-my {
+/* ---------- 我的消息导航 ---------- */
+.jump-wrap {
   position: absolute;
-  right: 28px;
-  bottom: 18px;
+  right: 24px;
+  bottom: 16px;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.jump-list {
+  width: 300px;
+  max-height: 46vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.jl-head {
+  padding: 9px 14px;
+  font-size: 12px;
+  color: var(--text-faint);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface-2);
+}
+
+.jl-body {
+  overflow-y: auto;
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.jl-item {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+
+.jl-item:hover {
+  background: var(--accent-soft);
+}
+
+.jl-idx {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--bg-surface-2);
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.jl-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jl-time {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.jump-my {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -199,13 +293,26 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
   cursor: pointer;
   box-shadow: var(--shadow);
   transition: all 0.15s ease;
-  z-index: 5;
 }
 
-.jump-my:hover {
+.jump-my:hover,
+.jump-my.open {
   border-color: var(--accent);
   color: var(--accent);
-  transform: translateY(-1px);
+}
+
+.jump-count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-size: 10.5px;
+  font-weight: 700;
 }
 
 /* 跳转定位后的短暂高亮 */

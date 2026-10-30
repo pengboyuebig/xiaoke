@@ -455,7 +455,6 @@ function onSettingsClosed() {
       :current-agent-id="currentAgentId"
       :mode="mode"
       :model="model"
-      :work-mode="workMode"
       @select="handleSelect"
       @new-chat="handleNewChat"
       @remove="handleRemove"
@@ -463,7 +462,6 @@ function onSettingsClosed() {
       @new-project="projectModalOpen = true"
       @remove-project="handleDeleteProject"
       @select-agent="handleSelectAgent"
-      @set-work-mode="setWorkMode"
       @open-settings="settingsOpen = true"
     />
     <main class="main">
@@ -491,6 +489,7 @@ function onSettingsClosed() {
         @send="handleSend"
         @stop="handleStop"
         @update:reasoning="setReasoning"
+        @set-mode="setWorkMode"
       />
     </main>
 

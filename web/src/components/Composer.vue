@@ -1,11 +1,33 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 
 const props = defineProps<{ busy: boolean; reasoning: string; mode?: string }>()
-const emit = defineEmits<{ send: [content: string]; stop: []; 'update:reasoning': [v: string] }>()
+const emit = defineEmits<{
+  send: [content: string]
+  stop: []
+  'update:reasoning': [v: string]
+  setMode: [m: 'plan' | 'build']
+}>()
 
 const text = ref('')
 const ta = ref<HTMLTextAreaElement | null>(null)
+
+// 输入框左侧的工作模式切换
+const modeMenuOpen = ref(false)
+const modeWrap = ref<HTMLElement | null>(null)
+const isPlan = () => props.mode === 'plan'
+function pickMode(m: 'plan' | 'build') {
+  emit('setMode', m)
+  modeMenuOpen.value = false
+}
+
+// 点击面板外部关闭
+function onDocClick(e: MouseEvent) {
+  if (!modeMenuOpen.value) return
+  if (modeWrap.value && !modeWrap.value.contains(e.target as Node)) modeMenuOpen.value = false
+}
+onMounted(() => document.addEventListener('mousedown', onDocClick))
+onUnmounted(() => document.removeEventListener('mousedown', onDocClick))
 
 // 思考程度选项（none 不注入请求体；其余映射为 reasoning_effort）
 const LEVELS = [
@@ -47,6 +69,37 @@ function onLevelChange(e: Event) {
 <template>
   <div class="composer-wrap">
     <div class="composer">
+      <!-- 输入框左侧：工作模式切换（计划 ⇄ 开发） -->
+      <div ref="modeWrap" class="mode-wrap">
+        <div v-if="modeMenuOpen" class="mode-menu">
+          <button class="mode-opt" :class="{ active: isPlan() }" @click="pickMode('plan')">
+            <span class="mo-icon">📋</span>
+            <span class="mo-text">
+              <b>计划模式</b>
+              <i>先调研出计划，只读不改，确认后才开发</i>
+            </span>
+            <span v-if="isPlan()" class="mo-check">✓</span>
+          </button>
+          <button class="mode-opt" :class="{ active: !isPlan() }" @click="pickMode('build')">
+            <span class="mo-icon">🛠️</span>
+            <span class="mo-text">
+              <b>开发模式</b>
+              <i>完整能力：读写文件、执行命令</i>
+            </span>
+            <span v-if="!isPlan()" class="mo-check">✓</span>
+          </button>
+        </div>
+        <button
+          class="mode-btn"
+          :class="isPlan() ? 'plan' : 'build'"
+          :title="isPlan() ? '计划模式：先调研再开发（点击切换）' : '开发模式：完整能力（点击切换）'"
+          @click="modeMenuOpen = !modeMenuOpen"
+        >
+          <span class="mb-icon">{{ isPlan() ? '📋' : '🛠️' }}</span>
+          <span class="mb-label">{{ isPlan() ? '计划' : '开发' }}</span>
+        </button>
+      </div>
+
       <textarea
         ref="ta"
         v-model="text"
@@ -100,6 +153,121 @@ function onLevelChange(e: Event) {
 .composer:focus-within {
   border-color: var(--accent);
   box-shadow: var(--focus-ring);
+}
+
+/* ---------- 输入框左侧：工作模式 ---------- */
+.mode-wrap {
+  position: relative;
+  flex-shrink: 0;
+  align-self: flex-end;
+}
+
+.mode-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface-2);
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.mode-btn:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.mode-btn.plan {
+  border-color: color-mix(in srgb, #56c2e6 45%, transparent);
+  background: rgba(86, 194, 230, 0.1);
+  color: #56c2e6;
+}
+
+.mode-btn.build {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.mb-icon {
+  font-size: 13px;
+}
+
+.mb-label {
+  font-weight: 600;
+}
+
+.mode-menu {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 0;
+  width: 268px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 30;
+}
+
+.mode-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+
+.mode-opt:hover {
+  background: var(--bg-surface-2);
+}
+
+.mode-opt.active {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.mo-icon {
+  font-size: 15px;
+  margin-top: 1px;
+}
+
+.mo-text {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.mo-text b {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.mo-text i {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-faint);
+  line-height: 1.45;
+  margin-top: 2px;
+}
+
+.mo-check {
+  color: var(--accent);
+  font-size: 13px;
 }
 
 textarea {
