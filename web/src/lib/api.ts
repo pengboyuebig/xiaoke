@@ -39,6 +39,8 @@ export interface ChatOptions {
   reasoning?: string
   /** 工作模式：plan（只读调研+计划）| build（开发） */
   mode?: string
+  /** 批准计划：本条消息只驱动模型，不在对话中显示 */
+  approve?: boolean
   signal?: AbortSignal
   onDelta: (text: string) => void
   onToolStart?: (name: string, args: string) => void
@@ -157,6 +159,7 @@ export const api = {
           agentId: opts.agentId || '',
           reasoning: opts.reasoning || '',
           mode: opts.mode || 'build',
+          approve: opts.approve === true,
         }),
         signal: opts.signal,
       })
@@ -218,8 +221,17 @@ export const api = {
           resolve({ sessionId })
         })
         .catch((err) => {
-          if (err && err.name === 'AbortError') resolve({ sessionId: opts.sessionId })
-          else reject(err)
+          if (err && err.name === 'AbortError') {
+            resolve({ sessionId: opts.sessionId })
+            return
+          }
+          // 连接级失败（服务重启/断网）给出可读提示，原始信息是 "Failed to fetch" / "network error"
+          const msg = String((err && err.message) || err || '')
+          if (err instanceof TypeError || /failed to fetch|network\s*error|load failed/i.test(msg)) {
+            reject(new Error('连接中断（服务可能已重启或网络异常），请重试'))
+            return
+          }
+          reject(err)
         })
     })
   },

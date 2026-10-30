@@ -19,13 +19,40 @@ const props = defineProps<{
   awaitingApproval?: boolean
 }>()
 
-const emit = defineEmits<{ approve: []; adjustPlan: [] }>()
+const emit = defineEmits<{ approve: []; approveCustom: [text: string]; adjustPlan: [] }>()
 
 const scroller = ref<HTMLElement | null>(null)
 const threadEl = ref<HTMLElement | null>(null)
+const threadEnd = ref<HTMLElement | null>(null)
 const pinned = ref(true)
 // 头像由 Go 后端的 /assets 提供，动态绑定避免 Vite 构建期解析
 const AVATAR = '/assets/avatar.png'
+
+// ---- 回到底部 ----
+function scrollToBottom() {
+  // 直接写 scrollTop 在部分 WebView 会被拦截，用 scrollIntoView 更可靠
+  const end = threadEnd.value
+  if (end) end.scrollIntoView({ block: 'end', behavior: 'instant' })
+  else if (scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight
+  pinned.value = true
+}
+
+// ---- 批准时自定义实现方式 ----
+const customOpen = ref(false)
+const customText = ref('')
+function submitCustom() {
+  const t = customText.value.trim()
+  if (!t) return
+  emit('approveCustom', t)
+  customOpen.value = false
+  customText.value = ''
+}
+function onCustomKeydown(e: KeyboardEvent) {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault()
+    submitCustom()
+  }
+}
 
 // ---- 「我的消息」导航：列出我发过的所有提问，点哪条跳哪条 ----
 const jumpOpen = ref(false)
@@ -85,7 +112,7 @@ const greetingForAgent = () => {
   return g.replace(/\*\*小柯\*\*/, `**${agentName()}**`)
 }
 
-// 用户手动上翻时停止自动跟随
+// 用户手动上翻时停止自动跟随（同时控制「回到底部」按钮）
 function onScroll() {
   const el = scroller.value
   if (!el) return
@@ -156,7 +183,7 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
           :avatar="agentAvatar()"
         />
       </div>
-      <!-- 计划已生成：批准后切开发模式并立即按计划开工 -->
+      <!-- 计划已生成：批准后切开发模式并立即按计划开工；也可用自己的方式实现 -->
       <div v-if="props.awaitingApproval" class="approve-bar">
         <div class="ab-main">
           <span class="ab-icon">📋</span>
@@ -169,17 +196,49 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
             </svg>
             批准并开始开发
           </button>
+          <button class="ab-btn ghost" :class="{ active: customOpen }" @click="customOpen = !customOpen">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" />
+            </svg>
+            我来说怎么做
+          </button>
           <button class="ab-btn ghost" @click="emit('adjustPlan')">继续调整计划</button>
+        </div>
+
+        <!-- 自定义实现方式：写清楚你希望怎么改，批准后按你的要求开工 -->
+        <div v-if="customOpen" class="ab-custom">
+          <textarea
+            v-model="customText"
+            class="ab-input"
+            rows="3"
+            placeholder="例如：不要用 SVG，改用 Canvas 实现；动画只保留车轮转动；颜色用深蓝"
+            @keydown="onCustomKeydown"
+          ></textarea>
+          <div class="ab-custom-foot">
+            <span class="ab-hint">Ctrl+Enter 发送</span>
+            <button class="ab-btn primary" :disabled="!customText.trim()" @click="submitCustom">
+              按我的方式开工
+            </button>
+          </div>
         </div>
       </div>
 
-      <div class="thread-end"></div>
+      <div ref="threadEnd" class="thread-end"></div>
     </div>
     </div>
 
-    <!-- 我的消息导航：列出我发过的全部提问，点哪条跳哪条 -->
-    <div v-if="showJump" ref="jumpWrap" class="jump-wrap">
-      <div v-if="jumpOpen" class="jump-list">
+    <!-- 右下角浮动控件：回到底部 + 我的消息导航 -->
+    <div v-if="showJump || (!pinned && !isEmpty)" ref="jumpWrap" class="jump-wrap">
+      <!-- 回到底部：不在底部时出现 -->
+      <button v-if="!pinned && !isEmpty" class="jump-bottom" title="回到底部" @click="scrollToBottom">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 5v14M5 12l7 7 7-7" />
+        </svg>
+        回到底部
+      </button>
+
+      <template v-if="showJump">
+        <div v-if="jumpOpen" class="jump-list">
         <div class="jl-head">我的消息 · {{ questionList.length }} 条</div>
         <div class="jl-body">
           <button v-for="(q, i) in questionList" :key="i" class="jl-item" @click="jumpTo(i)">
@@ -196,6 +255,7 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
         我的消息
         <span class="jump-count">{{ questionList.length }}</span>
       </button>
+      </template>
     </div>
   </div>
 </template>
@@ -320,6 +380,28 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
 .jump-my.open {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* 回到底部按钮 */
+.jump-bottom {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--bg-surface-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  font-size: 12.5px;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  transition: all 0.15s ease;
+}
+
+.jump-bottom:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  transform: translateY(-1px);
 }
 
 .jump-count {
@@ -530,5 +612,60 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
 .ab-btn.ghost:hover {
   border-color: var(--border-strong);
   color: var(--text);
+}
+
+.ab-btn.ghost.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 自定义实现方式输入区 */
+.ab-custom {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px dashed color-mix(in srgb, #56c2e6 35%, var(--border));
+}
+
+.ab-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 9px 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  resize: vertical;
+  min-height: 70px;
+  font-family: inherit;
+}
+
+.ab-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+
+.ab-custom-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ab-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.ab-btn.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
 }
 </style>

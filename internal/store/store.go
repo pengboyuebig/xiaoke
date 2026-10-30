@@ -24,6 +24,8 @@ type Message struct {
 	Role      string    `json:"role"` // "user" | "assistant" | "tool"
 	Content   string    `json:"content"`
 	CreatedAt time.Time `json:"createdAt"`
+	// 隐藏消息：仍参与模型上下文，但前端不渲染（如「批准计划」的自动指令）
+	Hidden bool `json:"hidden,omitempty"`
 	// assistant 消息携带的工具调用（content 可为空说明文字）
 	ToolCalls []ToolCallRecord `json:"toolCalls,omitempty"`
 	// role=tool 时：这条结果对应的调用 ID 与工具名

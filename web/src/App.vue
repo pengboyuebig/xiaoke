@@ -71,12 +71,21 @@ function onModeChange(m: WorkMode) {
   if (m === 'build') clearApproval()
 }
 
-/** 批准计划：切开发模式 → 自动发送「开始」按计划开工 */
+/** 批准计划：切开发模式 → 自动发送「开始」按计划开工（该消息不显示在对话里） */
 function handleApprove() {
   if (streaming.value) return
   clearApproval()
   setWorkMode('build')
-  handleSend('开始')
+  handleSend('开始', { hidden: true })
+}
+
+/** 批准但用自己的实现方式：切开发模式 → 发送用户写的指令（正常显示） */
+function handleApproveCustom(text: string) {
+  const t = text.trim()
+  if (!t || streaming.value) return
+  clearApproval()
+  setWorkMode('build')
+  handleSend(t)
 }
 
 /** 继续调整计划：收起批准条并聚焦输入框 */
@@ -230,7 +239,8 @@ const turns = computed<Turn[]>(() => {
   for (const m of messages.value) {
     if (m.role === 'user') {
       flushRound()
-      cur = { question: m.content, groups: [], startTime: m.createdAt }
+      // 隐藏消息（如批准计划的自动指令）不显示问题气泡，但仍开启一个新回合承接回复
+      cur = { question: m.hidden ? '' : m.content, groups: [], startTime: m.createdAt }
       out.push(cur)
       continue
     }
@@ -300,13 +310,13 @@ const turns = computed<Turn[]>(() => {
   return out
 })
 
-async function handleSend(content: string) {
+async function handleSend(content: string, opts?: { hidden?: boolean }) {
   if (streaming.value) return
   error.value = ''
   // 新一轮开始：旧的批准条作废；记录本次发送的模式
   clearApproval()
   const sentMode = workMode.value
-  messages.value.push({ role: 'user', content })
+  messages.value.push({ role: 'user', content, hidden: opts?.hidden === true })
   streaming.value = true
   streamingText.value = ''
   liveTools.value = []
@@ -326,6 +336,7 @@ async function handleSend(content: string) {
       agentId: currentAgent.value?.id || '',
       reasoning: reasoning.value,
       mode: workMode.value,
+      approve: opts?.hidden === true,
       signal: controller.signal,
       onDelta: (t) => {
         streamingText.value += t
@@ -522,6 +533,7 @@ function onSettingsClosed() {
         :messages="messages"
         :awaiting-approval="planAwaitingApproval"
         @approve="handleApprove"
+        @approve-custom="handleApproveCustom"
         @adjust-plan="handleAdjustPlan"
       />
       <Composer

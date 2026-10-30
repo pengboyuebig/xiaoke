@@ -12,6 +12,8 @@ export interface Message {
   role: Role
   content: string
   createdAt?: string
+  /** 隐藏消息：参与模型上下文但不渲染（如批准计划的自动指令） */
+  hidden?: boolean
   /** 仅前端本地：用户中途停止生成，服务端未保存这条半截回复 */
   stopped?: boolean
   /** assistant 消息携带的工具调用 */
@@ -174,6 +176,8 @@ export interface MCPStatus {
   name: string
   enabled: boolean
   running: boolean
+  /** 握手进行中（npx 冷启动） */
+  starting?: boolean
   error?: string
   tools: string[]
   toolHint?: string

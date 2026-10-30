@@ -112,6 +112,8 @@ type chatRequest struct {
 	Reasoning string `json:"reasoning"`
 	// Mode 工作模式：plan（只读调研+出计划）| build（开发，默认）
 	Mode string `json:"mode"`
+	// Approve 批准计划：本条 user 消息只用于驱动模型（前端不渲染）
+	Approve bool `json:"approve"`
 }
 
 // chat 处理一次问答（含工具调用循环）。
@@ -180,7 +182,7 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := h.store.Append(sess.ID, store.Message{
-		Role: "user", Content: req.Content, CreatedAt: time.Now(),
+		Role: "user", Content: req.Content, Hidden: req.Approve, CreatedAt: time.Now(),
 	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

@@ -105,6 +105,18 @@ async function toggle(s: Skill) {
     err.value = (ex as Error).message
   }
 }
+
+/** 启停开关：新建时改本地表单，已存在时调用接口 */
+function onEnabledChange(e: Event) {
+  const checked = (e.target as HTMLInputElement).checked
+  const cur = editing.value
+  if (!cur) return
+  if (creating.value) {
+    cur.enabled = checked
+  } else {
+    toggle(cur)
+  }
+}
 </script>
 
 <template>
@@ -151,7 +163,7 @@ async function toggle(s: Skill) {
           </div>
           <span class="spacer"></span>
           <label class="switch">
-            <input type="checkbox" :checked="current.enabled" @change="creating ? (current.enabled = $event.target.checked) : toggle(current)" />
+            <input type="checkbox" :checked="current.enabled" @change="onEnabledChange" />
             <span>{{ current.enabled ? '已启用' : '已停用' }}</span>
           </label>
         </div>
