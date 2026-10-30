@@ -373,6 +373,12 @@ func (c *Client) CallTool(ctx context.Context, tool string, args json.RawMessage
 		"name":      tool,
 		"arguments": args,
 	}, &result); err != nil {
+		// 进程已退出时错误带上 stderr 尾部，用户能看到 server 崩溃原因
+		select {
+		case <-c.exited:
+			return "", fmt.Errorf("MCP server %q 在调用 %s 时退出%s", c.name, tool, c.stderrSnippet())
+		default:
+		}
 		return "", err
 	}
 	texts := make([]string, 0, len(result.Content))

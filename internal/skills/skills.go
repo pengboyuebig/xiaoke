@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 var ErrNotFound = errors.New("skill not found")
@@ -185,18 +186,57 @@ func (s *Store) Delete(id string) error {
 	return s.saveLocked()
 }
 
+// maxAssemblyBytes 是技能注入系统提示词的总字节上限。
+// 技能是用户手写的自由文本，没有上限的话十几篇长技能会把上下文吃光，
+// 还挤掉真正的对话历史。
+const maxAssemblyBytes = 16 * 1024
+
 // Assembly 返回注入系统提示词的技能正文（仅启用的）；无启用技能返回空串。
+// 超过上限时按顺序装载，放不下的技能截断并标注——排在前面的优先。
 func (s *Store) Assembly() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var b strings.Builder
+	budget := maxAssemblyBytes
+	truncated := false
 	for _, it := range s.items {
 		if !it.Enabled || strings.TrimSpace(it.Content) == "" {
 			continue
 		}
-		fmt.Fprintf(&b, "\n\n【技能：%s】%s\n%s", it.Name, it.Description, it.Content)
+		sec := fmt.Sprintf("\n\n【技能：%s】%s\n%s", it.Name, it.Description, it.Content)
+		if len(sec) > budget {
+			if budget < 200 {
+				truncated = true // 连标注都放不下了
+				break
+			}
+			sec = truncateBytes(sec, budget) + "\n…（超出注入上限，已截断）"
+			b.WriteString(sec)
+			truncated = true
+			break
+		}
+		budget -= len(sec)
+		b.WriteString(sec)
+	}
+	if truncated {
+		b.WriteString("\n\n（提示：启用的技能总量过大，只装入了部分。请停用不常用的技能以获得完整注入。）")
 	}
 	return b.String()
+}
+
+// truncateBytes 按字节截断且不切碎 UTF-8 序列：
+// 不断回退直到结尾是合法 rune 边界（同时覆盖「续字节」与「悬空起始字节」两种情况）。
+func truncateBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := s[:n]
+	for len(cut) > 0 {
+		if r, size := utf8.DecodeLastRuneInString(cut); r != utf8.RuneError || size != 1 {
+			break
+		}
+		cut = cut[:len(cut)-1]
+	}
+	return cut
 }
 
 func genID() string {

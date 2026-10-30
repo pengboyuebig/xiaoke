@@ -67,6 +67,11 @@ type Session struct {
 	// LastSeq 是快照已包含到的日志序号（日志合并后写入）
 	LastSeq  int64     `json:"lastSeq,omitempty"`
 	Messages []Message `json:"messages"`
+
+	// Summary 是主动压缩生成的「历史摘要」；SummaryUpTo 之前的消息已被它覆盖。
+	// 摘要存在快照里（随快照合并/迁移一起走），发送上下文时用摘要替代旧消息。
+	Summary     string    `json:"summary,omitempty"`
+	SummaryUpTo time.Time `json:"summaryUpTo,omitempty"`
 }
 
 // Meta 是会话列表里展示的摘要（不含消息体）。
@@ -201,7 +206,7 @@ func (s *Store) Create(title, projectID string) (*Session, error) {
 }
 
 // List 返回全部会话的摘要，按更新时间倒序。
-// 优先只读 meta 文件；没有 meta 的旧会话回退到完整加载（不写盘）。
+// 优先只读 meta 文件；没有 meta 的旧会话完整加载一次并补写 meta（一次性迁移）。
 func (s *Store) List() ([]Meta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -231,7 +236,8 @@ func (s *Store) List() ([]Meta, error) {
 		metas = append(metas, m)
 		seen[id] = true
 	}
-	// 兼容没有 meta 的旧会话
+	// 兼容没有 meta 的旧会话：完整加载一次并补写 meta（一次性迁移），
+	// 否则每次列表刷新都要全量读快照+日志，会话越多侧栏越慢。
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".meta.json") {
@@ -245,6 +251,7 @@ func (s *Store) List() ([]Meta, error) {
 		if err != nil {
 			continue // 单个文件损坏不影响列表
 		}
+		_ = s.saveMeta(metaOf(sess))
 		metas = append(metas, metaOf(sess))
 	}
 	sort.Slice(metas, func(i, j int) bool { return metas[i].UpdatedAt.After(metas[j].UpdatedAt) })
@@ -363,6 +370,7 @@ func (s *Store) Delete(id string) error {
 	if _, err := s.moveToTrashLocked(id); err != nil {
 		return fmt.Errorf("删除前备份失败，已取消删除: %w", err)
 	}
+	s.pruneTrashLocked()
 	for _, p := range []string{s.logPath(id), s.metaPath(id), s.path(id)} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -373,6 +381,38 @@ func (s *Store) Delete(id string) error {
 
 // TrashDir 是删除会话时保留副本的目录（位于会话目录下的 trash/）。
 func (s *Store) TrashDir() string { return filepath.Join(s.dir, "trash") }
+
+// maxTrashEntries 回收站目录数上限：到顶后删最旧的。
+// 30 天自动清理之外的第二道保险——短时间大量删会话也不会把磁盘吃穿。
+const maxTrashEntries = 50
+
+// pruneTrashLocked 回收站条数超限时按修改时间删最旧。调用方需持有 s.mu。
+func (s *Store) pruneTrashLocked() {
+	entries, err := os.ReadDir(s.TrashDir())
+	if err != nil || len(entries) <= maxTrashEntries {
+		return
+	}
+	type item struct {
+		name string
+		mod  time.Time
+	}
+	items := []item{}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			items = append(items, item{e.Name(), info.ModTime()})
+		}
+	}
+	if len(items) <= maxTrashEntries {
+		return
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].mod.Before(items[j].mod) })
+	for i := 0; i < len(items)-maxTrashEntries; i++ {
+		_ = os.RemoveAll(filepath.Join(s.TrashDir(), items[i].name))
+	}
+}
 
 // moveToTrashLocked 把会话文件复制到 trash/<id>-<时间戳>/。调用方需持有 s.mu。
 func (s *Store) moveToTrashLocked(id string) (string, error) {
@@ -852,6 +892,61 @@ func (s *Store) compactLocked(id string) error {
 		return err
 	}
 	// 删除失败不阻断：快照的 LastSeq 会让旧日志条目在读取时被跳过
+	_ = os.Remove(s.logPath(id))
+	return s.saveMeta(metaOf(sess))
+}
+
+// SetTitle 设置会话标题（写 meta 即可：加载侧以 meta 为准）。
+// 已有标题时不覆盖——自动命名只补空白，用户改过就尊重。
+func (s *Store) SetTitle(id, title string) error {
+	if !validID.MatchString(id) {
+		return ErrNotFound
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return nil
+	}
+	if rs := []rune(title); len(rs) > 32 {
+		title = string(rs[:32])
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.loadMeta(id)
+	if err != nil {
+		// 无 meta 的旧会话：先补一份再改
+		sess, lerr := s.loadFullLocked(id)
+		if lerr != nil {
+			return lerr
+		}
+		m = metaOf(sess)
+	}
+	if strings.TrimSpace(m.Title) != "" {
+		return nil
+	}
+	m.Title = title
+	m.UpdatedAt = time.Now()
+	return s.saveMeta(m)
+}
+
+// SetSummary 持久化「历史摘要」：把摘要写进快照并收敛日志，
+// 保证重启后摘要与消息边界（SummaryUpTo）一起还原。
+func (s *Store) SetSummary(id string, summary string, upTo time.Time) error {
+	if !validID.MatchString(id) {
+		return ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, err := s.loadFullLocked(id)
+	if err != nil {
+		return err
+	}
+	sess.Summary = summary
+	sess.SummaryUpTo = upTo
+	if err := s.saveSnapshot(sess); err != nil {
+		return err
+	}
+	// 消息体已随快照落盘（导出/回收站仍能看到完整历史），日志收敛掉避免双份；
+	// 读取侧按 SummaryUpTo 过滤摘要覆盖范围。
 	_ = os.Remove(s.logPath(id))
 	return s.saveMeta(metaOf(sess))
 }

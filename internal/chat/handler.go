@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"xiaoke/internal/agents"
@@ -40,6 +41,13 @@ type Handler struct {
 // maxHistoryBytes 是发给上游的历史消息总字节预算：
 // 只按条数截断时，几条大文件结果（单条可达 64KB）就可能撑爆上下文。
 const maxHistoryBytes = 256 * 1024
+
+// parallelToolLimit 是单轮多个只读工具的并发上限。
+// MCP server 侧通常还是串行处理，这里限制的是「同时挂起的请求数」。
+const parallelToolLimit = 4
+
+// maxToolArgBytes 单次工具调用参数体的字节上限（1MB）。
+const maxToolArgBytes = 1 << 20
 
 func NewHandler(cfg *config.Config, st *store.Store, set *settings.Store, pm *projects.Manager, mm *mcp.Manager, ag *agents.Store, sk *skills.Store) *Handler {
 	return &Handler{cfg: cfg, store: st, set: set, projects: pm, mcp: mm, agents: ag, skills: sk}
@@ -321,6 +329,15 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	// 自动命名：标题还是空时，用首条用户消息的第一行生成（本地截断，不花模型调用）。
+	// SetTitle 内部保证不覆盖已有标题。
+	if sess.Title == "" {
+		if t := deriveTitle(req.Content); t != "" {
+			if err := h.store.SetTitle(sess.ID, t); err == nil {
+				sess.Title = t
+			}
+		}
+	}
 
 	// 组装上下文：系统提示词（智能体人格+技能+项目+工具规范）+ 截断后的历史
 	full, err := h.store.Get(sess.ID)
@@ -339,9 +356,10 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	env := &tools.Env{
-		Workspace: projPath,
-		ReadDirs:  sset.ReadDirs,
-		Allowlist: sset.CommandAllowlist,
+		Workspace:         projPath,
+		ReadDirs:          sset.ReadDirs,
+		Allowlist:         sset.CommandAllowlist,
+		CommandTimeoutSec: sset.CommandTimeoutSec,
 	}
 	defs := tools.Defs(tools.Builtin())
 	defs = append(defs, h.mcp.Tools()...)
@@ -380,14 +398,39 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		Instructions:   prompt.PlanGuideFor(planMode),
 	})
 	convo := []ChatMessage{{Role: "system", Content: sysPrompt}}
-	// 历史：先按条数/字节裁剪并向前对齐到 user 边界，再清理孤立/不完整的 tool 消息。
-	// 否则截断点落在 assistant.tool_calls 与 tool 结果之间时，严格上游会直接 400。
-	history := sanitizeHistory(trimHistory(full.Messages, eff.MaxHistory, maxHistoryBytes))
+
+	// 上下文控制（两层）：
+	//   1. 主动压缩——历史超预算时先把旧回合总结成摘要（持久化，可关闭）；
+	//   2. 被动裁剪——对「摘要之后的近期消息」按条数/字节硬裁，兜底。
+	streamFn := Upstream(effAsConfig(eff))
+	view := summaryView{Recent: full.Messages}
+	if sset.AutoCompact && !strings.EqualFold(eff.Mode, "mock") {
+		keep := eff.MaxHistory
+		if sset.CompactKeepCount > 0 {
+			keep = sset.CompactKeepCount
+		}
+		view = maybeCompact(r.Context(), h.store, full, keep, maxHistoryBytes, streamFn, effAsConfig(eff))
+	}
+	if strings.TrimSpace(view.Summary) != "" {
+		// 摘要以 system 角色紧跟主提示词，明确告知它是「此前的对话压缩」
+		convo = append(convo, ChatMessage{
+			Role: "system",
+			Content: "【此前的对话摘要】\n以下是本会话更早内容的压缩版（细节已省略，完整历史仍在本地）：\n" +
+				view.Summary + "\n【摘要结束】继续对话时以此为背景。",
+		})
+	}
+	// 裁剪并清理孤立/不完整的 tool 消息：截断点落在 assistant.tool_calls
+	// 与 tool 结果之间时，严格上游会直接 400。
+	history := sanitizeHistory(trimHistory(view.Recent, eff.MaxHistory, maxHistoryBytes))
 	convo = append(convo, toWire(history)...)
 
 	maxSteps := sset.MaxToolSteps
-	streamFn := Upstream(effAsConfig(eff))
-	reasoning := req.Reasoning
+	reasoning := normalizeReasoning(req.Reasoning)
+	// 计划模式没有显式指定思考程度时默认 high：
+	// 调研与计划的质量远比响应速度重要，且这是用户显式选择「慢工出细活」的模式。
+	if planMode && reasoning == "" {
+		reasoning = "high"
+	}
 
 	// 切换到 SSE 输出
 	fl, ok := w.(http.Flusher)
@@ -401,8 +444,13 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	fl.Flush()
 
+	// send 必须串行：并行只读工具会从多个 goroutine 同时发事件，
+	// 而 http.ResponseWriter 的并发写不是线程安全的，SSE 流会交错损坏。
+	var sendMu sync.Mutex
 	send := func(evt map[string]any) {
 		data, _ := json.Marshal(evt)
+		sendMu.Lock()
+		defer sendMu.Unlock()
 		w.Write([]byte("data: " + string(data) + "\n\n"))
 		fl.Flush()
 	}
@@ -449,39 +497,48 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		convo = append(convo, ChatMessage{Role: "assistant", Content: content, ToolCalls: calls})
 
-		for _, call := range calls {
-			// args 不再按 400 字符截断：前端合并成工具区块后只展示摘要行
-			send(map[string]any{"type": "tool", "name": call.Function.Name, "args": call.Function.Arguments})
-			start := time.Now()
-			text, execErr := h.execTool(r.Context(), env, defs, call)
-			ms := time.Since(start).Milliseconds()
-			evt := map[string]any{
-				"type": "tool_result", "name": call.Function.Name,
-				"ok": execErr == nil, "ms": ms,
-				"preview": truncateRunes(firstLineOK(text, execErr), 500),
+		// 全部只读工具且多于一个时并发执行（写类工具必须串行，避免竞争同一文件）；
+		// 结果仍按调用顺序回填 convo 与落库，SSE 事件按完成顺序发出（前端按 id 配对）。
+		parallel := len(calls) > 1 && noneWriteCapable(defs, calls)
+		results := make([]toolOutcome, len(calls))
+		if parallel {
+			var wg sync.WaitGroup
+			sem := make(chan struct{}, parallelToolLimit)
+			for i := range calls {
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(i int) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					results[i] = h.runOneTool(r.Context(), env, defs, calls[i], send)
+				}(i)
 			}
-			if execErr != nil {
-				evt["error"] = execErr.Error()
+			wg.Wait()
+		} else {
+			for i := range calls {
+				results[i] = h.runOneTool(r.Context(), env, defs, calls[i], send)
 			}
-			send(evt)
-			resultText := text
-			if execErr != nil {
-				resultText = "工具执行出错: " + execErr.Error() + orText(text)
+		}
+		for i := range calls {
+			out := results[i]
+			resultText := out.text
+			if out.err != nil {
+				resultText = "工具执行出错: " + out.err.Error() + orText(out.text)
 			}
 			if err := h.store.Append(sess.ID, store.Message{
-				Role: "tool", Content: resultText, ToolCallID: call.ID,
-				Name: call.Function.Name, CreatedAt: time.Now(),
+				Role: "tool", Content: resultText, ToolCallID: calls[i].ID,
+				Name: calls[i].Function.Name, CreatedAt: time.Now(),
 			}); err != nil {
 				send(map[string]any{"type": "error", "error": "保存工具结果失败: " + err.Error()})
 				return
 			}
 			convo = append(convo, ChatMessage{
 				Role: "tool", Content: resultText,
-				ToolCallID: call.ID, Name: call.Function.Name,
+				ToolCallID: calls[i].ID, Name: calls[i].Function.Name,
 			})
-			if r.Context().Err() != nil {
-				return // 客户端断开，停止循环
-			}
+		}
+		if r.Context().Err() != nil {
+			return // 客户端断开，停止循环
 		}
 	}
 	// 达到最大轮数：强制做一轮无工具的最终答复
@@ -505,6 +562,60 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	send(map[string]any{"type": "error", "error": fmt.Sprintf("已达到最大工具轮数（%d），本轮结束", maxSteps)})
 }
 
+// toolOutcome 是一次工具执行的完整结果（SSE 已在执行中发出，这里供落库/回填）。
+type toolOutcome struct {
+	text string
+	err  error
+}
+
+// runOneTool 发出 tool 开始事件、执行、发出 tool_result 事件。
+// 并发与串行两种模式都用它，保证事件结构一致（都带 id，前端按 id 配对）。
+func (h *Handler) runOneTool(ctx context.Context, env *tools.Env, defs []tools.ToolDef, call ToolCall, send func(map[string]any)) toolOutcome {
+	// args 不再按 400 字符截断：前端合并成工具区块后只展示摘要行
+	send(map[string]any{"type": "tool", "id": call.ID, "name": call.Function.Name, "args": call.Function.Arguments})
+	start := time.Now()
+	text, execErr := h.execTool(ctx, env, defs, call)
+	ms := time.Since(start).Milliseconds()
+	evt := map[string]any{
+		"type": "tool_result", "id": call.ID, "name": call.Function.Name,
+		"ok": execErr == nil, "ms": ms,
+		"preview": truncateRunes(firstLineOK(text, execErr), 500),
+	}
+	if execErr != nil {
+		evt["error"] = execErr.Error()
+	}
+	send(evt)
+	return toolOutcome{text: text, err: execErr}
+}
+
+// noneWriteCapable 判断本轮全部调用是否都不具备写能力（并发执行的前提）。
+func noneWriteCapable(defs []tools.ToolDef, calls []ToolCall) bool {
+	index := toolIndex(defs)
+	for _, c := range calls {
+		def := index[c.Function.Name]
+		if def == nil {
+			continue // 未知工具执行时才会报错，这里按串行稳妥处理
+		}
+		name := def.Function.Name
+		if def.FromMCP != "" {
+			name = def.MCPTool
+		}
+		if tools.IsWriteCapable(name) {
+			return false
+		}
+	}
+	return true
+}
+
+// toolIndex 按 O(1) 查找建工具索引（execTool 原为线性扫描，单轮多工具时重复扫描）。
+func toolIndex(defs []tools.ToolDef) map[string]*tools.ToolDef {
+	m := make(map[string]*tools.ToolDef, len(defs))
+	for i := range defs {
+		m[defs[i].Function.Name] = &defs[i]
+	}
+	return m
+}
+
 // execTool 按名字分发：内置工具直接执行，MCP 工具转发给对应 server。
 func (h *Handler) execTool(ctx context.Context, env *tools.Env, defs []tools.ToolDef, call ToolCall) (string, error) {
 	var def *tools.ToolDef
@@ -520,6 +631,11 @@ func (h *Handler) execTool(ctx context.Context, env *tools.Env, defs []tools.Too
 	raw := strings.TrimSpace(call.Function.Arguments)
 	if raw == "" || raw == "null" {
 		raw = "{}"
+	}
+	// 参数体上限：模型的 arguments 偶发失控（复读/超长转义），
+	// 没有上限会把 1MB+ 的 JSON 直接塞给工具或 MCP server。
+	if len(raw) > maxToolArgBytes {
+		return "", fmt.Errorf("工具参数过大（%dKB，上限 %dKB）", len(raw)/1024, maxToolArgBytes/1024)
 	}
 	args := json.RawMessage(raw)
 	if !json.Valid(args) {
@@ -552,6 +668,7 @@ func effAsConfig(e settings.LLMSettings) config.LLMConfig {
 	return config.LLMConfig{
 		Mode: e.Mode, BaseURL: e.BaseURL, APIKey: e.APIKey,
 		Model: e.Model, Temperature: e.Temperature, MaxHistory: e.MaxHistory,
+		MaxTokens: e.MaxTokens,
 	}
 }
 
@@ -560,6 +677,24 @@ func agentIDOf(a *agents.Agent) string {
 		return ""
 	}
 	return a.ID
+}
+
+// deriveTitle 从首条用户消息生成会话标题：取第一个非空行，
+// 去掉列表/标题的 Markdown 前缀，截 32 字符。生成失败返回空串（保持「新对话」）。
+func deriveTitle(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimLeft(line, "#*-• ")
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if rs := []rune(line); len(rs) > 32 {
+			line = string(rs[:32])
+		}
+		return line
+	}
+	return ""
 }
 
 func truncateRunes(s string, n int) string {

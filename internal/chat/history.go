@@ -44,15 +44,26 @@ func trimHistory(msgs []store.Message, maxCount, maxBytes int) []store.Message {
 		start++
 	}
 	if start >= len(msgs) {
-		start = len(msgs) - 1
+		// 全是工具消息（生产上不会发生：当前 user 消息总在末尾）。
+		// 退而求其次：从最后一条非 tool 消息开始，避免以孤立 tool 开头被上游 400。
+		i := len(msgs) - 1
+		for i > 0 && msgs[i].Role == "tool" {
+			i--
+		}
+		start = i
 	}
 	return msgs[start:]
 }
 
 func messageSize(m store.Message) int {
-	n := len(m.Content) + 16
+	// 24：role/createdAt 等结构与 JSON 包装的估算开销
+	n := len(m.Content) + 24
 	for _, c := range m.ToolCalls {
-		n += len(c.Name) + len(c.Arguments) + 8
+		// tool_call 的 id/name/arguments 外加 tool_calls 数组项的 JSON 包装
+		n += len(c.ID) + len(c.Name) + len(c.Arguments) + 32
+	}
+	if m.ToolCallID != "" {
+		n += len(m.ToolCallID) + len(m.Name) + 16
 	}
 	return n
 }

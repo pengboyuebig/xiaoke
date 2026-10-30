@@ -10,9 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -130,7 +133,7 @@ func execListFiles(ctx context.Context, env *Env, args json.RawMessage) (string,
 			if err != nil {
 				return nil // 单个不可读路径跳过
 			}
-			// 目录条目也计入上限，避免大仓库/node_modules 把内存撑爆
+			// 目录条目也计入上限，避免大仓库把内存撑爆
 			if len(entries) >= maxListEntries {
 				return fs.SkipAll
 			}
@@ -142,6 +145,10 @@ func execListFiles(ctx context.Context, env *Env, args json.RawMessage) (string,
 				return nil
 			}
 			if d.IsDir() {
+				// 与 search_files/项目树同一套跳过规则：递归浏览不应走进依赖目录
+				if skipDirs[d.Name()] {
+					return fs.SkipDir
+				}
 				if strings.Count(rel, string(filepath.Separator)) >= 4 {
 					return fs.SkipDir
 				}
@@ -158,7 +165,14 @@ func execListFiles(ctx context.Context, env *Env, args json.RawMessage) (string,
 	if len(entries) == 0 {
 		return "(空目录)", nil
 	}
-	sort.Strings(entries)
+	// 目录在前、文件在后，各自字母序：模型读目录结构时层次更清晰
+	sort.Slice(entries, func(i, j int) bool {
+		di, dj := strings.HasSuffix(entries[i], "/"), strings.HasSuffix(entries[j], "/")
+		if di != dj {
+			return di
+		}
+		return entries[i] < entries[j]
+	})
 	if len(entries) > maxListEntries {
 		entries = append(entries[:maxListEntries], fmt.Sprintf("…（超出 %d 条上限，已截断）", maxListEntries))
 	}
@@ -241,7 +255,14 @@ func execWriteFile(ctx context.Context, env *Env, args json.RawMessage) (string,
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(abs, []byte(in.Content), 0o644); err != nil {
+	// 原子写：先写同目录临时文件再 rename。直接 WriteFile 时进程被杀/断电
+	// 会留下半截文件——源码文件半截比写入失败糟糕得多。
+	tmp := abs + ".xk-tmp"
+	if err := os.WriteFile(tmp, []byte(in.Content), 0o644); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, abs); err != nil {
+		_ = os.Remove(tmp)
 		return "", err
 	}
 	return fmt.Sprintf("已写入 %s（%d 字节）", filepath.ToSlash(in.Path), len(in.Content)), nil
@@ -279,6 +300,18 @@ func isUTF8Boundary(s string) bool {
 	return b&0xC0 != 0x80
 }
 
+// binaryExts 是无需读入做文本匹配的常见二进制/资源扩展名。
+// 搜索跳过它们：既省 IO，也避免把图片字节误判成「无命中文件」白扫一遍。
+var binaryExts = map[string]bool{
+	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true, ".ico": true,
+	".pdf": true, ".zip": true, ".gz": true, ".tar": true, ".7z": true, ".rar": true,
+	".mp3": true, ".mp4": true, ".mov": true, ".avi": true, ".webm": true,
+	".woff": true, ".woff2": true, ".ttf": true, ".otf": true, ".eot": true,
+	".exe": true, ".dll": true, ".so": true, ".dylib": true, ".class": true,
+	".pyc": true, ".o": true, ".a": true, ".lib": true, ".wasm": true,
+	".sqlite": true, ".db": true, ".bin": true, ".dat": true,
+}
+
 func execSearchFiles(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
 	var in struct {
 		Query string `json:"query"`
@@ -292,11 +325,17 @@ func execSearchFiles(ctx context.Context, env *Env, args json.RawMessage) (strin
 		return "", err
 	}
 	q := strings.ToLower(in.Query)
-	hits := []string{}
-	scanned := 0
-	err = filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || len(hits) >= maxSearchHits {
-			return fs.SkipAll
+
+	// 两阶段：先串行收集待扫描文件（WalkDir 本身是 IO 串行的），
+	// 再用 worker 池并行读文件做匹配——大仓库搜索时长以 IO 为主，并行收益明显。
+	type candidate struct {
+		path string
+		rel  string
+	}
+	var candidates []candidate
+	walkErr := filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
 		}
 		if d.IsDir() {
 			if skipDirs[d.Name()] {
@@ -304,44 +343,110 @@ func execSearchFiles(ctx context.Context, env *Env, args json.RawMessage) (strin
 			}
 			return nil
 		}
-		scanned++
-		if scanned > maxSearchFiles {
+		if len(candidates) >= maxSearchFiles {
 			return fs.SkipAll
+		}
+		if binaryExts[strings.ToLower(filepath.Ext(d.Name()))] {
+			return nil
 		}
 		info, ierr := d.Info()
 		if ierr != nil || info.Size() > 1024*1024 {
 			return nil
 		}
-		raw, rerr := os.ReadFile(p)
-		if rerr != nil || bytes.IndexByte(raw, 0) >= 0 {
-			return nil
-		}
 		rel, _ := filepath.Rel(base, p)
-		for i, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
-			if strings.Contains(strings.ToLower(line), q) {
-				trimmed := strings.TrimSpace(line)
-				if len([]rune(trimmed)) > 200 {
-					trimmed = truncateRunes(trimmed, 200) + "…"
-				}
-				hits = append(hits, fmt.Sprintf("%s:%d: %s", filepath.ToSlash(rel), i+1, trimmed))
-				if len(hits) >= maxSearchHits {
-					break
-				}
-			}
-		}
+		candidates = append(candidates, candidate{path: p, rel: filepath.ToSlash(rel)})
 		return nil
 	})
-	if err != nil {
-		return "", err
+	if walkErr != nil {
+		return "", walkErr
 	}
+
+	var (
+		mu        sync.Mutex
+		hits      []string
+		scanned   int
+		truncated bool
+	)
+	workers := runtime.NumCPU()
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 2 {
+		workers = 1
+	}
+	jobs := make(chan candidate)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range jobs {
+				mu.Lock()
+				full := len(hits) >= maxSearchHits
+				mu.Unlock()
+				if full {
+					continue
+				}
+				fileHits := searchOneFile(c.path, c.rel, q, maxSearchHits)
+				mu.Lock()
+				scanned++
+				for _, h := range fileHits {
+					if len(hits) >= maxSearchHits {
+						truncated = true
+						break
+					}
+					hits = append(hits, h)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, c := range candidates {
+		// 已够命中数就不再投喂，尽快让 worker 收工
+		mu.Lock()
+		full := len(hits) >= maxSearchHits
+		mu.Unlock()
+		if full {
+			break
+		}
+		select {
+		case jobs <- c:
+		case <-ctx.Done():
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
 	if len(hits) == 0 {
 		return fmt.Sprintf("未找到包含 %q 的内容（扫描 %d 个文件）", in.Query, scanned), nil
 	}
 	out := strings.Join(hits, "\n")
-	if len(hits) >= maxSearchHits {
+	if truncated {
 		out += fmt.Sprintf("\n…（已达 %d 条上限）", maxSearchHits)
 	}
 	return out, nil
+}
+
+// searchOneFile 读单个文件做大小写不敏感匹配，返回命中行（带 文件:行号 前缀）。
+func searchOneFile(path, rel, q string, limit int) []string {
+	raw, err := os.ReadFile(path)
+	if err != nil || bytes.IndexByte(raw, 0) >= 0 {
+		return nil
+	}
+	hits := []string{}
+	for i, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
+		if strings.Contains(strings.ToLower(line), q) {
+			trimmed := strings.TrimSpace(line)
+			if len([]rune(trimmed)) > 200 {
+				trimmed = truncateRunes(trimmed, 200) + "…"
+			}
+			hits = append(hits, fmt.Sprintf("%s:%d: %s", rel, i+1, trimmed))
+			if len(hits) >= limit {
+				break
+			}
+		}
+	}
+	return hits
 }
 
 func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
@@ -384,10 +489,13 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 	if info, err := os.Stat(cwd); err != nil || !info.IsDir() {
 		return "", fmt.Errorf("工作目录不存在：%s（请先在侧栏选择或重建项目）", cwd)
 	}
-	cctx, cancel := context.WithTimeout(ctx, cmdTimeout)
+	cctx, cancel := context.WithTimeout(ctx, commandTimeout(env))
 	defer cancel()
 	cmd := exec.CommandContext(cctx, in.Command, in.Args...)
 	cmd.Dir = cwd
+	// 分页器必杀：git diff/log 在交互终端会起 pager 等输入，挂满 30s 超时。
+	// 子进程继承的环境里明确禁用分页，输出直落管道。
+	cmd.Env = append(os.Environ(), "GIT_PAGER=cat", "PAGER=cat", "GIT_TERMINAL_PROMPT=0")
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -395,6 +503,11 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 	out := buf.String()
 	if len(out) > maxOutBytes {
 		out = truncateBytes(out, maxOutBytes) + "\n…(输出已按 8KB 截断)"
+	}
+	if !utf8.ValidString(out) {
+		// 中文 Windows 控制台程序可能输出 GBK：不乱转码（会造出错误的字），
+		// 明确告知模型输出编码可疑，建议用 python 之类显式以 UTF-8 输出重跑。
+		out += "\n…（注意：以上输出不是合法 UTF-8，可能是 GBK 编码的中文；据此判断时先确认编码）"
 	}
 	head := fmt.Sprintf("$ %s %s\n", in.Command, strings.Join(in.Args, " "))
 	if runErr != nil {
@@ -405,4 +518,12 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 		return head + "(无输出)", nil
 	}
 	return head + out, nil
+}
+
+// commandTimeout 返回命令超时：settings 可配（秒），缺省 30s。
+func commandTimeout(env *Env) time.Duration {
+	if env.CommandTimeoutSec > 0 {
+		return time.Duration(env.CommandTimeoutSec) * time.Second
+	}
+	return cmdTimeout
 }

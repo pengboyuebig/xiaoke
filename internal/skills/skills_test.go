@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestSeedCreateToggleAssembly(t *testing.T) {
@@ -72,5 +73,32 @@ func TestSeedCreateToggleAssembly(t *testing.T) {
 	}
 	if len(s.List()) != 1 {
 		t.Fatal("删除后应剩 1 条")
+	}
+}
+
+// 技能注入总量超上限时：按顺序装载、截断并给出提示，而不是无限膨胀系统提示词。
+func TestAssemblyByteCap(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "skills.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := strings.Repeat("技能内容。", 3000) // ~36KB
+	for i := 0; i < 3; i++ {
+		if _, err := s.Create(Skill{
+			Name: "技能" + string(rune('A'+i)), Content: big, Enabled: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := s.Assembly()
+	if len(out) <= maxAssemblyBytes {
+		t.Fatalf("应发生截断（超过上限），len=%d", len(out))
+	}
+	if !strings.Contains(out, "超出注入上限") || !strings.Contains(out, "只装入了部分") {
+		t.Fatal("截断应有明确标注")
+	}
+	// 截断点不应切碎 UTF-8
+	if !utf8.ValidString(out) {
+		t.Fatal("截断产生了非法 UTF-8")
 	}
 }

@@ -107,3 +107,37 @@ func TestMaskKey(t *testing.T) {
 		t.Fatal("空白 key 应视为未配置")
 	}
 }
+
+// 新字段钳制：温度上限、maxHistory 上限、maxTokens 负值、压缩保留区不超过窗口。
+func TestNormalizeNewFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	s, err := Open(path, config.LLMConfig{Mode: "mock"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := s.Get()
+	next.LLM.Temperature = 5
+	next.LLM.MaxHistory = 9999
+	next.LLM.MaxTokens = -7
+	next.CompactKeepCount = 500
+	if err := s.Update(next, nil); err != nil {
+		t.Fatal(err)
+	}
+	got := s.Get()
+	if got.LLM.Temperature != 2 {
+		t.Fatalf("温度应钳到 2，got %v", got.LLM.Temperature)
+	}
+	if got.LLM.MaxHistory != 200 {
+		t.Fatalf("maxHistory 应钳到 200，got %d", got.LLM.MaxHistory)
+	}
+	if got.LLM.MaxTokens != 0 {
+		t.Fatalf("负 maxTokens 应归零，got %d", got.LLM.MaxTokens)
+	}
+	if got.CompactKeepCount != got.LLM.MaxHistory {
+		t.Fatalf("保留区应不超过窗口，got %d", got.CompactKeepCount)
+	}
+	if !got.AutoCompact {
+		t.Fatal("默认应开启自动压缩")
+	}
+}

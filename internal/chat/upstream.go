@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -52,21 +53,33 @@ type Hooks struct {
 	OnToolCall func(ToolDelta)
 }
 
-// reasoningEffortByRequest 把请求级「思考程度」注入请求体（可选字段，
-// 上游不识别该字段时按 OpenAI 规范应忽略；想关闭时传空/none 不注入）。
-func withReasoning(body map[string]any, effort string) {
-	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "", "none", "off", "auto":
-		return
-	case "minimal":
-		body["reasoning_effort"] = "minimal"
-	case "low":
-		body["reasoning_effort"] = "low"
-	case "medium":
-		body["reasoning_effort"] = "medium"
-	case "high":
-		body["reasoning_effort"] = "high"
+// validReasoning 是请求级思考程度的合法取值。
+var validReasoning = map[string]bool{
+	"minimal": true, "low": true, "medium": true, "high": true,
+}
+
+// normalizeReasoning 清洗请求级思考程度：未知值一律丢弃（记日志），
+// 而不是原样透传——上游对非法值的行为不可预期（有的 400，有的静默忽略）。
+func normalizeReasoning(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" || v == "none" || v == "off" || v == "auto" {
+		return ""
 	}
+	if !validReasoning[v] {
+		log.Printf("忽略未知思考程度 %q，可用值: minimal/low/medium/high", v)
+		return ""
+	}
+	return v
+}
+
+// withReasoning 把「思考程度」注入请求体（可选字段，
+// 上游不识别该字段时按 OpenAI 规范应忽略；想关闭时传空/none 不注入）。
+// 入参必须先经 normalizeReasoning 清洗。
+func withReasoning(body map[string]any, effort string) {
+	if effort == "" {
+		return
+	}
+	body["reasoning_effort"] = effort
 }
 
 // StreamFn 跑一轮流式补全，返回最终文本与（可能存在的）工具调用。
@@ -87,9 +100,16 @@ func Upstream(llm config.LLMConfig) StreamFn {
 
 // streamClient 专供流式补全：不设总超时（一次回答可能持续几分钟），
 // 但限制「等待响应头」的时间，避免上游完全卡死时请求无限挂起。
+//
+// 连接池调优：对话是长连接+高频小包场景，默认的 MaxIdleConnsPerHost=2
+// 会让并发请求（多会话/并行工具）反复建 TLS 握手，首 token 延迟明显上升。
 var streamClient = func() *http.Client {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.ResponseHeaderTimeout = 60 * time.Second
+	t.MaxIdleConns = 100
+	t.MaxIdleConnsPerHost = 16
+	t.IdleConnTimeout = 90 * time.Second
+	// TLSHandshakeTimeout 默认 10s，保持；压缩交给上游协商（SSE 通常不压缩）
 	return &http.Client{Transport: t}
 }()
 
@@ -106,6 +126,9 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 		"messages":    messages,
 		"stream":      true,
 		"temperature": cfg.Temperature,
+	}
+	if cfg.MaxTokens > 0 {
+		body["max_tokens"] = cfg.MaxTokens
 	}
 	if len(toolDefs) > 0 {
 		body["tools"] = toolDefs
@@ -124,6 +147,8 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	req.Header.Set("User-Agent", "xiaoke")
+	// 显式声明 SSE：个别网关会根据 Accept 决定是否缓冲
+	req.Header.Set("Accept", "text/event-stream")
 
 	resp, err := streamClient.Do(req)
 	if err != nil {
@@ -274,7 +299,7 @@ func streamMock(ctx context.Context, cfg config.LLMConfig, messages []ChatMessag
 		if len([]rune(result)) > 60 {
 			result = string([]rune(result)[:60]) + "…"
 		}
-		reply := fmt.Sprintf("**小柯** 工具跑完了，结果是：%s\n\n这是一次 **mock 工具调用演示**——证明整条「模型→工具→结果回填→继续生成」的链路是通的。接上真实模型后，我就能真正帮你写代码、写文章了。", result)
+		reply := fmt.Sprintf("**小柯** 工具跑完了，结果：%s\n\n这是一次 **mock 工具调用演示**——「模型→工具→结果回填→继续生成」这条链路是通的。接上真实模型后我就能真正干活了，现在这副躯壳只是个演示品，别对它期待太多。", result)
 		out, err := streamChars(ctx, reply, hooks.OnDelta)
 		return out, nil, err
 	}
@@ -317,7 +342,7 @@ func streamMock(ctx context.Context, cfg config.LLMConfig, messages []ChatMessag
 	if len([]rune(q)) > 40 {
 		q = string([]rune(q)[:40]) + "…"
 	}
-	reply := fmt.Sprintf("**小柯** 收到，你说的是「%s」。\n\n我现在跑在 **mock 演示模式**下。想让我真正干活（写代码、写文章、调工具），请在**设置**里把模型接上：\n\n1. 点左侧边栏的 ⚙ 设置\n2. 选择预设（DeepSeek / 本地 opencode 网关），填入 API Key\n3. 新建一个项目，然后对我说「帮我写个 xxx」", q)
+	reply := fmt.Sprintf("**小柯** 收到，你说的是「%s」。\n\n我现在跑在 **mock 演示模式**下，说穿了就是个会复读的空壳。想让我真正干活（写代码、写文章、调工具）：\n\n1. 点侧边栏 ⚙ 设置\n2. 选预设（DeepSeek / 本地 opencode 网关），填 API Key\n3. 建一个项目，然后对我说「帮我写个 xxx」\n\n——在那之前，请多包涵。", q)
 	out, err := streamChars(ctx, reply, hooks.OnDelta)
 	return out, nil, err
 }

@@ -134,7 +134,14 @@ func main() {
 		log.Printf("  MCP servers: %d 个", n)
 	}
 	log.Printf("================================================")
-	srv := &http.Server{Addr: addr, Handler: securityHeaders(mux)}
+	// 读头超时防 slowloris（本地服务，风险低但属于零成本加固）；
+	// 不设 Read/Write 总超时——SSE 流式回答会持续几分钟。
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           securityHeaders(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	errCh := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

@@ -55,6 +55,7 @@ type settingsView struct {
 		Model       string  `json:"model"`
 		Temperature float64 `json:"temperature"`
 		MaxHistory  int     `json:"maxHistory"`
+		MaxTokens   int     `json:"maxTokens"`
 	} `json:"llm"`
 	MCPServers            []settings.MCPServer `json:"mcpServers"`
 	ReadDirs              []string             `json:"readDirs"`
@@ -62,6 +63,9 @@ type settingsView struct {
 	ProjectsRootEffective string               `json:"projectsRootEffective"`
 	MaxToolSteps          int                  `json:"maxToolSteps"`
 	CommandAllowlist      []string             `json:"commandAllowlist"`
+	AutoCompact           bool                 `json:"autoCompact"`
+	CompactKeepCount      int                  `json:"compactKeepCount"`
+	CommandTimeoutSec     int                  `json:"commandTimeoutSec"`
 }
 
 func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +84,10 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 	v.LLM.Model = s.LLM.Model
 	v.LLM.Temperature = s.LLM.Temperature
 	v.LLM.MaxHistory = s.LLM.MaxHistory
+	v.LLM.MaxTokens = s.LLM.MaxTokens
+	v.AutoCompact = s.AutoCompact
+	v.CompactKeepCount = s.CompactKeepCount
+	v.CommandTimeoutSec = s.CommandTimeoutSec
 	writeJSON(w, http.StatusOK, v)
 }
 

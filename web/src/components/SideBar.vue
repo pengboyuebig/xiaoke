@@ -27,6 +27,16 @@ const emit = defineEmits<{
 }>()
 
 
+// 会话搜索：标题/ID 本地过滤（纯前端，无请求）
+const sessionQuery = ref('')
+const filteredSessions = computed(() => {
+  const q = sessionQuery.value.trim().toLowerCase()
+  if (!q) return props.sessions
+  return props.sessions.filter(
+    (s) => (s.title || '').toLowerCase().includes(q) || s.id.includes(q),
+  )
+})
+
 // 智能体切换下拉
 const expanding = ref(false)
 const currentAgent = computed<Agent | null>(
@@ -108,10 +118,19 @@ function projectName(projects: Project[], id?: string): string {
       <div v-if="!projects.length" class="empty">还没有项目，点「＋」创建一个。</div>
     </div>
 
-    <div class="section-label">最近会话</div>
+    <div class="section-label">
+      最近会话
+      <span class="sess-count">{{ filteredSessions.length }}</span>
+    </div>
+    <input
+      v-model="sessionQuery"
+      class="sess-search"
+      type="search"
+      placeholder="搜索会话…"
+    />
     <div class="list">
       <div
-        v-for="s in sessions"
+        v-for="s in filteredSessions"
         :key="s.id"
         class="item"
         :class="{ active: s.id === currentId }"
@@ -135,7 +154,8 @@ function projectName(projects: Project[], id?: string): string {
           <Icon name="x" :size="12" :stroke="2" />
         </button>
       </div>
-      <div v-if="!sessions.length" class="empty">还没有会话。</div>
+      <div v-if="!filteredSessions.length && sessionQuery.trim()" class="empty">没有匹配「{{ sessionQuery.trim() }}」的会话。</div>
+      <div v-else-if="!sessions.length" class="empty">还没有会话。</div>
     </div>
 
     <div class="foot">
@@ -173,6 +193,33 @@ function projectName(projects: Project[], id?: string): string {
   height: 180px;
   background: linear-gradient(180deg, rgba(255, 154, 61, 0.35), transparent);
   opacity: 0.55;
+}
+
+
+.sess-search {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text);
+  outline: none;
+  transition: border-color var(--dur) var(--ease);
+}
+
+.sess-search:focus {
+  border-color: var(--border-accent);
+}
+
+.sess-search::placeholder {
+  color: var(--text-faint);
+}
+
+.sess-count {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---------- 智能体切换器 ---------- */

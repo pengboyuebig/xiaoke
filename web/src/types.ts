@@ -25,6 +25,8 @@ export interface Message {
 
 /** 流式过程中的工具活动（live 状态，落库后由服务端消息接管） */
 export interface ToolActivity {
+  /** 调用 ID（后端 SSE 事件带）：并行执行时按它配对结果 */
+  id?: string
   name: string
   args?: string
   done: boolean
@@ -182,6 +184,7 @@ export interface SettingsView {
     model: string
     temperature: number
     maxHistory: number
+    maxTokens: number
   }
   mcpServers: MCPServerCfg[]
   readDirs: string[]
@@ -189,6 +192,9 @@ export interface SettingsView {
   projectsRootEffective: string
   maxToolSteps: number
   commandAllowlist: string[]
+  autoCompact: boolean
+  compactKeepCount: number
+  commandTimeoutSec: number
 }
 
 export interface MCPStatus {
@@ -213,10 +219,14 @@ export interface SettingsPayload {
     model: string
     temperature: number
     maxHistory: number
+    maxTokens: number
   }
   mcpServers: MCPServerCfg[]
   readDirs: string[]
   projectsRoot: string
   maxToolSteps: number
   commandAllowlist: string[]
+  autoCompact: boolean
+  compactKeepCount: number
+  commandTimeoutSec: number
 }

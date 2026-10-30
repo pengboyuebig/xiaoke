@@ -20,6 +20,8 @@ type Env struct {
 	Workspace string   // 可读写的工作区根（项目目录）；为空表示未选择项目
 	ReadDirs  []string // 只读授权目录
 	Allowlist []string // 可执行命令白名单（basename 匹配）
+	// CommandTimeoutSec run_command 超时（秒；<=0 用默认 30）。构建/安装类命令可能需要调大。
+	CommandTimeoutSec int
 }
 
 func (e *Env) clone() *Env {

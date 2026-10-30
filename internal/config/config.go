@@ -29,6 +29,9 @@ type LLMConfig struct {
 	Model       string  `json:"model"`
 	Temperature float64 `json:"temperature"`
 	MaxHistory  int     `json:"maxHistory"`
+	// MaxTokens 单次回复 token 上限（<=0 = 不注入请求体，由上游默认）。
+	// 运行时字段：不参与 config.json 序列化（由 settings 提供）。
+	MaxTokens int `json:"-"`
 }
 
 // Defaults 返回开箱即用的默认配置（mock 模式，无需 API Key）。

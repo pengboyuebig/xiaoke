@@ -2,7 +2,6 @@
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 
-const props = defineProps<{ busy: boolean; reasoning: string; mode?: string }>()
 const emit = defineEmits<{
   send: [content: string]
   stop: []
@@ -12,6 +11,48 @@ const emit = defineEmits<{
 
 const text = ref('')
 const ta = ref<HTMLTextAreaElement | null>(null)
+
+// 草稿按会话保存：切会话/误刷新不丢输入。上限 20 条草稿防 localStorage 膨胀。
+const DRAFT_PREFIX = 'xiaoke-draft:'
+const DRAFT_MAX = 20
+const props = defineProps<{ busy: boolean; reasoning: string; mode?: string; sessionId?: string }>()
+
+function loadDraft(sid?: string) {
+  if (!sid) return ''
+  try {
+    return localStorage.getItem(DRAFT_PREFIX + sid) || ''
+  } catch {
+    return ''
+  }
+}
+function saveDraft(sid: string | undefined, value: string) {
+  if (!sid) return
+  try {
+    if (value) localStorage.setItem(DRAFT_PREFIX + sid, value)
+    else localStorage.removeItem(DRAFT_PREFIX + sid)
+    // 粗略防膨胀：草稿键过多时按 key 序清理一批（非精确 LRU，够用即可）
+    const keys: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i)
+      if (k?.startsWith(DRAFT_PREFIX)) keys.push(k)
+    }
+    if (keys.length > DRAFT_MAX) {
+      keys.sort()
+      for (const k of keys.slice(0, keys.length - DRAFT_MAX)) localStorage.removeItem(k)
+    }
+  } catch {
+    /* 存储满/隐私模式：忽略 */
+  }
+}
+watch(
+  () => props.sessionId,
+  (sid, prev) => {
+    if (prev && text.value.trim()) saveDraft(prev, text.value)
+    text.value = loadDraft(sid)
+  },
+  { immediate: true },
+)
+watch(text, (v) => saveDraft(props.sessionId, v))
 
 // 输入框左侧的工作模式切换
 const modeMenuOpen = ref(false)
@@ -53,6 +94,7 @@ function submit() {
   if (!content || props.busy) return
   emit('send', content)
   text.value = ''
+  saveDraft(props.sessionId, '')
 }
 
 function onKeydown(e: KeyboardEvent) {

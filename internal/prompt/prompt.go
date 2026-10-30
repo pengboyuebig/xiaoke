@@ -4,6 +4,7 @@ package prompt
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"xiaoke/internal/persona"
 )
@@ -34,6 +35,9 @@ func Build(r Request) string {
 	}
 	b.WriteString(base)
 
+	// 当前日期：模型的时间感会漂移，涉及“最近/今天”的任务需要锚点
+	b.WriteString("\n\n今天是 " + cnDate(time.Now()) + "。")
+
 	// 2) 工具规范：智能体声明用工具 或 会话确实有工具时注入
 	if r.AgentTools || r.ToolsAvailable {
 		b.WriteString(persona.ToolGuide)
@@ -42,8 +46,9 @@ func Build(r Request) string {
 		}
 	}
 
-	// 3) 技能
+	// 3) 技能：明确「何时遵循」，避免技能正文被当成普通背景
 	if s := strings.TrimSpace(r.SkillsAssembly); s != "" {
+		b.WriteString("\n\n【已启用技能】以下是用户启用的技能说明；与当前任务相关时遵循其方法论，无关时忽略：")
 		b.WriteString(s)
 	}
 
@@ -68,6 +73,12 @@ func Build(r Request) string {
 	return b.String()
 }
 
+// cnDate 返回「2026年10月30日 星期五」格式的日期锚点。
+func cnDate(t time.Time) string {
+	week := []string{"日", "一", "二", "三", "四", "五", "六"}[int(t.Weekday())]
+	return fmt.Sprintf("%d年%d月%d日 星期%s", t.Year(), int(t.Month()), t.Day(), week)
+}
+
 // PlanGuideFor 返回工作模式的补充指令（作为 Instructions 传入）。
 //
 // 设计对齐主流开源 Agent 的 plan mode 共识（Cline / Roo Code / Claude Code）：
@@ -76,19 +87,19 @@ func Build(r Request) string {
 func PlanGuideFor(planMode bool) string {
 	if planMode {
 		return `【当前为计划模式（Plan Mode）】
-你现在处于「先计划、后开发」的计划模式，规则：
-1. 只允许调研：用 list_files / read_file / search_files（及只读 MCP 工具）查看代码与文档；禁止修改文件、禁止执行命令（这两类工具已对你会话禁用）。
+你处于「先计划、后开发」的计划模式，规则：
+1. 只允许调研：用 list_files / read_file / search_files（及只读 MCP 工具）查看代码与文档；写文件与执行命令这两类工具已对你会话禁用，不要尝试也不要向用户索要权限。
 2. 调研充分后，输出一份结构化实施计划，必须包含：
    - 目标：一句话说明要做什么
-   - 现状调研：发现了什么（引用具体文件/函数）
-   - 实施步骤：按 1. 2. 3. 编号，每步写清改哪个文件、做什么（只写步骤要点，不要把大段完整代码贴进计划）
+   - 现状调研：发现了什么（引用具体文件/函数/行号，写你确认过的，不写猜的）
+   - 实施步骤：按 1. 2. 3. 编号，每步写清改哪个文件、做什么（只写步骤要点，不贴大段完整代码）
    - 风险与边界：可能踩的坑、明确不做的事
-3. 计划输出后等待用户在界面上点「批准并开始开发」；不要自己尝试写文件或执行命令。
-   用户若提出修改意见，按意见更新计划后继续等待批准。
-4. 不要提前动手实现；也不要在计划里粘贴大段代码或命令让用户手动执行。`
+3. 计划输出后停在那里，等用户点「批准并开始开发」；用户提修改意见就更新计划，继续等批准。催你动手也不行——模式锁着，这是机制不是态度。
+4. 计划里不要塞大段代码或让用户手动执行的命令；那是开发模式的事。`
 	}
 	return `【当前为开发模式（Build Mode）】
-你处于正常开发模式，拥有完整工具（读写文件、执行白名单命令）。
-- 若本会话已有用户确认过的计划，按计划分步实施，每完成一步简要汇报。
-- 动手前仍应先读相关文件核实现状，不要凭空猜。`
+你拥有完整工具（读写文件、执行白名单命令）。
+- 若本会话已有用户确认过的计划，按计划分步实施：每完成一步用一句话汇报改了什么，再进入下一步；发现计划与现实不符时，先停下来说明偏差，不要擅自改道。
+- 动手前先读相关文件核实现状；「我记得这里是这样的」不算核实。
+- 每个文件写完做一次语法/构建层面的自检（能 build 就 build），把「写完」和「能跑」区分开。`
 }

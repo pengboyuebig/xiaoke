@@ -470,3 +470,76 @@ func TestConcurrentAppends(t *testing.T) {
 		t.Fatalf("并发追加后 meta 异常: %+v %v", metas, err)
 	}
 }
+
+// 上下文摘要：SetSummary 持久化后，重新加载与会话列表都能看到；
+// 再追加消息不影响摘要边界。
+func TestSummaryPersistence(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := s.Create("摘要会话", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now()
+	for i := 0; i < 4; i++ {
+		if err := s.Append(sess.ID, Message{Role: "user", Content: fmt.Sprintf("q%d", i), CreatedAt: base.Add(time.Duration(i) * time.Minute)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	upTo := base.Add(2 * time.Minute)
+	if err := s.SetSummary(sess.ID, "前两轮：用户问了 q0、q1 并得到回答。", upTo); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Summary == "" || !got.SummaryUpTo.Equal(upTo) {
+		t.Fatalf("摘要未还原: summary=%q upTo=%v", got.Summary, got.SummaryUpTo)
+	}
+	if len(got.Messages) != 4 {
+		t.Fatalf("消息不应丢失，got %d", len(got.Messages))
+	}
+	// 摘要之后再追加消息，边界不被破坏
+	if err := s.Append(sess.ID, Message{Role: "user", Content: "q4", CreatedAt: base.Add(5 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	got2, _ := s.Get(sess.ID)
+	if got2.Summary == "" || len(got2.Messages) != 5 {
+		t.Fatalf("追加后摘要应保留: summary=%q msgs=%d", got2.Summary, len(got2.Messages))
+	}
+}
+
+// 自动命名：SetTitle 写 meta，Get 能读到；已有标题不覆盖；空标题被忽略。
+func TestSetTitle(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, _ := s.Create("", "")
+	if err := s.SetTitle(sess.ID, "帮我写一个贪吃蛇游戏"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.Get(sess.ID)
+	if got.Title != "帮我写一个贪吃蛇游戏" {
+		t.Fatalf("标题应写入: %q", got.Title)
+	}
+	// 已有标题不覆盖
+	if err := s.SetTitle(sess.ID, "第二个名字"); err != nil {
+		t.Fatal(err)
+	}
+	got2, _ := s.Get(sess.ID)
+	if got2.Title != "帮我写一个贪吃蛇游戏" {
+		t.Fatalf("已有标题不应被覆盖: %q", got2.Title)
+	}
+	// 超长截断 32 rune
+	sess2, _ := s.Create("", "")
+	long := strings.Repeat("长", 50)
+	_ = s.SetTitle(sess2.ID, long)
+	got3, _ := s.Get(sess2.ID)
+	if len([]rune(got3.Title)) != 32 {
+		t.Fatalf("标题应截断到 32 字符，got %d", len([]rune(got3.Title)))
+	}
+}

@@ -1,8 +1,10 @@
 package chat
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"xiaoke/internal/store"
 )
@@ -112,5 +114,64 @@ func TestSanitizeKeepsCompleteToolRound(t *testing.T) {
 	got := sanitizeHistory(msgs)
 	if len(got) != 4 || got[1].ToolCalls[0].ID != "c1" || got[2].Role != "tool" {
 		t.Fatalf("完整的工具轮不应被修改，实际: %+v", got)
+	}
+}
+
+// messageSize 计入工具调用的 id/name/JSON 包装开销：几条带大参数的调用
+// 也会吃掉字节预算，只算正文会低估。
+func TestMessageSizeAccountsToolOverhead(t *testing.T) {
+	bare := store.Message{Role: "assistant", Content: "x"}
+	withCalls := store.Message{
+		Role:    "assistant",
+		Content: "x",
+		ToolCalls: []store.ToolCallRecord{{
+			ID: "call_0123456789abcdef", Name: "write_file",
+			Arguments: strings.Repeat("a", 100),
+		}},
+	}
+	if messageSize(withCalls) <= messageSize(bare)+100 {
+		t.Fatalf("工具调用开销应被计入: bare=%d withCalls=%d", messageSize(bare), messageSize(withCalls))
+	}
+	toolResult := store.Message{Role: "tool", Content: "x", ToolCallID: "call_0123456789abcdef", Name: "write_file"}
+	if messageSize(toolResult) <= messageSize(bare) {
+		t.Fatal("tool 结果的 id/name 开销应被计入")
+	}
+}
+
+// 字节预算裁剪后窗口必须以 user 开头（工具循环超长的兜底路径）。
+func TestTrimHistoryToolOnlyFallback(t *testing.T) {
+	msgs := []store.Message{}
+	for i := 0; i < 3; i++ {
+		msgs = append(msgs, store.Message{Role: "assistant", Content: "调用工具", CreatedAt: time.Now(),
+			ToolCalls: []store.ToolCallRecord{{ID: fmt.Sprintf("c%d", i), Name: "read_file", Arguments: "{}"}}})
+		msgs = append(msgs, store.Message{Role: "tool", Content: strings.Repeat("x", 3000), ToolCallID: fmt.Sprintf("c%d", i), CreatedAt: time.Now()})
+	}
+	got := trimHistory(msgs, 0, 1024)
+	if len(got) == 0 {
+		t.Fatal("不应裁空")
+	}
+	if got[0].Role == "tool" {
+		t.Fatal("窗口不应以孤立 tool 结果开头")
+	}
+}
+
+// 自动命名标题：首行、去 Markdown 前缀、截 32 字符、全空行返回空。
+func TestDeriveTitle(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"帮我写一个贪吃蛇游戏", "帮我写一个贪吃蛇游戏"},
+		{"\n  第二行才是内容", "第二行才是内容"},
+		{"# 标题行内容", "标题行内容"},
+		{"- 列表项开头", "列表项开头"},
+		{"   ", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := deriveTitle(c.in); got != c.want {
+			t.Errorf("deriveTitle(%q)=%q want %q", c.in, got, c.want)
+		}
+	}
+	long := strings.Repeat("字", 40)
+	if got := deriveTitle(long); len([]rune(got)) != 32 {
+		t.Fatalf("应截断到 32，got %d", len([]rune(got)))
 	}
 }

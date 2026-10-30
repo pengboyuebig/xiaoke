@@ -23,6 +23,14 @@ type Settings struct {
 	ProjectsRoot     string      `json:"projectsRoot"`     // 项目根目录
 	MaxToolSteps     int         `json:"maxToolSteps"`     // agent 工具循环最大轮数
 	CommandAllowlist []string    `json:"commandAllowlist"` // 允许执行的命令白名单
+
+	// AutoCompact 上下文主动压缩：历史超过预算时，把旧回合总结成摘要（用当前模型），
+	// 替代「直接裁掉」，保留更早的语境。被动裁剪仍作为兜底。
+	AutoCompact bool `json:"autoCompact"`
+	// CompactKeepCount 压缩时保留最近多少条消息不参与摘要（<=0 时用 MaxHistory）。
+	CompactKeepCount int `json:"compactKeepCount"`
+	// CommandTimeoutSec run_command 超时（秒；<=0 = 默认 30，上限 600）。
+	CommandTimeoutSec int `json:"commandTimeoutSec"`
 }
 
 type LLMSettings struct {
@@ -32,6 +40,8 @@ type LLMSettings struct {
 	Model       string  `json:"model"`
 	Temperature float64 `json:"temperature"`
 	MaxHistory  int     `json:"maxHistory"`
+	// MaxTokens 单次回复的最大 token（<=0 = 不注入，由上游默认）。
+	MaxTokens int `json:"maxTokens,omitempty"`
 }
 
 // MCPServer 描述一个 stdio MCP server（与 opensquilla 的 [[mcp.servers]] 同形态）。
@@ -42,6 +52,8 @@ type MCPServer struct {
 	Env      map[string]string `json:"env,omitempty"`
 	Enabled  bool              `json:"enabled"`
 	ReadOnly bool              `json:"readOnly,omitempty"` // 为 true 时不把写/删/移动类工具暴露给模型
+	// TimeoutSec 单次工具调用超时（秒；<=0 用默认 60）。重活类 server（构建/爬取）可调大。
+	TimeoutSec int `json:"timeoutSec,omitempty"`
 }
 
 // Store 是并发安全的设置仓库。
@@ -90,6 +102,8 @@ func (s *Store) defaults() Settings {
 		ProjectsRoot:     "", // 留空 = 用 <小柯目录>/projects
 		MaxToolSteps:     8,
 		CommandAllowlist: []string{"git", "npm", "npx", "node", "python", "pip"},
+		AutoCompact:      true, // 上下文超预算时主动总结，而不是硬裁
+		CompactKeepCount: 0,    // 0 = 跟随 MaxHistory
 	}
 }
 
@@ -104,8 +118,38 @@ func (s *Store) normalize() {
 	if s.data.LLM.MaxHistory <= 0 {
 		s.data.LLM.MaxHistory = 20
 	}
+	if s.data.LLM.MaxHistory > 200 {
+		s.data.LLM.MaxHistory = 200
+	}
 	if s.data.LLM.Temperature <= 0 {
 		s.data.LLM.Temperature = 0.7
+	}
+	if s.data.LLM.Temperature > 2 {
+		s.data.LLM.Temperature = 2
+	}
+	if s.data.LLM.MaxTokens < 0 {
+		s.data.LLM.MaxTokens = 0
+	}
+	if s.data.CompactKeepCount < 0 {
+		s.data.CompactKeepCount = 0
+	}
+	if s.data.CompactKeepCount > s.data.LLM.MaxHistory {
+		// 保留区不可能比裁剪窗口还大，否则压缩永远不触发
+		s.data.CompactKeepCount = s.data.LLM.MaxHistory
+	}
+	for i := range s.data.MCPServers {
+		if s.data.MCPServers[i].TimeoutSec < 0 {
+			s.data.MCPServers[i].TimeoutSec = 0
+		}
+		if s.data.MCPServers[i].TimeoutSec > 600 {
+			s.data.MCPServers[i].TimeoutSec = 600
+		}
+	}
+	if s.data.CommandTimeoutSec < 0 {
+		s.data.CommandTimeoutSec = 0
+	}
+	if s.data.CommandTimeoutSec > 600 {
+		s.data.CommandTimeoutSec = 600
 	}
 	if s.data.MCPServers == nil {
 		s.data.MCPServers = []MCPServer{}

@@ -44,8 +44,8 @@ export interface ChatOptions {
   approve?: boolean
   signal?: AbortSignal
   onDelta: (text: string) => void
-  onToolStart?: (name: string, args: string) => void
-  onToolResult?: (info: { name: string; ok: boolean; preview: string; error?: string; ms: number }) => void
+  onToolStart?: (name: string, args: string, id: string) => void
+  onToolResult?: (info: { id: string; name: string; ok: boolean; preview: string; error?: string; ms: number }) => void
 }
 
 export const api = {
@@ -213,10 +213,15 @@ export const api = {
                     opts.onDelta(evt.text as string)
                     break
                   case 'tool':
-                    opts.onToolStart?.(evt.name as string, (evt.args as string) || '')
+                    opts.onToolStart?.(
+                      evt.name as string,
+                      (evt.args as string) || '',
+                      (evt.id as string) || '',
+                    )
                     break
                   case 'tool_result':
                     opts.onToolResult?.({
+                      id: (evt.id as string) || '',
                       name: evt.name as string,
                       ok: evt.ok as boolean,
                       preview: (evt.preview as string) || '',

@@ -354,21 +354,32 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
       onDelta: (t) => {
         streamingText.value += t
       },
-      onToolStart: (name, args) => {
-        liveTools.value.push({ name, args, done: false })
+      onToolStart: (name, args, id) => {
+        liveTools.value.push({ id, name, args, done: false })
       },
       onToolResult: (info) => {
-        // 找到最近一个同名未完成的活动行
-        for (let i = liveTools.value.length - 1; i >= 0; i--) {
-          const t = liveTools.value[i]
-          if (t.name === info.name && !t.done) {
-            t.done = true
-            t.ok = info.ok
-            t.preview = info.preview
-            t.error = info.error
-            t.ms = info.ms
-            return
+        // 并行执行时按调用 id 配对；无 id（旧后端）退回「最近一个同名未完成」
+        const list = liveTools.value
+        let idx = -1
+        if (info.id) {
+          idx = list.findIndex((t) => t.id === info.id && !t.done)
+        }
+        if (idx < 0) {
+          for (let i = list.length - 1; i >= 0; i--) {
+            const t = list[i]
+            if (t.name === info.name && !t.done) {
+              idx = i
+              break
+            }
           }
+        }
+        if (idx >= 0) {
+          const t = list[idx]
+          t.done = true
+          t.ok = info.ok
+          t.preview = info.preview
+          t.error = info.error
+          t.ms = info.ms
         }
       },
     })
@@ -576,6 +587,7 @@ function onSettingsClosed() {
         :busy="streaming"
         :reasoning="reasoning"
         :mode="workMode"
+        :session-id="currentId"
         @send="handleSend"
         @stop="handleStop"
         @update:reasoning="setReasoning"

@@ -45,6 +45,9 @@ const form = reactive({
   projectsRoot: '',
   maxToolSteps: 8,
   allowlistText: 'git, npm, node, python, pip',
+  maxTokens: 0,
+  autoCompact: true,
+  commandTimeoutSec: 0,
   mcpServers: [] as (MCPServerCfg & { argLines: string })[],
 })
 const newMcp = reactive({ name: '', command: '', argsText: '', dir: '' })
@@ -75,6 +78,9 @@ async function loadSettings() {
     form.projectsRoot = s.projectsRoot
     form.maxToolSteps = s.maxToolSteps
     form.allowlistText = s.commandAllowlist.join(', ')
+    form.maxTokens = s.llm.maxTokens || 0
+    form.autoCompact = s.autoCompact !== false
+    form.commandTimeoutSec = s.commandTimeoutSec || 0
     form.mcpServers = s.mcpServers.map((m) => ({
       ...m,
       args: [...m.args],
@@ -286,6 +292,7 @@ async function save() {
           model: form.model.trim(),
           temperature: Number(form.temperature) || 0.7,
           maxHistory: Number(form.maxHistory) || 20,
+          maxTokens: Math.max(0, Number(form.maxTokens) || 0),
         },
         mcpServers: form.mcpServers.map((m) => ({
           name: m.name.trim(),
@@ -299,6 +306,9 @@ async function save() {
         projectsRoot: form.projectsRoot.trim(),
         maxToolSteps: Number(form.maxToolSteps) || 8,
         commandAllowlist: form.allowlistText.split(/[,,\n]/).map((s) => s.trim()).filter(Boolean),
+        autoCompact: form.autoCompact !== false,
+        compactKeepCount: 0,
+        commandTimeoutSec: Math.max(0, Number(form.commandTimeoutSec) || 0),
       },
       form.clearApiKey,
     )
@@ -510,7 +520,7 @@ async function save() {
         <section v-else class="panel">
           <div class="panel-head">
             <h2>高级</h2>
-            <p>工具循环与命令执行的边界控制。</p>
+            <p>工具循环、上下文与命令执行的边界控制。</p>
           </div>
           <div class="grid">
             <div class="card">
@@ -522,6 +532,28 @@ async function save() {
               <div class="card-title">命令白名单（逗号分隔）</div>
               <input v-model="form.allowlistText" class="inp" placeholder="git, npm, node, python, pip" />
               <div class="hint">run_command 只允许执行这里的命令，argv 直传不经 shell。</div>
+            </div>
+            <div class="card">
+              <div class="card-title">单次回复长度上限（token，可选）</div>
+              <input v-model="form.maxTokens" class="inp" type="number" min="0" placeholder="留空或 0 = 上游默认" />
+              <div class="hint">注入请求体 max_tokens。设太小会把回答拦腰截断，不确定就留空。</div>
+            </div>
+            <div class="card">
+              <div class="card-title">命令超时（秒，0 = 默认 30）</div>
+              <input v-model="form.commandTimeoutSec" class="inp" type="number" min="0" max="600" />
+              <div class="hint">npm install / 构建类命令可能超 30 秒，超时就调大（上限 600）。</div>
+            </div>
+            <div class="card">
+              <div class="card-title">
+                <label class="check-row">
+                  <input v-model="form.autoCompact" type="checkbox" />
+                  上下文自动压缩
+                </label>
+              </div>
+              <div class="hint">
+                历史超过预算时，自动把较早的回合总结成摘要（用当前模型，约几秒），
+                保留更早的语境；关闭后超长历史会被直接裁掉（更快，但丢语境）。
+              </div>
             </div>
           </div>
 
@@ -1136,6 +1168,23 @@ textarea.inp {
   flex-wrap: wrap;
   gap: 12px;
   margin-top: 12px;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.check-row input[type='checkbox'] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 /* ---------- 回收站 ---------- */
