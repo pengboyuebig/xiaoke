@@ -10,9 +10,16 @@ import type {
   SettingsPayload,
   SettingsView,
   Skill,
+  Todo,
   TrashItem,
   TreeItem,
 } from '../types'
+
+/** 一次对话的 token 用量（上游真实 usage 优先，缺失时后端按字节估算） */
+export interface UsageInfo {
+  prompt: number
+  completion: number
+}
 
 async function jfetch<T>(input: string, init?: RequestInit): Promise<T> {
   const res = await fetch(input, init)
@@ -48,6 +55,10 @@ export interface ChatOptions {
   onCompact?: (covered: number) => void
   onToolStart?: (name: string, args: string, id: string) => void
   onToolResult?: (info: { id: string; name: string; ok: boolean; preview: string; error?: string; ms: number }) => void
+  /** 待办清单更新（todo_write 工具执行成功后推送） */
+  onTodo?: (todos: Todo[]) => void
+  /** 对话结束：携带本次累计的 token 用量 */
+  onDone?: (usage?: UsageInfo) => void
 }
 
 export const api = {
@@ -163,6 +174,14 @@ export const api = {
     return jfetch('/api/mcp/retry', { method: 'POST' })
   },
 
+  // ---------- 长期记忆（全局层；项目记忆由模型经工具维护） ----------
+  getMemory(): Promise<{ content: string }> {
+    return jfetch('/api/memory')
+  },
+  saveMemory(content: string): Promise<{ ok: string }> {
+    return jfetch('/api/memory', jsonBody('PUT', { content }))
+  },
+
   /**
    * 发起一次流式对话（含工具调用循环）。onDelta 逐段接收文本增量；
    * onToolStart / onToolResult 上报工具活动。通过 signal 可中断。
@@ -237,11 +256,17 @@ export const api = {
                       ms: (evt.ms as number) || 0,
                     })
                     break
+                  case 'todo':
+                    opts.onTodo?.((evt.todos as Todo[]) || [])
+                    break
                   case 'error':
                     throw new Error((evt.error as string) || '未知错误')
-                  case 'done':
+                  case 'done': {
+                    const u = evt.usage as { prompt?: number; completion?: number } | undefined
+                    opts.onDone?.(u ? { prompt: u.prompt || 0, completion: u.completion || 0 } : undefined)
                     resolve({ sessionId })
                     return
+                  }
                 }
               }
             }

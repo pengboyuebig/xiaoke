@@ -86,6 +86,12 @@ export interface SessionMeta {
   messageCount: number
 }
 
+/** 会话待办（todo_write 工具维护，随会话持久化） */
+export interface Todo {
+  content: string
+  status: 'pending' | 'in_progress' | 'completed'
+}
+
 /** 回收站里的一条记录（删除会话时保留的副本） */
 export interface TrashItem {
   /** 目录名，恢复/彻底删除时用 */
@@ -105,6 +111,10 @@ export interface Session {
   createdAt: string
   updatedAt: string
   messages: Message[]
+  todos?: Todo[]
+  promptTokens?: number
+  completionTokens?: number
+  requests?: number
 }
 
 export interface ListResponse {
@@ -185,6 +195,7 @@ export interface SettingsView {
     temperature: number
     maxHistory: number
     maxTokens: number
+    contextWindow: number
   }
   mcpServers: MCPServerCfg[]
   readDirs: string[]
@@ -220,6 +231,7 @@ export interface SettingsPayload {
     temperature: number
     maxHistory: number
     maxTokens: number
+    contextWindow: number
   }
   mcpServers: MCPServerCfg[]
   readDirs: string[]

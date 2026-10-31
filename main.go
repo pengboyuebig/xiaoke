@@ -22,8 +22,10 @@ import (
 	"xiaoke/internal/chat"
 	"xiaoke/internal/config"
 	"xiaoke/internal/mcp"
+	"xiaoke/internal/memory"
 	"xiaoke/internal/persona"
 	"xiaoke/internal/projects"
+	"xiaoke/internal/rules"
 	"xiaoke/internal/settings"
 	"xiaoke/internal/skills"
 	"xiaoke/internal/store"
@@ -92,12 +94,20 @@ func main() {
 		log.Fatalf("初始化会话存储失败: %v", err)
 	}
 
+	// 长期记忆（全局 + 项目两级 MEMORY.md）与项目规则文件读取
+	memStore, err := memory.Open(filepath.Join(cfg.DataDir, "memory"))
+	if err != nil {
+		log.Fatalf("初始化长期记忆失败: %v", err)
+	}
+	rulesStore := rules.New()
+
 	// 自动备份：启动时立即备份一份，之后每 24 小时一次，只保留最近 14 份。
 	// 备份失败只记日志，不影响服务启动。
 	go autoBackup(st, filepath.Join(cfg.DataDir, "backups"))
 
 	mux := http.NewServeMux()
-	chat.NewHandler(cfg, st, setStore, projectsMgr, mcpMgr, agentsStore, skillsStore).Register(mux)
+	chatHandler := chat.NewHandler(cfg, st, setStore, projectsMgr, mcpMgr, agentsStore, skillsStore, memStore, rulesStore)
+	chatHandler.Register(mux)
 	res := &api.Resources{
 		Agents: agentsStore, Skills: skillsStore,
 		AvatarsDir: "avatars", AssetsDir: cfg.AssetsDir,
@@ -105,6 +115,7 @@ func main() {
 	apiHandler := api.New(cfg, setStore, projectsMgr, mcpMgr, res)
 	apiHandler.Register(mux)
 	apiHandler.RegisterResources(mux)
+	chatHandler.RegisterMemoryAPI(mux)
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		eff := setStore.Effective()

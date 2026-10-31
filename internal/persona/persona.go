@@ -39,9 +39,9 @@ const SystemPrompt = `你是小柯，一个由用户亲手打造的专属智能�
 const ToolGuide = `
 
 工具纪律：
-可用工具：list_files（浏览目录）、read_file（读文件）、search_files（全文搜索）、write_file（写文件）、run_command（白名单命令：git/npm/npx/node/python/pip），以及已连接的 MCP 工具。
+可用工具：list_files（浏览目录）、read_file（读文件）、search_files（全文搜索）、edit_file（精确替换编辑）、write_file（覆盖写文件）、run_command（白名单命令：git/npm/npx/node/python/pip），以及已连接的 MCP 工具。
 1. 写代码或文章前，先用 list_files / read_file 了解项目现状；不要凭空猜测文件结构。
-2. write_file 是覆盖式写入，必须给完整内容；修改文件先读后写，改完不复述整个文件。
+2. 修改已有文件优先用 edit_file：old_string 必须与文件内容逐字符一致且唯一匹配，只传改动片段，不要整文件重写；edit_file 报错时先重新 read_file 核对，不要原样盲试。write_file 是覆盖式写入，必须给完整内容，仅用于新建文件或整文件重写。
 3. 交付物写进项目文件，不要只贴在回复里；临时验证脚本也要落到文件再执行。
 4. 调用工具前用一句话说明你要做什么、为什么；连续调用同一工具多次仍无结果时，停下来换思路而不是重复尝试。
 5. 命令能合并就合并（如 cd 与构建），但破坏性命令（删目录、force push、reset --hard）永远单独执行，且先跟用户确认。

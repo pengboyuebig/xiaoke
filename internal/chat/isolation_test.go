@@ -40,9 +40,9 @@ func TestCrossSessionIsolation(t *testing.T) {
 	var compactCalls int
 	summarizeA := func(ctx context.Context, cfg config.LLMConfig, msgs []ChatMessage, defs []tools.ToolDef, hooks Hooks, reasoning string) (string, []ToolCall, error) {
 		compactCalls++
-		return "会话 A 的摘要：用户聊过夜枭计划。", nil, nil
+		return "A 的会话摘要：用户聊过绝密代号夜枭计划，口令是蓝鲸。\n已完成：确认了口令传递方式与保密约定。\n未完成：等待下一步指示。\n偏好：保持安静，不在群里讨论。\n其他：本轮没有别的决定。", nil, nil
 	}
-	viewA := maybeCompact(context.Background(), st, fullA, 4, 6*1024, summarizeA, base)
+	viewA := maybeCompact(context.Background(), st, fullA, 4, 6*1024, summarizeA, base, 0)
 	if compactCalls == 0 || viewA.Summary == "" {
 		t.Fatalf("前置条件：A 应成功生成摘要（calls=%d summary=%q）", compactCalls, viewA.Summary)
 	}
@@ -58,7 +58,7 @@ func TestCrossSessionIsolation(t *testing.T) {
 		sentToUpstream = msgs
 		return "**小柯** 不知道。", nil, nil
 	}
-	viewB := maybeCompact(context.Background(), st, fullB, 4, 6*1024, summarizeA, base)
+	viewB := maybeCompact(context.Background(), st, fullB, 4, 6*1024, summarizeA, base, 0)
 	convo := []ChatMessage{{Role: "system", Content: "系统提示词"}}
 	if strings.TrimSpace(viewB.Summary) != "" {
 		convo = append(convo, ChatMessage{Role: "system", Content: viewB.Summary})
@@ -93,7 +93,7 @@ func TestSummaryStaysInOwnSession(t *testing.T) {
 		_ = st.Append(a.ID, store.Message{Role: "assistant", Content: strings.Repeat("回", 300), CreatedAt: timeNow()})
 	}
 	fullA, _ := st.Get(a.ID)
-	view := maybeCompact(context.Background(), st, fullA, 4, 6*1024, testSummarizer(new(int), "A 的摘要"), config.LLMConfig{})
+	view := maybeCompact(context.Background(), st, fullA, 4, 6*1024, testSummarizer(new(int), goodSummary), config.LLMConfig{}, 0)
 	if view.Summary == "" {
 		t.Skip("压缩未触发（材料不足），跳过")
 	}
@@ -117,12 +117,12 @@ func TestCompactCooldownPerSession(t *testing.T) {
 	a := mk("A")
 	b := mk("B")
 	fullA, _ := st.Get(a.ID)
-	if v := maybeCompact(context.Background(), st, fullA, 4, 6*1024, testSummarizer(new(int), "a"), config.LLMConfig{}); v.Summary == "" {
+	if v := maybeCompact(context.Background(), st, fullA, 4, 6*1024, testSummarizer(new(int), goodSummary), config.LLMConfig{}, 0); v.Summary == "" {
 		t.Skip("A 未触发压缩")
 	}
 	fullB, _ := st.Get(b.ID)
 	calls := 0
-	vb := maybeCompact(context.Background(), st, fullB, 4, 6*1024, testSummarizer(&calls, "b"), config.LLMConfig{})
+	vb := maybeCompact(context.Background(), st, fullB, 4, 6*1024, testSummarizer(&calls, goodSummary), config.LLMConfig{}, 0)
 	if vb.Summary == "" || calls != 1 {
 		t.Fatalf("B 的首次压缩不应被 A 的冷却挡住: calls=%d summary=%q", calls, vb.Summary)
 	}

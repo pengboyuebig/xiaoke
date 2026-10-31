@@ -56,9 +56,25 @@ var toolReadFile = Tool{
 	Execute: execReadFile,
 }
 
+var toolEditFile = Tool{
+	Name:        "edit_file",
+	Description: "对工作区内已有文件做精确替换编辑：用 old_string 定位（必须唯一匹配）并替换为 new_string。修改文件优先用它，只传改动片段，不要用 write_file 重写整个文件。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "path": {"type": "string", "description": "文件相对路径（相对项目根）"},
+    "old_string": {"type": "string", "description": "要被替换的原文片段，必须与文件内容逐字符一致（含缩进）"},
+    "new_string": {"type": "string", "description": "替换后的新片段；删除内容时传空串"},
+    "replace_all": {"type": "boolean", "description": "true 时替换全部匹配，默认 false（仅允许唯一匹配）"}
+  },
+  "required": ["path", "old_string", "new_string"]
+}`),
+	Execute: execEditFile,
+}
+
 var toolWriteFile = Tool{
 	Name:        "write_file",
-	Description: "把文本写入工作区内的文件（自动创建父目录，UTF-8，覆盖式写入，上限 256KB）。只能写当前项目工作区内的路径。",
+	Description: "把文本写入工作区内的文件（自动创建父目录，UTF-8，覆盖式写入，上限 256KB）。新建文件用它；修改已有文件优先用 edit_file。",
 	Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -82,6 +98,56 @@ var toolSearchFiles = Tool{
   "required": ["query"]
 }`),
 	Execute: execSearchFiles,
+}
+
+var toolMemoryAppend = Tool{
+	Name:        "memory_append",
+	Description: "把值得跨会话长期记住的信息写入记忆（用户偏好、项目结构、重要决定、被纠正过的错误）。一行一个结论，不要复述对话原文；已有内容不要重复追加。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "content": {"type": "string", "description": "要记住的内容（一句话结论）"},
+    "scope": {"type": "string", "enum": ["global", "project"], "description": "global=跟随用户（跨项目），project=只属于当前项目（默认）"}
+  },
+  "required": ["content"]
+}`),
+	Execute: execMemoryAppend,
+}
+
+var toolMemoryRead = Tool{
+	Name:        "memory_read",
+	Description: "读取长期记忆的完整内容（系统提示词里只有截断版）。scope 同 memory_append。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "scope": {"type": "string", "enum": ["global", "project"], "description": "默认 project"}
+  }
+}`),
+	Execute: execMemoryRead,
+}
+
+var toolTodoWrite = Tool{
+	Name:        "todo_write",
+	Description: "维护当前任务的待办清单（整表替换）。3 步以上的任务先建待办再动手；每完成一项立即更新状态；同一时刻最多一项 in_progress。待办会展示给用户并跨压缩保留。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "todos": {
+      "type": "array",
+      "description": "完整待办列表（每次全量覆盖）",
+      "items": {
+        "type": "object",
+        "properties": {
+          "content": {"type": "string", "description": "待办内容（祈使句，如「修复登录超时」）"},
+          "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "状态"}
+        },
+        "required": ["content", "status"]
+      }
+    }
+  },
+  "required": ["todos"]
+}`),
+	Execute: execTodoWrite,
 }
 
 var toolRunCommand = Tool{
@@ -252,20 +318,134 @@ func execWriteFile(ctx context.Context, env *Env, args json.RawMessage) (string,
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-		return "", err
-	}
-	// 原子写：先写同目录临时文件再 rename。直接 WriteFile 时进程被杀/断电
-	// 会留下半截文件——源码文件半截比写入失败糟糕得多。
-	tmp := abs + ".xk-tmp"
-	if err := os.WriteFile(tmp, []byte(in.Content), 0o644); err != nil {
-		return "", err
-	}
-	if err := os.Rename(tmp, abs); err != nil {
-		_ = os.Remove(tmp)
+	if err := writeAtomic(abs, in.Content); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("已写入 %s（%d 字节）", filepath.ToSlash(in.Path), len(in.Content)), nil
+}
+
+// writeAtomic 原子写：先写同目录临时文件再 rename。直接 WriteFile 时进程被杀/断电
+// 会留下半截文件——源码文件半截比写入失败糟糕得多。write_file 与 edit_file 共用。
+func writeAtomic(abs, content string) error {
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return err
+	}
+	tmp := abs + ".xk-tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, abs); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// execEditFile 精确替换编辑：old_string 必须与文件内容唯一匹配（或 replace_all）。
+//
+// 对标主流 agent 的 search_replace：整文件覆盖会让模型重输出整个文件——长文件既浪费
+// token 又容易在重写中丢失无关内容；精确替换只传改动片段，且唯一性校验把「改错位置」
+// 从静默损坏变成显式错误。
+//
+// 匹配策略：CRLF→LF 归一化后做精确匹配（不做模糊匹配——模糊容错会把「相似但不同」
+// 的两处代码混为一处）；写回时按原文件行尾风格还原。
+func execEditFile(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		Path       string `json:"path"`
+		OldString  string `json:"old_string"`
+		NewString  string `json:"new_string"`
+		ReplaceAll bool   `json:"replace_all"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+	if in.Path == "" {
+		return "", fmt.Errorf("需要 path 参数")
+	}
+	if in.OldString == "" {
+		return "", fmt.Errorf("old_string 不能为空（新建文件请用 write_file）")
+	}
+	if in.OldString == in.NewString {
+		return "", fmt.Errorf("old_string 与 new_string 相同，没有需要替换的内容")
+	}
+	if len(in.NewString) > maxWriteBytes {
+		return "", fmt.Errorf("new_string 超过 %dKB 上限", maxWriteBytes/1024)
+	}
+	// 编辑走写路径校验：只读授权目录里的文件不可修改
+	abs, err := env.resolveWrite(in.Path)
+	if err != nil {
+		return "", err
+	}
+	raw, err := os.ReadFile(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("文件不存在：%s（新建文件请用 write_file）", in.Path)
+		}
+		return "", err
+	}
+	if bytes.IndexByte(raw, 0) >= 0 {
+		return "", fmt.Errorf("%s 是二进制文件，无法按文本编辑", in.Path)
+	}
+	crlf := bytes.Contains(raw, []byte("\r\n"))
+	norm := func(s string) string { return strings.ReplaceAll(s, "\r\n", "\n") }
+	content := norm(string(raw))
+	oldS, newS := norm(in.OldString), norm(in.NewString)
+
+	count := strings.Count(content, oldS)
+	switch {
+	case count == 0:
+		return "", fmt.Errorf("old_string 在 %s 中没有找到匹配%s", in.Path, editNearestHint(content, oldS))
+	case count > 1 && !in.ReplaceAll:
+		return "", fmt.Errorf("old_string 在 %s 中匹配到 %d 处（需要唯一匹配）：包含更多上下文使其唯一，或确认要全部替换时传 replace_all=true", in.Path, count)
+	}
+	updated := content
+	if in.ReplaceAll {
+		updated = strings.ReplaceAll(content, oldS, newS)
+	} else {
+		updated = strings.Replace(content, oldS, newS, 1)
+	}
+	if crlf {
+		updated = strings.ReplaceAll(updated, "\n", "\r\n")
+	}
+	if err := writeAtomic(abs, updated); err != nil {
+		return "", err
+	}
+	replaced := count
+	if !in.ReplaceAll {
+		replaced = 1
+	}
+	return fmt.Sprintf("已修改 %s（替换 %d 处）", filepath.ToSlash(in.Path), replaced), nil
+}
+
+// editNearestHint 在 0 匹配时给出「最近似位置」提示，把「失败→重读→重试」的
+// 三轮往返压缩成一轮：先试 old_string 首行原文，再退化为首行最长 token。
+func editNearestHint(content, oldS string) string {
+	first := strings.TrimSpace(strings.SplitN(oldS, "\n", 2)[0])
+	if first == "" {
+		return "（请重新 read_file 核对内容后再试）"
+	}
+	if idx := strings.Index(content, first); idx >= 0 {
+		line := 1 + strings.Count(content[:idx], "\n")
+		return fmt.Sprintf("；它的第一行在第 %d 行附近出现过，但整段不一致（后续行可能有差异）——重新 read_file 该区域核对后再试", line)
+	}
+	// 首行整行没有：取首行最长 token 再找一次
+	token := ""
+	for _, w := range strings.FieldsFunc(first, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '(' || r == ')' || r == '{' || r == '}' || r == ',' || r == ';'
+	}) {
+		if len(w) > len(token) {
+			token = w
+		}
+	}
+	if token != "" {
+		if idx := strings.Index(content, token); idx >= 0 {
+			line := 1 + strings.Count(content[:idx], "\n")
+			trimmed := strings.TrimSpace(strings.SplitN(content[idx:], "\n", 2)[0])
+			trimmed = truncateRunes(trimmed, 120)
+			return fmt.Sprintf("；内容最接近的是第 %d 行：%s——请重新 read_file 核对后再试", line, trimmed)
+		}
+	}
+	return "（请重新 read_file 核对内容后再试）"
 }
 
 // SkipDirs 是递归遍历（列目录/搜索）统一跳过的依赖/构建目录。
@@ -448,6 +628,99 @@ func searchOneFile(path, rel, q string, limit int) []string {
 		}
 	}
 	return hits
+}
+
+// ---------- 会话级工具（依赖 Env 注入的回调；回调为 nil 时明确报错） ----------
+
+// validTodoStatus 是 todo 状态的合法取值。
+var validTodoStatus = map[string]bool{
+	"pending": true, "in_progress": true, "completed": true,
+}
+
+// execTodoWrite 整表替换待办：校验状态合法性与条目数，然后交给 Env 回调持久化。
+func execTodoWrite(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		Todos []TodoItem `json:"todos"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+	if len(in.Todos) == 0 {
+		return "", fmt.Errorf("todos 不能为空（全部完成时保留列表并标记 completed，方便用户核对）")
+	}
+	if len(in.Todos) > 50 {
+		return "", fmt.Errorf("待办过多（%d 条，上限 50）：拆成阶段性条目，一项一个可验证的结果", len(in.Todos))
+	}
+	inProgress := 0
+	for i := range in.Todos {
+		in.Todos[i].Content = strings.TrimSpace(in.Todos[i].Content)
+		if in.Todos[i].Content == "" {
+			return "", fmt.Errorf("第 %d 条待办内容为空", i+1)
+		}
+		if !validTodoStatus[in.Todos[i].Status] {
+			return "", fmt.Errorf("第 %d 条状态 %q 不合法（pending/in_progress/completed）", i+1, in.Todos[i].Status)
+		}
+		if in.Todos[i].Status == "in_progress" {
+			inProgress++
+		}
+	}
+	if inProgress > 1 {
+		return "", fmt.Errorf("同一时刻只能有一项 in_progress（当前 %d 项）", inProgress)
+	}
+	if env.SetTodos == nil {
+		return "", fmt.Errorf("待办功能当前不可用")
+	}
+	if err := env.SetTodos(in.Todos); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("已更新待办（%d 项：%d 已完成 / %d 进行中 / %d 待开始）",
+		len(in.Todos), countStatus(in.Todos, "completed"), inProgress, countStatus(in.Todos, "pending")), nil
+}
+
+func countStatus(todos []TodoItem, status string) int {
+	n := 0
+	for _, t := range todos {
+		if t.Status == status {
+			n++
+		}
+	}
+	return n
+}
+
+func execMemoryAppend(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		Content string `json:"content"`
+		Scope   string `json:"scope"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(in.Content) == "" {
+		return "", fmt.Errorf("需要 content 参数")
+	}
+	if env.MemoryAppend == nil {
+		return "", fmt.Errorf("记忆功能当前不可用")
+	}
+	scope := in.Scope
+	if scope == "" {
+		scope = "project"
+	}
+	return env.MemoryAppend(scope, in.Content)
+}
+
+func execMemoryRead(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		Scope string `json:"scope"`
+	}
+	_ = json.Unmarshal(args, &in)
+	if env.MemoryRead == nil {
+		return "", fmt.Errorf("记忆功能当前不可用")
+	}
+	scope := in.Scope
+	if scope == "" {
+		scope = "project"
+	}
+	return env.MemoryRead(scope)
 }
 
 func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string, error) {

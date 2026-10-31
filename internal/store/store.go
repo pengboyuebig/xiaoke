@@ -57,6 +57,13 @@ type ToolCallRecord struct {
 	Arguments string `json:"arguments"`
 }
 
+// Todo 是会话级待办（todo_write 工具维护），随会话持久化、切会话还原。
+type Todo struct {
+	Content   string    `json:"content"`
+	Status    string    `json:"status"` // pending | in_progress | completed
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
 type Session struct {
 	ID        string    `json:"id"`
 	Title     string    `json:"title"`
@@ -72,6 +79,15 @@ type Session struct {
 	// 摘要存在快照里（随快照合并/迁移一起走），发送上下文时用摘要替代旧消息。
 	Summary     string    `json:"summary,omitempty"`
 	SummaryUpTo time.Time `json:"summaryUpTo,omitempty"`
+
+	// Todos 当前待办清单（整表替换式更新），压缩后仍注入上下文，长任务不丢进度。
+	Todos []Todo `json:"todos,omitempty"`
+
+	// PromptTokens/CompletionTokens/Requests 是会话累计用量（优先取上游真实
+	// usage，缺失时按字节估算兜底），仅作展示，不参与压缩触发。
+	PromptTokens     int64 `json:"promptTokens,omitempty"`
+	CompletionTokens int64 `json:"completionTokens,omitempty"`
+	Requests         int64 `json:"requests,omitempty"`
 }
 
 // Meta 是会话列表里展示的摘要（不含消息体）。
@@ -972,6 +988,47 @@ func (s *Store) SetSummary(id string, summary string, upTo time.Time) error {
 	}
 	// 消息体已随快照落盘（导出/回收站仍能看到完整历史），日志收敛掉避免双份；
 	// 读取侧按 SummaryUpTo 过滤摘要覆盖范围。
+	_ = os.Remove(s.logPath(id))
+	return s.saveMeta(metaOf(sess))
+}
+
+// SetTodos 整表替换会话待办（todo_write 工具的持久化入口）。
+func (s *Store) SetTodos(id string, todos []Todo) error {
+	if !validID.MatchString(id) {
+		return ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, err := s.loadFullLocked(id)
+	if err != nil {
+		return err
+	}
+	sess.Todos = todos
+	sess.UpdatedAt = time.Now()
+	if err := s.saveSnapshot(sess); err != nil {
+		return err
+	}
+	_ = os.Remove(s.logPath(id))
+	return s.saveMeta(metaOf(sess))
+}
+
+// AddUsage 累计会话用量（每次对话请求结束时调用一次）。
+func (s *Store) AddUsage(id string, prompt, completion int64) error {
+	if !validID.MatchString(id) {
+		return ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, err := s.loadFullLocked(id)
+	if err != nil {
+		return err
+	}
+	sess.PromptTokens += prompt
+	sess.CompletionTokens += completion
+	sess.Requests++
+	if err := s.saveSnapshot(sess); err != nil {
+		return err
+	}
 	_ = os.Remove(s.logPath(id))
 	return s.saveMeta(metaOf(sess))
 }

@@ -71,6 +71,9 @@ func TestSplitBySummary(t *testing.T) {
 	}
 }
 
+// goodSummary 是能通过退化检测的摘要样本（≥80 rune，信息密度足够低开销）。
+const goodSummary = "目标：完成数据导出功能。\n已完成：调研了 store 层；确认导出走 JSON；写好了字段映射表。\n重要决定：导出文件放在 data/exports 下，命名带时间戳。\n未完成：写导出实现与测试；补 README 使用说明。\n偏好：先测试后提交，不要自动 push。"
+
 // 触发压缩：用假 summarizer 验证摘要生成、持久化与视图更新。
 func TestMaybeCompactTriggers(t *testing.T) {
 	st, err := store.New(t.TempDir())
@@ -98,7 +101,7 @@ func TestMaybeCompactTriggers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	view := maybeCompact(context.Background(), st, full, 4, 6*1024, testSummarizer(&realCalls, "用户做了 6 个任务，全部完成"), config.LLMConfig{Mode: "openai"})
+	view := maybeCompact(context.Background(), st, full, 4, 6*1024, testSummarizer(&realCalls, goodSummary), config.LLMConfig{Mode: "openai"}, 0)
 	if realCalls != 1 {
 		t.Fatalf("摘要应被调用 1 次，got %d", realCalls)
 	}
@@ -134,13 +137,13 @@ func TestMaybeCompactCooldownAndFailure(t *testing.T) {
 	full, _ := st.Get(sess.ID)
 
 	calls := 0
-	view := maybeCompact(context.Background(), st, full, 4, 6*1024, testSummarizer(&calls, "摘要"), config.LLMConfig{})
+	view := maybeCompact(context.Background(), st, full, 4, 6*1024, testSummarizer(&calls, goodSummary), config.LLMConfig{}, 0)
 	if calls != 1 || view.Summary == "" {
 		t.Fatalf("首次应触发压缩: calls=%d summary=%q", calls, view.Summary)
 	}
 	// 同一会话立刻再来一次：冷却期内不调模型，视图沿用已持久化的摘要
 	full2, _ := st.Get(sess.ID)
-	view2 := maybeCompact(context.Background(), st, full2, 4, 6*1024, testSummarizer(&calls, "摘要"), config.LLMConfig{})
+	view2 := maybeCompact(context.Background(), st, full2, 4, 6*1024, testSummarizer(&calls, goodSummary), config.LLMConfig{}, 0)
 	if calls != 1 {
 		t.Fatalf("冷却期内不应再次调用摘要，calls=%d", calls)
 	}
@@ -148,7 +151,7 @@ func TestMaybeCompactCooldownAndFailure(t *testing.T) {
 		t.Fatal("冷却期内应沿用已持久化摘要")
 	}
 
-	// 失败场景：新会话 + 摘要报错 → 返回无摘要视图，且不落库
+	// 失败场景：新会话 + 摘要持续报错 → 重试后仍失败，返回无摘要视图，且不落库
 	compactLastTry = map[string]time.Time{} // 重置冷却
 	sess2, _ := st.Create("失败测试", "")
 	for i := 0; i < 6; i++ {
@@ -158,9 +161,9 @@ func TestMaybeCompactCooldownAndFailure(t *testing.T) {
 	}
 	full3, _ := st.Get(sess2.ID)
 	failCalls := 0
-	view3 := maybeCompact(context.Background(), st, full3, 4, 6*1024, testFailingSummarizer(&failCalls), config.LLMConfig{})
-	if failCalls != 1 {
-		t.Fatalf("失败重试应被调用一次: %d", failCalls)
+	view3 := maybeCompact(context.Background(), st, full3, 4, 6*1024, testFailingSummarizer(&failCalls), config.LLMConfig{}, 0)
+	if failCalls != compactMaxAttempts {
+		t.Fatalf("失败应重试到上限: %d", failCalls)
 	}
 	if view3.Summary != "" || len(view3.Recent) != len(full3.Messages) {
 		t.Fatalf("失败应退回被动视图: summary=%q recent=%d", view3.Summary, len(view3.Recent))
@@ -181,7 +184,7 @@ func TestMaybeCompactSkipsSmallHistory(t *testing.T) {
 	}
 	full, _ := st.Get(sess.ID)
 	calls := 0
-	view := maybeCompact(context.Background(), st, full, 20, 256*1024, testSummarizer(&calls, "不该被调用"), config.LLMConfig{})
+	view := maybeCompact(context.Background(), st, full, 20, 256*1024, testSummarizer(&calls, goodSummary), config.LLMConfig{}, 0)
 	if calls != 0 {
 		t.Fatalf("小历史不应触发压缩，calls=%d", calls)
 	}
@@ -226,6 +229,18 @@ func testFailingSummarizer(calls *int) StreamFn {
 	}
 }
 
+// testSummarizerSeq 按调用次序返回预设回复（超出后重复最后一个）。
+func testSummarizerSeq(calls *int, replies []string) StreamFn {
+	return func(ctx context.Context, cfg config.LLMConfig, msgs []ChatMessage, defs []tools.ToolDef, hooks Hooks, reasoning string) (string, []ToolCall, error) {
+		i := *calls
+		*calls++
+		if i >= len(replies) {
+			i = len(replies) - 1
+		}
+		return replies[i], nil, nil
+	}
+}
+
 // 用户场景回归：条数超了但字节预算充足 → 上下文并不吃紧，不应压缩。
 // （30 条一句话消息 ≈ 3KB，远小于 256KB 预算的 70% 水位）
 func TestCompactSkipsWhenBudgetHealthy(t *testing.T) {
@@ -238,11 +253,96 @@ func TestCompactSkipsWhenBudgetHealthy(t *testing.T) {
 	}
 	full, _ := st.Get(sess.ID)
 	calls := 0
-	view := maybeCompact(context.Background(), st, full, 4, 256*1024, testSummarizer(&calls, "不该被调用"), config.LLMConfig{})
+	view := maybeCompact(context.Background(), st, full, 4, 256*1024, testSummarizer(&calls, goodSummary), config.LLMConfig{}, 0)
 	if calls != 0 {
 		t.Fatalf("上下文充足时不应压缩，calls=%d", calls)
 	}
 	if len(view.Recent) != len(full.Messages) {
 		t.Fatal("未压缩时应保留完整消息供被动裁剪处理")
+	}
+}
+
+// token 水位：配置了 ContextWindow 后按 bytes/4 估算触发，字节预算不再参与。
+func TestCompactTokenWatermark(t *testing.T) {
+	st, _ := store.New(t.TempDir())
+	sess, _ := st.Create("token水位", "")
+	base := time.Now()
+	// ~5.5KB 消息；字节模式下（预算 256KB）永远不会触发
+	for i := 0; i < 30; i++ {
+		_ = st.Append(sess.ID, store.Message{Role: "user", Content: strings.Repeat("字", 90), CreatedAt: base})
+		_ = st.Append(sess.ID, store.Message{Role: "assistant", Content: "好", CreatedAt: base})
+	}
+	full, _ := st.Get(sess.ID)
+	calls := 0
+	// 字节预算为 0（字节模式直接不触发）+ 小窗口：token 水位接管
+	view := maybeCompact(context.Background(), st, full, 4, 0, testSummarizer(&calls, goodSummary), config.LLMConfig{}, 1000)
+	if calls == 0 {
+		t.Fatal("token 水位超限应触发压缩")
+	}
+	if view.Summary == "" {
+		t.Fatal("token 水位触发后应有摘要")
+	}
+	// 大窗口（上下文充足）：不触发
+	compactLastTry = map[string]time.Time{}
+	calls2 := 0
+	maybeCompact(context.Background(), st, full, 4, 0, testSummarizer(&calls2, goodSummary), config.LLMConfig{}, 10_000_000)
+	if calls2 != 0 {
+		t.Fatalf("窗口充足时不应压缩，calls=%d", calls2)
+	}
+}
+
+// 退化摘要：第一次输出过短判退化 → 重试成功。
+func TestCompactDegenerateRetry(t *testing.T) {
+	st, _ := store.New(t.TempDir())
+	sess, _ := st.Create("退化重试", "")
+	base := time.Now()
+	for i := 0; i < 6; i++ {
+		body := strings.Repeat(fmt.Sprintf("这是第%d个任务的详细背景材料。", i), 30)
+		_ = st.Append(sess.ID, userMsg(fmt.Sprintf("q%d：%s", i, body), base.Add(time.Duration(i)*time.Minute)))
+		_ = st.Append(sess.ID, asstMsg(fmt.Sprintf("**小柯** 回答%d。", i), base))
+	}
+	full, _ := st.Get(sess.ID)
+	compactLastTry = map[string]time.Time{}
+	calls := 0
+	seq := testSummarizerSeq(&calls, []string{strings.Repeat("短", 5), goodSummary})
+	view := maybeCompact(context.Background(), st, full, 4, 6*1024, seq, config.LLMConfig{}, 0)
+	if calls != 2 {
+		t.Fatalf("退化后应重试一次，calls=%d", calls)
+	}
+	if view.Summary != goodSummary {
+		t.Fatalf("重试成功后应采用第二次摘要: %q", view.Summary)
+	}
+}
+
+// 缩减率守卫：摘要几乎不比原文短 → 放弃压缩，不落库。
+func TestCompactReductionGuard(t *testing.T) {
+	st, _ := store.New(t.TempDir())
+	sess, _ := st.Create("缩减守卫", "")
+	base := time.Now()
+	for i := 0; i < 6; i++ {
+		_ = st.Append(sess.ID, userMsg(fmt.Sprintf("q%d", i), base))
+		_ = st.Append(sess.ID, asstMsg("a", base))
+	}
+	full, _ := st.Get(sess.ID)
+	compactLastTry = map[string]time.Time{}
+	calls := 0
+	// 原文很短（12 条一句话 ≈ 数百字节），返回一条超长摘要 → 守卫应拦下
+	bloated := strings.Repeat("这是复读机式的超长摘要。", 200)
+	view := maybeCompact(context.Background(), st, full, 4, 6*1024, testSummarizer(&calls, bloated), config.LLMConfig{}, 0)
+	if view.Summary != "" {
+		t.Fatalf("缩减率不足应放弃压缩: %q", view.Summary)
+	}
+	if got, _ := st.Get(sess.ID); got.Summary != "" {
+		t.Fatal("守卫拦截后不应落库摘要")
+	}
+}
+
+// cleanSummary：剥掉整体包裹的代码围栏。
+func TestCleanSummary(t *testing.T) {
+	if got := cleanSummary("```markdown\n正文内容\n```"); got != "正文内容" {
+		t.Fatalf("应剥围栏: %q", got)
+	}
+	if got := cleanSummary("  普通摘要  "); got != "普通摘要" {
+		t.Fatalf("普通文本应只去空白: %q", got)
 	}
 }

@@ -86,6 +86,120 @@ func TestWriteOutsideWorkspaceDenied(t *testing.T) {
 	}
 }
 
+func writeTemp(t *testing.T, env *Env, path, content string) {
+	t.Helper()
+	args, _ := json.Marshal(map[string]string{"path": path, "content": content})
+	if _, err := execWriteFile(context.Background(), env, args); err != nil {
+		t.Fatalf("writeTemp 失败: %v", err)
+	}
+}
+
+func TestEditFileBasic(t *testing.T) {
+	env, ws := testEnv(t)
+	writeTemp(t, env, "app.py", "def main():\n    print(\"hello\")\n    return 0\n")
+	args, _ := json.Marshal(map[string]string{
+		"path":       "app.py",
+		"old_string": "print(\"hello\")",
+		"new_string": "print(\"hello, xiaoke\")",
+	})
+	out, err := execEditFile(context.Background(), env, args)
+	if err != nil {
+		t.Fatalf("edit_file 失败: %v", err)
+	}
+	if !strings.Contains(out, "替换 1 处") {
+		t.Fatalf("回执异常: %s", out)
+	}
+	data, _ := os.ReadFile(filepath.Join(ws, "app.py"))
+	want := "def main():\n    print(\"hello, xiaoke\")\n    return 0\n"
+	if string(data) != want {
+		t.Fatalf("替换后内容不符: %q", string(data))
+	}
+}
+
+func TestEditFileNoMatchGivesHint(t *testing.T) {
+	env, _ := testEnv(t)
+	writeTemp(t, env, "a.txt", "alpha beta\ngamma delta\n")
+	// 首行能对上但整段不一致：提示应给出「第 1 行附近」
+	args, _ := json.Marshal(map[string]string{
+		"path": "a.txt", "old_string": "alpha beta\nWRONG LINE", "new_string": "x",
+	})
+	_, err := execEditFile(context.Background(), env, args)
+	if err == nil || !strings.Contains(err.Error(), "第 1 行") {
+		t.Fatalf("零匹配应附首行位置提示: %v", err)
+	}
+	// 首行也对不上：退化到最长 token 提示
+	args2, _ := json.Marshal(map[string]string{
+		"path": "a.txt", "old_string": "alpha beta2 gamma", "new_string": "x",
+	})
+	_, err = execEditFile(context.Background(), env, args2)
+	if err == nil || !strings.Contains(err.Error(), "alpha") {
+		t.Fatalf("零匹配应附最近似内容提示: %v", err)
+	}
+}
+
+func TestEditFileMultipleMatches(t *testing.T) {
+	env, ws := testEnv(t)
+	writeTemp(t, env, "b.txt", "same\nsame\nother\n")
+	args, _ := json.Marshal(map[string]string{
+		"path": "b.txt", "old_string": "same", "new_string": "changed",
+	})
+	if _, err := execEditFile(context.Background(), env, args); err == nil {
+		t.Fatal("多处匹配且未 replace_all 应报错")
+	}
+	all, _ := json.Marshal(map[string]any{
+		"path": "b.txt", "old_string": "same", "new_string": "changed", "replace_all": true,
+	})
+	if _, err := execEditFile(context.Background(), env, all); err != nil {
+		t.Fatalf("replace_all 应成功: %v", err)
+	}
+	data, _ := os.ReadFile(filepath.Join(ws, "b.txt"))
+	if string(data) != "changed\nchanged\nother\n" {
+		t.Fatalf("replace_all 结果不符: %q", string(data))
+	}
+}
+
+func TestEditFilePreservesCRLF(t *testing.T) {
+	env, ws := testEnv(t)
+	p := filepath.Join(ws, "win.txt")
+	if err := os.WriteFile(p, []byte("line1\r\nline2\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args, _ := json.Marshal(map[string]string{
+		"path": "win.txt", "old_string": "line2", "new_string": "line2 edited",
+	})
+	if _, err := execEditFile(context.Background(), env, args); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(p)
+	if string(data) != "line1\r\nline2 edited\r\n" {
+		t.Fatalf("CRLF 文件编辑后应保持 CRLF: %q", string(data))
+	}
+}
+
+func TestEditFileRejects(t *testing.T) {
+	env, _ := testEnv(t)
+	writeTemp(t, env, "c.txt", "content\n")
+	cases := []struct {
+		name string
+		args map[string]any
+		want string
+	}{
+		{"old 为空", map[string]any{"path": "c.txt", "old_string": "", "new_string": "x"}, "old_string 不能为空"},
+		{"old==new", map[string]any{"path": "c.txt", "old_string": "content", "new_string": "content"}, "相同"},
+		{"文件不存在", map[string]any{"path": "nope.txt", "old_string": "a", "new_string": "b"}, "文件不存在"},
+		{"越界路径", map[string]any{"path": "../evil.txt", "old_string": "a", "new_string": "b"}, "越出授权根目录"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			args, _ := json.Marshal(c.args)
+			_, err := execEditFile(context.Background(), env, args)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("应报错含 %q，实际: %v", c.want, err)
+			}
+		})
+	}
+}
+
 func TestRunCommandAllowlist(t *testing.T) {
 	env, ws := testEnv(t)
 	// 白名单外
@@ -219,11 +333,97 @@ func TestIsWriteCapable(t *testing.T) {
 		"read_file", "read_text_file", "list_directory", "list_files",
 		"search_files", "get_file_info", "directory_tree", "read_multiple_files",
 		"list_allowed_directories", "format_text", "confirm_status",
+		// 智能体内部状态工具：只写自己的待办/记忆，不碰用户文件
+		"todo_write", "memory_append", "memory_read",
 	}
 	for _, n := range read {
 		if IsWriteCapable(n) {
 			t.Errorf("%q 不应判定为写类工具", n)
 		}
+	}
+}
+
+// todo_write：状态校验、单 in_progress 约束、回调透传。
+func TestTodoWrite(t *testing.T) {
+	env := &Env{}
+	if _, err := execTodoWrite(context.Background(), env, nil); err == nil {
+		t.Fatal("回调未注入时应报错")
+	}
+	var saved []TodoItem
+	env.SetTodos = func(todos []TodoItem) error {
+		saved = todos
+		return nil
+	}
+	ok, _ := json.Marshal(map[string]any{"todos": []map[string]string{
+		{"content": "调研", "status": "completed"},
+		{"content": "实现", "status": "in_progress"},
+		{"content": "测试", "status": "pending"},
+	}})
+	if out, err := execTodoWrite(context.Background(), env, ok); err != nil {
+		t.Fatalf("合法待办应通过: %v %q", err, out)
+	}
+	if len(saved) != 3 || saved[0].Status != "completed" {
+		t.Fatalf("待办未透传: %+v", saved)
+	}
+	// 两个 in_progress 拒绝
+	bad, _ := json.Marshal(map[string]any{"todos": []map[string]string{
+		{"content": "a", "status": "in_progress"},
+		{"content": "b", "status": "in_progress"},
+	}})
+	if _, err := execTodoWrite(context.Background(), env, bad); err == nil {
+		t.Fatal("多个 in_progress 应拒绝")
+	}
+	// 非法状态拒绝
+	bad2, _ := json.Marshal(map[string]any{"todos": []map[string]string{
+		{"content": "a", "status": "done"},
+	}})
+	if _, err := execTodoWrite(context.Background(), env, bad2); err == nil {
+		t.Fatal("非法状态应拒绝")
+	}
+	// 空列表拒绝
+	empty, _ := json.Marshal(map[string]any{"todos": []map[string]string{}})
+	if _, err := execTodoWrite(context.Background(), env, empty); err == nil {
+		t.Fatal("空待办应拒绝")
+	}
+}
+
+// memory 工具依赖 Env 注入的回调：回调缺失要明确报错，存在则透传 scope。
+func TestMemoryToolsViaEnvCallbacks(t *testing.T) {
+	env := &Env{}
+	args, _ := json.Marshal(map[string]string{"content": "记住我", "scope": "global"})
+	if _, err := execMemoryAppend(context.Background(), env, args); err == nil {
+		t.Fatal("回调未注入时 memory_append 应报错")
+	}
+	if _, err := execMemoryRead(context.Background(), env, nil); err == nil {
+		t.Fatal("回调未注入时 memory_read 应报错")
+	}
+
+	var gotScope, gotContent string
+	env.MemoryAppend = func(scope, content string) (string, error) {
+		gotScope, gotContent = scope, content
+		return "已写入", nil
+	}
+	env.MemoryRead = func(scope string) (string, error) {
+		return "记忆内容(" + scope + ")", nil
+	}
+	if out, err := execMemoryAppend(context.Background(), env, args); err != nil || out != "已写入" {
+		t.Fatalf("透传失败: %v %q", err, out)
+	}
+	if gotScope != "global" || gotContent != "记住我" {
+		t.Fatalf("参数未正确透传: scope=%q content=%q", gotScope, gotContent)
+	}
+	// scope 缺省 = project
+	defArgs, _ := json.Marshal(map[string]string{"content": "默认作用域"})
+	if _, err := execMemoryAppend(context.Background(), env, defArgs); err != nil {
+		t.Fatal(err)
+	}
+	if gotScope != "project" {
+		t.Fatalf("scope 缺省应为 project: %q", gotScope)
+	}
+	rargs, _ := json.Marshal(map[string]string{})
+	out, err := execMemoryRead(context.Background(), env, rargs)
+	if err != nil || !strings.Contains(out, "project") {
+		t.Fatalf("memory_read 缺省 scope 异常: %v %q", err, out)
 	}
 }
 

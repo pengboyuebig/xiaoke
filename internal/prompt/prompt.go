@@ -19,6 +19,8 @@ type Request struct {
 	ReadDirs       []string // 只读授权目录
 	ToolsAvailable bool     // 本次会话实际可用工具（内置+MCP > 0）
 	SkillsAssembly string   // 启用技能的注入正文
+	Rules          string   // 项目规则文件（AGENTS.md / CLAUDE.md 等，已转义）
+	Memory         string   // 长期记忆（全局 + 项目两层，budget 内）
 	Instructions   string   // 追加的补充指令
 }
 
@@ -50,6 +52,19 @@ func Build(r Request) string {
 	if s := strings.TrimSpace(r.SkillsAssembly); s != "" {
 		b.WriteString("\n\n【已启用技能】以下是用户启用的技能说明；与当前任务相关时遵循其方法论，无关时忽略：")
 		b.WriteString(s)
+	}
+
+	// 3.5) 项目规则文件：仓库约定跟着项目走（构建命令、风格、结构）。
+	// 优先级声明：用户当前指令 > 深层规则文件 > 浅层规则文件。
+	if rules := strings.TrimSpace(r.Rules); rules != "" {
+		b.WriteString("\n\n【项目规则】以下是项目里的规则文件（AGENTS.md / CLAUDE.md 等），是对你如何在这个项目工作的约定，与当前任务相关时必须遵守；用户当前对话里的明确指令优先于规则文件：")
+		b.WriteString("\n" + rules)
+	}
+
+	// 3.6) 长期记忆：跨会话保留的用户偏好/项目知识；模型可用 memory_append 增补。
+	if mem := strings.TrimSpace(r.Memory); mem != "" {
+		b.WriteString("\n\n【长期记忆】以下是往期会话沉淀的记忆，相关时直接运用；已有内容不要向用户复述确认，也不要重复写入：")
+		b.WriteString("\n" + mem)
 	}
 
 	// 4) 项目上下文

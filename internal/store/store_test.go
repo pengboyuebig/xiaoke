@@ -512,6 +512,74 @@ func TestSummaryPersistence(t *testing.T) {
 	}
 }
 
+// 待办清单：整表替换 + 持久化还原 + 日志收敛后不丢消息。
+func TestSetTodosPersistence(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, _ := s.Create("待办会话", "")
+	if err := s.Append(sess.ID, Message{Role: "user", Content: "做一个功能", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	todos := []Todo{
+		{Content: "调研现状", Status: "completed", UpdatedAt: time.Now()},
+		{Content: "写实现", Status: "in_progress", UpdatedAt: time.Now()},
+		{Content: "补测试", Status: "pending", UpdatedAt: time.Now()},
+	}
+	if err := s.SetTodos(sess.ID, todos); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Todos) != 3 || got.Todos[1].Status != "in_progress" {
+		t.Fatalf("待办未还原: %+v", got.Todos)
+	}
+	if len(got.Messages) != 1 {
+		t.Fatalf("消息不应丢失: %d", len(got.Messages))
+	}
+	// 第二次替换（模拟 todo 更新）
+	todos[1].Status = "completed"
+	if err := s.SetTodos(sess.ID, todos); err != nil {
+		t.Fatal(err)
+	}
+	got2, _ := s.Get(sess.ID)
+	if got2.Todos[1].Status != "completed" {
+		t.Fatalf("待办更新未生效: %+v", got2.Todos)
+	}
+	// 非法 ID 拒绝
+	if err := s.SetTodos("nope", nil); err == nil {
+		t.Fatal("非法 ID 应报错")
+	}
+}
+
+// 用量累计：多次 AddUsage 累加且重启可还原。
+func TestAddUsageAccumulates(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, _ := s.Create("", "")
+	if err := s.Append(sess.ID, Message{Role: "user", Content: "hi", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddUsage(sess.ID, 100, 50); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddUsage(sess.ID, 200, 80); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.Get(sess.ID)
+	if got.PromptTokens != 300 || got.CompletionTokens != 130 || got.Requests != 2 {
+		t.Fatalf("用量累计不符: %+v", got)
+	}
+	if err := s.AddUsage("bad-id", 1, 1); err == nil {
+		t.Fatal("非法 ID 应报错")
+	}
+}
+
 // 自动命名：SetTitle 写 meta，Get 能读到；已有标题不覆盖；空标题被忽略。
 func TestSetTitle(t *testing.T) {
 	s, err := New(t.TempDir())

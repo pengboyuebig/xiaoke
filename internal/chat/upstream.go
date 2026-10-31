@@ -47,10 +47,20 @@ type ToolDelta struct {
 	ArgDelta string
 }
 
-// Hooks 是流式回调：文本增量 + 工具调用增量。
+// Hooks 是流式回调：文本增量 + 工具调用增量 + token 用量。
 type Hooks struct {
 	OnDelta    func(string)
 	OnToolCall func(ToolDelta)
+	// OnUsage 上报本轮 token 用量（上游真实 usage 优先，缺失时字节估算兜底）。
+	// 由 streamFn 在调用方 goroutine 内顺序调用，无并发。
+	OnUsage func(prompt, completion int64)
+}
+
+// reportUsage 统一上报入口：nil 安全。
+func (h Hooks) reportUsage(prompt, completion int64) {
+	if h.OnUsage != nil && (prompt > 0 || completion > 0) {
+		h.OnUsage(prompt, completion)
+	}
 }
 
 // validReasoning 是请求级思考程度的合法取值。
@@ -126,6 +136,9 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 		"messages":    messages,
 		"stream":      true,
 		"temperature": cfg.Temperature,
+		// 请求上游在流式尾部回传真实 usage（OpenAI 规范字段；
+		// 不识别的兼容网关应忽略未知字段，解析端对本字段缺失完全宽容）
+		"stream_options": map[string]bool{"include_usage": true},
 	}
 	if cfg.MaxTokens > 0 {
 		body["max_tokens"] = cfg.MaxTokens
@@ -163,6 +176,8 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 	var full strings.Builder
 	acc := map[int]*ToolCall{} // tool_calls 按 index 增量拼装
 	order := []int{}
+	reqBytes := len(payload) // 请求体字节（usage 缺失时的估算基数）
+	var gotUsage bool
 	reader := bufio.NewReaderSize(resp.Body, 64*1024)
 	for {
 		line, rerr := reader.ReadString('\n')
@@ -172,7 +187,11 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 			if payload == "[DONE]" {
 				break
 			}
-			content, deltas, stop := parseChunk(payload)
+			content, deltas, stop, usage := parseChunk(payload)
+			if usage != nil {
+				gotUsage = true
+				hooks.reportUsage(usage.promptTokens, usage.completionTokens)
+			}
 			if content != "" {
 				full.WriteString(content)
 				if hooks.OnDelta != nil {
@@ -223,11 +242,33 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 	if full.Len() == 0 && len(calls) == 0 {
 		return "", nil, fmt.Errorf("上游没有返回任何内容")
 	}
+	if !gotUsage {
+		// 上游没回 usage（部分兼容网关不支持 stream_options）：按 bytes/4 估算兜底
+		estIn, estOut := estimateTokens(reqBytes), estimateTokens(full.Len())+int64(len(calls))
+		hooks.reportUsage(estIn, estOut)
+	}
 	return full.String(), calls, nil
 }
 
-// parseChunk 从一条 SSE 数据里取文本增量、tool_calls 增量与 finish_reason。
-func parseChunk(payload string) (content string, deltas []ToolDelta, stop string) {
+// chunkUsage 是流式尾 chunk 回传的真实 token 用量。
+type chunkUsage struct {
+	promptTokens     int64
+	completionTokens int64
+}
+
+// estimateTokens 按 bytes/4 估算 token（与主流 agent 相同的启发式；
+// 中文约 3 字节/字折 0.75 token，偏差可接受——它只用于展示与兜底，
+// 压缩触发主要依赖字节水位，见 compact.go）。
+func estimateTokens(n int) int64 {
+	if n <= 0 {
+		return 0
+	}
+	return int64(n) / 4
+}
+
+// parseChunk 从一条 SSE 数据里取文本增量、tool_calls 增量、finish_reason
+// 与（可能存在的）usage——usage 通常出现在 choices 为空的最后一个 chunk。
+func parseChunk(payload string) (content string, deltas []ToolDelta, stop string, usage *chunkUsage) {
 	var chunk struct {
 		Choices []struct {
 			Delta struct {
@@ -243,12 +284,19 @@ func parseChunk(payload string) (content string, deltas []ToolDelta, stop string
 			} `json:"delta"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
+		Usage *struct {
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-		return "", nil, ""
+		return "", nil, "", nil
+	}
+	if chunk.Usage != nil && (chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0) {
+		usage = &chunkUsage{promptTokens: chunk.Usage.PromptTokens, completionTokens: chunk.Usage.CompletionTokens}
 	}
 	if len(chunk.Choices) == 0 {
-		return "", nil, ""
+		return "", nil, "", usage
 	}
 	c := chunk.Choices[0]
 	if c.FinishReason != "" {
@@ -259,7 +307,7 @@ func parseChunk(payload string) (content string, deltas []ToolDelta, stop string
 			Index: tc.Index, ID: tc.ID, Name: tc.Function.Name, ArgDelta: tc.Function.Arguments,
 		})
 	}
-	return c.Delta.Content, deltas, stop
+	return c.Delta.Content, deltas, stop, usage
 }
 
 // ---------- mock 上游（免 Key 演示，可模拟一次工具调用闭环） ----------
@@ -299,20 +347,31 @@ func streamMock(ctx context.Context, cfg config.LLMConfig, messages []ChatMessag
 		if len([]rune(result)) > 60 {
 			result = string([]rune(result)[:60]) + "…"
 		}
-		reply := fmt.Sprintf("**小柯** 工具跑完了，结果：%s\n\n这是一次 **mock 工具调用演示**——「模型→工具→结果回填→继续生成」这条链路是通的。接上真实模型后我就能真正干活了，现在这副躯壳只是个演示品，别对它期待太多。", result)
+		reply := fmt.Sprintf("**小柯** 工具跑完了，结果：%s\n\n这是一次 **mock 工具调用演示**——「模型→工具→结果回填→继续生成」这条链路是通的（顺带演示了待办清单）。接上真实模型后我就能真正干活了，现在这副躯壳只是个演示品，别对它期待太多。", result)
+		hooks.reportUsage(180, estimateTokens(len(reply)))
 		out, err := streamChars(ctx, reply, hooks.OnDelta)
 		return out, nil, err
 	}
 
-	// 第一轮：命中关键词 → 演示工具调用
+	// 第一轮：命中关键词 → 演示待办 + 写文件的组合调用
 	if mockNeedTool(lastUser) {
+		todoArgs, _ := json.Marshal(map[string]any{
+			"todos": []map[string]string{
+				{"content": "创建演示文件 hello.txt", "status": "in_progress"},
+				{"content": "向用户确认文件可见", "status": "pending"},
+			},
+		})
+		todoCall := ToolCall{ID: fmt.Sprintf("mock_%d_t", time.Now().UnixMilli()), Type: "function"}
+		todoCall.Function.Name = "todo_write"
+		todoCall.Function.Arguments = string(todoArgs)
+
 		arg := map[string]string{
 			"path":    "hello.txt",
 			"content": "这是小柯（mock 模式）创建的文件。\n如果你能在项目里看到我，说明工具链已经打通。\n",
 		}
 		raw, _ := json.Marshal(arg)
 		argStr := string(raw)
-		call := ToolCall{ID: fmt.Sprintf("mock_%d", time.Now().UnixMilli()), Type: "function"}
+		call := ToolCall{ID: fmt.Sprintf("mock_%d_w", time.Now().UnixMilli()), Type: "function"}
 		call.Function.Name = "write_file"
 		call.Function.Arguments = argStr
 		// 模拟 arguments 分片增量（4 段），验证拼装逻辑
@@ -324,17 +383,18 @@ func streamMock(ctx context.Context, cfg config.LLMConfig, messages []ChatMessag
 				if end > n {
 					end = n
 				}
-				hooks.OnToolCall(ToolDelta{Index: 0, ID: call.ID, Name: call.Function.Name, ArgDelta: argStr[i:end]})
+				hooks.OnToolCall(ToolDelta{Index: 1, ID: call.ID, Name: call.Function.Name, ArgDelta: argStr[i:end]})
 			}
 		}
 		// 先给一句说明文字
-		note := "我来演示一下工具调用：在工作区里创建一个 hello.txt。"
+		note := "我来演示一下工具调用：先建个待办清单，然后在工作区里创建一个 hello.txt。"
 		if hooks.OnDelta != nil {
 			if _, err := streamChars(ctx, note, hooks.OnDelta); err != nil {
 				return note, nil, err
 			}
 		}
-		return note, []ToolCall{call}, nil
+		hooks.reportUsage(150, estimateTokens(len(note)))
+		return note, []ToolCall{todoCall, call}, nil
 	}
 
 	// 普通闲聊回复
@@ -343,6 +403,7 @@ func streamMock(ctx context.Context, cfg config.LLMConfig, messages []ChatMessag
 		q = string([]rune(q)[:40]) + "…"
 	}
 	reply := fmt.Sprintf("**小柯** 收到，你说的是「%s」。\n\n我现在跑在 **mock 演示模式**下，说穿了就是个会复读的空壳。想让我真正干活（写代码、写文章、调工具）：\n\n1. 点侧边栏 ⚙ 设置\n2. 选预设（DeepSeek / 本地 opencode 网关），填 API Key\n3. 建一个项目，然后对我说「帮我写个 xxx」\n\n——在那之前，请多包涵。", q)
+	hooks.reportUsage(80, estimateTokens(len(reply)))
 	out, err := streamChars(ctx, reply, hooks.OnDelta)
 	return out, nil, err
 }

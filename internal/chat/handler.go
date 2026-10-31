@@ -18,9 +18,11 @@ import (
 	"xiaoke/internal/agents"
 	"xiaoke/internal/config"
 	"xiaoke/internal/mcp"
+	"xiaoke/internal/memory"
 	"xiaoke/internal/persona"
 	"xiaoke/internal/projects"
 	"xiaoke/internal/prompt"
+	"xiaoke/internal/rules"
 	"xiaoke/internal/settings"
 	"xiaoke/internal/skills"
 	"xiaoke/internal/store"
@@ -36,6 +38,8 @@ type Handler struct {
 	mcp      *mcp.Manager
 	agents   *agents.Store
 	skills   *skills.Store
+	memory   *memory.Store
+	rules    *rules.Store
 }
 
 // maxHistoryBytes 是发给上游的历史消息总字节预算：
@@ -49,8 +53,8 @@ const parallelToolLimit = 4
 // maxToolArgBytes 单次工具调用参数体的字节上限（1MB）。
 const maxToolArgBytes = 1 << 20
 
-func NewHandler(cfg *config.Config, st *store.Store, set *settings.Store, pm *projects.Manager, mm *mcp.Manager, ag *agents.Store, sk *skills.Store) *Handler {
-	return &Handler{cfg: cfg, store: st, set: set, projects: pm, mcp: mm, agents: ag, skills: sk}
+func NewHandler(cfg *config.Config, st *store.Store, set *settings.Store, pm *projects.Manager, mm *mcp.Manager, ag *agents.Store, sk *skills.Store, mem *memory.Store, rs *rules.Store) *Handler {
+	return &Handler{cfg: cfg, store: st, set: set, projects: pm, mcp: mm, agents: ag, skills: sk, memory: mem, rules: rs}
 }
 
 // Register 把路由挂到 mux 上（Go 1.22+ 方法路由）。
@@ -66,6 +70,37 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/trash/{dir}/restore", h.restoreTrash)
 	mux.HandleFunc("DELETE /api/trash/{dir}", h.purgeTrash)
 	mux.HandleFunc("POST /api/chat", h.chat)
+}
+
+// RegisterMemoryAPI 挂载全局记忆的查看/编辑接口（设置页「长期记忆」编辑框用；
+// 项目记忆只经 memory 工具增量维护，不走设置页）。
+func (h *Handler) RegisterMemoryAPI(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/memory", h.getMemory)
+	mux.HandleFunc("PUT /api/memory", h.putMemory)
+}
+
+func (h *Handler) getMemory(w http.ResponseWriter, r *http.Request) {
+	content, err := h.memory.Read(memory.ScopeGlobal, "")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"content": content})
+}
+
+func (h *Handler) putMemory(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+		return
+	}
+	if err := h.memory.WriteGlobal(in.Content); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"ok": "1"})
 }
 
 func (h *Handler) listSessions(w http.ResponseWriter, r *http.Request) {
@@ -399,6 +434,39 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		Allowlist:         sset.CommandAllowlist,
 		CommandTimeoutSec: sset.CommandTimeoutSec,
 	}
+	// 会话级工具回调：待办写会话快照，记忆按项目分层（未选项目时落到全局层）
+	projID := ""
+	if project != nil {
+		projID = project.ID
+	}
+	var latestTodos []store.Todo
+	todoDirty := false
+	env.SetTodos = func(items []tools.TodoItem) error {
+		now := time.Now()
+		todos := make([]store.Todo, 0, len(items))
+		for _, it := range items {
+			todos = append(todos, store.Todo{Content: it.Content, Status: it.Status, UpdatedAt: now})
+		}
+		if err := h.store.SetTodos(sess.ID, todos); err != nil {
+			return err
+		}
+		latestTodos = todos
+		todoDirty = true
+		return nil
+	}
+	memoryScope := func(scope string) memory.Scope {
+		if scope == "global" || projID == "" {
+			return memory.ScopeGlobal
+		}
+		return memory.ScopeProject
+	}
+	env.MemoryAppend = func(scope, content string) (string, error) {
+		return h.memory.Append(memoryScope(scope), projID, content)
+	}
+	env.MemoryRead = func(scope string) (string, error) {
+		return h.memory.Read(memoryScope(scope), projID)
+	}
+
 	defs := tools.Defs(tools.Builtin())
 	defs = append(defs, h.mcp.Tools()...)
 
@@ -424,6 +492,13 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	if agent != nil {
 		agentName, agentBase, agentTools = agent.Name, agent.SystemPrompt, agent.Tools
 	}
+	// 规则文件：项目工作区 + 只读授权目录根下的 AGENTS.md / CLAUDE.md 等。
+	// 内容已做伪框架标签转义，属于第三方输入的最小信任注入。
+	ruleRoots := make([]string, 0, len(sset.ReadDirs)+1)
+	if projPath != "" {
+		ruleRoots = append(ruleRoots, projPath)
+	}
+	ruleRoots = append(ruleRoots, sset.ReadDirs...)
 	sysPrompt := prompt.Build(prompt.Request{
 		AgentName:      agentName,
 		AgentBase:      agentBase,
@@ -433,6 +508,8 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		ReadDirs:       sset.ReadDirs,
 		ToolsAvailable: len(defs) > 0,
 		SkillsAssembly: h.skills.Assembly(),
+		Rules:          h.rules.Discover(ruleRoots),
+		Memory:         h.memory.Assembly(projID),
 		Instructions:   prompt.PlanGuideFor(planMode),
 	})
 	convo := []ChatMessage{{Role: "system", Content: sysPrompt}}
@@ -447,7 +524,7 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		if sset.CompactKeepCount > 0 {
 			keep = sset.CompactKeepCount
 		}
-		view = maybeCompact(r.Context(), h.store, full, keep, maxHistoryBytes, streamFn, effAsConfig(eff))
+		view = maybeCompact(r.Context(), h.store, full, keep, maxHistoryBytes, streamFn, effAsConfig(eff), eff.ContextWindow)
 	}
 	// 本次请求新生成的摘要（与请求开始时的快照对比）：用于向前端发 compact 事件
 	newSummary := ""
@@ -457,12 +534,14 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		covered = len(full.Messages) - len(view.Recent) // 新摘要覆盖的消息数
 	}
 	if strings.TrimSpace(view.Summary) != "" {
-		// 摘要以 system 角色紧跟主提示词，明确告知它是「此前的对话压缩」
-		convo = append(convo, ChatMessage{
-			Role: "system",
-			Content: "【此前的对话摘要】\n以下是本会话更早内容的压缩版（细节已省略，完整历史仍在本地）：\n" +
-				view.Summary + "\n【摘要结束】继续对话时以此为背景。",
-		})
+		// 摘要以 system 角色紧跟主提示词，明确告知它是「此前的对话压缩」；
+		// 未完成待办随摘要一起注入——压缩丢上下文不能丢任务进度。
+		content := "【此前的对话摘要】\n以下是本会话更早内容的压缩版（细节已省略，完整历史仍在本地）：\n" +
+			view.Summary + "\n【摘要结束】继续对话时以此为背景。"
+		if todos := pendingTodos(full.Todos); len(todos) > 0 {
+			content += "\n\n【当前待办（压缩后仍然有效，完成一项就更新一次）】\n" + todosText(todos)
+		}
+		convo = append(convo, ChatMessage{Role: "system", Content: content})
 	}
 	// 裁剪并清理孤立/不完整的 tool 消息：截断点落在 assistant.tool_calls
 	// 与 tool 结果之间时，严格上游会直接 400。
@@ -504,9 +583,30 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		// 透明度：让用户知道上下文刚被压缩过（否则摘要悄无声息地替换历史，像失忆）
 		send(map[string]any{"type": "compact", "covered": covered})
 	}
-	hooks := Hooks{OnDelta: func(delta string) {
-		send(map[string]any{"type": "delta", "text": delta})
-	}}
+	// 本次请求的累计用量：streamFn 每轮经 Hooks.OnUsage 上报（真实 usage 优先，
+	// 缺失时上游实现按字节估算兜底）。全部在当前 goroutine 顺序发生，无需加锁。
+	var usagePrompt, usageCompletion int64
+	hooks := Hooks{
+		OnDelta: func(delta string) {
+			send(map[string]any{"type": "delta", "text": delta})
+		},
+		OnUsage: func(p, c int64) {
+			usagePrompt += p
+			usageCompletion += c
+		},
+	}
+	// 请求结束时落库累计用量（mock 模式的演示用量也计入，方便前端联调）
+	defer func() {
+		if usagePrompt > 0 || usageCompletion > 0 {
+			_ = h.store.AddUsage(sess.ID, usagePrompt, usageCompletion)
+		}
+	}()
+	finish := func() {
+		send(map[string]any{
+			"type":  "done",
+			"usage": map[string]any{"prompt": usagePrompt, "completion": usageCompletion},
+		})
+	}
 
 	// ---------- agent loop：最多 maxSteps 轮工具调用 ----------
 	for step := 0; step < maxSteps; step++ {
@@ -529,7 +629,7 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 				send(map[string]any{"type": "error", "error": "保存回复失败: " + err.Error()})
 				return
 			}
-			send(map[string]any{"type": "done"})
+			finish()
 			return
 		}
 
@@ -585,6 +685,11 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 				Role: "tool", Content: resultText,
 				ToolCallID: calls[i].ID, Name: calls[i].Function.Name,
 			})
+			// 待办有变：推最新清单给前端（紧跟对应工具的 tool_result）
+			if calls[i].Function.Name == "todo_write" && todoDirty && latestTodos != nil {
+				todoDirty = false
+				send(todoEvent(latestTodos))
+			}
 		}
 		if r.Context().Err() != nil {
 			return // 客户端断开，停止循环
@@ -604,11 +709,45 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		if err := h.store.Append(sess.ID, store.Message{
 			Role: "assistant", Content: content, CreatedAt: time.Now(),
 		}); err == nil {
-			send(map[string]any{"type": "done"})
+			finish()
 			return
 		}
 	}
 	send(map[string]any{"type": "error", "error": fmt.Sprintf("已达到最大工具轮数（%d），本轮结束", maxSteps)})
+}
+
+// todoEvent 组装 SSE 待办事件（content/status 只传前端需要的字段）。
+func todoEvent(todos []store.Todo) map[string]any {
+	out := make([]map[string]any, 0, len(todos))
+	for _, t := range todos {
+		out = append(out, map[string]any{"content": t.Content, "status": t.Status})
+	}
+	return map[string]any{"type": "todo", "todos": out}
+}
+
+// pendingTodos 过滤出未完成的待办（压缩注入只需要还在进行中的部分）。
+func pendingTodos(todos []store.Todo) []store.Todo {
+	out := make([]store.Todo, 0, len(todos))
+	for _, t := range todos {
+		if t.Status != "completed" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// todosText 待办清单的纯文本形态（注入上下文用）。
+func todosText(todos []store.Todo) string {
+	label := map[string]string{"in_progress": "进行中", "pending": "待开始"}
+	lines := make([]string, 0, len(todos))
+	for i, t := range todos {
+		l, ok := label[t.Status]
+		if !ok {
+			l = t.Status
+		}
+		lines = append(lines, fmt.Sprintf("%d. [%s] %s", i+1, l, t.Content))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // toolOutcome 是一次工具执行的完整结果（SSE 已在执行中发出，这里供落库/回填）。

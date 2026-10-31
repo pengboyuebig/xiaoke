@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import type { Agent, Message, Project, Turn } from '../types'
+import type { Agent, Message, Project, Todo, Turn } from '../types'
+import type { UsageInfo } from '../lib/api'
 import TurnView from './TurnView.vue'
+import TodoCard from './TodoCard.vue'
 import Icon from './Icon.vue'
 import { renderMarkdown } from '../lib/markdown'
 
@@ -18,6 +20,10 @@ const props = defineProps<{
   agent?: Agent | null
   /** 计划模式下计划已生成，等待用户批准 */
   awaitingApproval?: boolean
+  /** 当前会话的待办清单（todo_write 维护，随会话还原） */
+  todos?: Todo[]
+  /** 最近一次对话的 token 用量（done 事件上报） */
+  lastUsage?: UsageInfo | null
 }>()
 
 const emit = defineEmits<{ approve: []; approveCustom: [text: string]; adjustPlan: []; quick: [text: string] }>()
@@ -177,6 +183,8 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
 
     <!-- 回合流：每个回合 = 问题气泡 + 工作容器 -->
     <div v-else ref="threadEl" class="thread">
+      <!-- 当前待办清单：todo_write 更新后实时刷新，切会话随会话还原 -->
+      <TodoCard v-if="props.todos?.length" :todos="props.todos" />
       <div v-for="(t, i) in props.turns" :key="i" class="turn-item">
         <!-- 我的问题（与 questionList 同条件：trim 后非空才渲染，保证索引一一对应） -->
         <div v-if="(t.question || '').trim()" class="msg user">
@@ -196,6 +204,11 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
           :agent-name="agentName()"
           :avatar="agentAvatar()"
         />
+      </div>
+      <!-- 最近一次对话的 token 用量（done 事件上报；估算值仅作参考） -->
+      <div v-if="props.lastUsage && (props.lastUsage.prompt || props.lastUsage.completion)" class="usage-line">
+        <Icon name="clock" :size="12" />
+        本次用量 ↑{{ props.lastUsage.prompt }} ↓{{ props.lastUsage.completion }} tokens（估算值，仅供参考）
       </div>
       <!-- 计划已生成：批准后切开发模式并立即按计划开工；也可用自己的方式实现 -->
       <div v-if="props.awaitingApproval" class="approve-bar">
@@ -633,6 +646,16 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
 
 .thread-end {
   height: 16px;
+}
+
+/* ---------- 用量展示 ---------- */
+.usage-line {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 2px 0 10px;
+  font-size: 11px;
+  color: var(--text-faint);
 }
 
 /* ---------- 计划批准条 ---------- */

@@ -15,6 +15,12 @@ import (
 	"strings"
 )
 
+// TodoItem 是一条待办（tools 层自有类型，handler 负责与 store 互转）。
+type TodoItem struct {
+	Content string `json:"content"`
+	Status  string `json:"status"` // pending | in_progress | completed
+}
+
 // Env 是一次工具执行的环境（每次请求按当前设置/项目构造）。
 type Env struct {
 	Workspace string   // 可读写的工作区根（项目目录）；为空表示未选择项目
@@ -22,6 +28,13 @@ type Env struct {
 	Allowlist []string // 可执行命令白名单（basename 匹配）
 	// CommandTimeoutSec run_command 超时（秒；<=0 用默认 30）。构建/安装类命令可能需要调大。
 	CommandTimeoutSec int
+
+	// SetTodos / MemoryAppend / MemoryRead 是会话级能力的回调，由 handler 在
+	// 每次请求时用闭包注入（携带会话 ID、项目 ID 等上下文），tools 包保持零依赖。
+	// 为 nil 表示该能力本次不可用（工具执行时报错并提示）。
+	SetTodos     func(todos []TodoItem) error
+	MemoryAppend func(scope, content string) (string, error)
+	MemoryRead   func(scope string) (string, error)
 }
 
 func (e *Env) clone() *Env {
@@ -41,7 +54,11 @@ type Tool struct {
 
 // Builtin 返回全部内置工具。
 func Builtin() []Tool {
-	return []Tool{toolListFiles, toolReadFile, toolWriteFile, toolSearchFiles, toolRunCommand}
+	return []Tool{
+		toolListFiles, toolReadFile, toolEditFile, toolWriteFile,
+		toolSearchFiles, toolTodoWrite, toolMemoryAppend, toolMemoryRead,
+		toolRunCommand,
+	}
 }
 
 // ToolDef 是发给上游 OpenAI 接口的 tools 数组元素。
@@ -99,6 +116,10 @@ func IsWriteCapable(name string) bool {
 	switch n {
 	case "write_file", "run_command":
 		return true
+	case "todo_write", "memory_append":
+		// 只写智能体自己的内部状态（会话待办 / 长期记忆文件），不碰用户项目文件：
+		// 计划模式下同样可用，不算写操作。
+		return false
 	}
 	for _, kw := range []string{
 		"write", "edit", "create", "mkdir", "move", "rename", "delete", "remove",

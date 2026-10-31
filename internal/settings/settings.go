@@ -42,6 +42,9 @@ type LLMSettings struct {
 	MaxHistory  int     `json:"maxHistory"`
 	// MaxTokens 单次回复的最大 token（<=0 = 不注入，由上游默认）。
 	MaxTokens int `json:"maxTokens,omitempty"`
+	// ContextWindow 上游模型的上下文窗口（token）。>0 时压缩触发按 token 水位
+	//（bytes/4 估算）计算，更贴近上游真实约束；0 = 未知，按字节水位触发。
+	ContextWindow int `json:"contextWindow,omitempty"`
 }
 
 // MCPServer 描述一个 stdio MCP server（与 opensquilla 的 [[mcp.servers]] 同形态）。
@@ -129,6 +132,16 @@ func (s *Store) normalize() {
 	}
 	if s.data.LLM.MaxTokens < 0 {
 		s.data.LLM.MaxTokens = 0
+	}
+	if s.data.LLM.ContextWindow < 0 {
+		s.data.LLM.ContextWindow = 0
+	}
+	if s.data.LLM.ContextWindow > 0 && s.data.LLM.ContextWindow < 4096 {
+		// 有值但过小没有意义（比被动裁剪窗口还小），视为未配置
+		s.data.LLM.ContextWindow = 0
+	}
+	if s.data.LLM.ContextWindow > 10_000_000 {
+		s.data.LLM.ContextWindow = 10_000_000
 	}
 	if s.data.CompactKeepCount < 0 {
 		s.data.CompactKeepCount = 0

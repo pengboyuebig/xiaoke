@@ -141,3 +141,34 @@ func TestNormalizeNewFields(t *testing.T) {
 		t.Fatal("默认应开启自动压缩")
 	}
 }
+
+// ContextWindow 钳制：负值/过小视为未配置（回退字节水位），上限封顶。
+func TestNormalizeContextWindow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	s, err := Open(path, config.LLMConfig{Mode: "mock"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		in   int
+		want int
+	}{
+		{-5, 0},      // 负值归零
+		{0, 0},       // 0 = 未配置（字节水位）
+		{100, 0},     // 有值但比 4096 小 → 视为未配置
+		{4096, 4096}, // 合法下界
+		{128_000, 128_000},
+		{99_999_999, 10_000_000}, // 上限封顶
+	}
+	for _, c := range cases {
+		next := s.Get()
+		next.LLM.ContextWindow = c.in
+		if err := s.Update(next, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got := s.Get().LLM.ContextWindow; got != c.want {
+			t.Fatalf("ContextWindow in=%d 应钳到 %d，got %d", c.in, c.want, got)
+		}
+	}
+}

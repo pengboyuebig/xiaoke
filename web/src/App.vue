@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api } from './lib/api'
-import type { Agent, Message, MsgGroup, Project, SessionMeta, Skill, ToolActivity, ToolPair, Turn } from './types'
+import type { Agent, Message, MsgGroup, Project, SessionMeta, Skill, Todo, ToolActivity, ToolPair, Turn } from './types'
+import type { UsageInfo } from './lib/api'
 import SideBar from './components/SideBar.vue'
 import ChatView from './components/ChatView.vue'
 import Composer from './components/Composer.vue'
@@ -25,6 +26,10 @@ let compactTimer: number | undefined
 const error = ref('')
 const mode = ref('')
 const model = ref('')
+
+// 当前会话的待办清单与最近一次用量（todo/usage SSE 事件维护，切会话随会话还原）
+const sessionTodos = ref<Todo[]>([])
+const lastUsage = ref<UsageInfo | null>(null)
 
 // 智能体
 const agents = ref<Agent[]>([])
@@ -186,6 +191,7 @@ onMounted(async () => {
       currentProjectId.value = s.projectId || ''
       if (s.agentId) currentAgentId.value = s.agentId
       messages.value = s.messages
+      sessionTodos.value = s.todos || []
     } else if (last) {
       localStorage.removeItem(CURRENT_SESSION_KEY)
     }
@@ -203,6 +209,8 @@ function handleSelectAgent(id: string) {
   currentId.value = ''
   rememberSession('')
   messages.value = []
+  sessionTodos.value = []
+  lastUsage.value = null
   error.value = ''
 }
 
@@ -390,6 +398,12 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
           t.ms = info.ms
         }
       },
+      onTodo: (todos) => {
+        sessionTodos.value = todos
+      },
+      onDone: (usage) => {
+        lastUsage.value = usage || null
+      },
     })
     // 无论正常结束还是中途停止，都以服务端落库为准刷新一次
     let serverHadThis = false
@@ -400,6 +414,7 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
         const s = await api.getSession(r.sessionId)
         if (r.sessionId === currentId.value) {
           messages.value = s.messages
+          sessionTodos.value = s.todos || []
           const last = s.messages[s.messages.length - 1]
           serverHadThis = last?.role === 'assistant' && !!last.content && last.content === streamingText.value
         }
@@ -452,6 +467,8 @@ function handleNewChat() {
   currentId.value = ''
   rememberSession('')
   messages.value = []
+  sessionTodos.value = []
+  lastUsage.value = null
   liveTools.value = []
   error.value = ''
 }
@@ -467,6 +484,8 @@ async function handleSelect(id: string) {
     currentProjectId.value = s.projectId || ''
     if (s.agentId) currentAgentId.value = s.agentId
     messages.value = s.messages
+    sessionTodos.value = s.todos || []
+    lastUsage.value = null
     error.value = ''
   } catch (e) {
     error.value = (e as Error).message
@@ -498,6 +517,8 @@ async function handleRemove(id: string) {
   if (id === currentId.value) {
     currentId.value = ''
     messages.value = []
+    sessionTodos.value = []
+    lastUsage.value = null
     try {
       localStorage.removeItem(CURRENT_SESSION_KEY)
     } catch {
@@ -514,6 +535,8 @@ function handleSelectProject(id: string) {
   currentProjectId.value = id
   currentId.value = ''
   messages.value = []
+  sessionTodos.value = []
+  lastUsage.value = null
   error.value = ''
 }
 
@@ -523,6 +546,8 @@ function unbindProject() {
   currentProjectId.value = ''
   currentId.value = ''
   messages.value = []
+  sessionTodos.value = []
+  lastUsage.value = null
   error.value = ''
 }
 
@@ -599,6 +624,8 @@ function onSettingsClosed() {
         :agent="currentAgent"
         :messages="messages"
         :awaiting-approval="planAwaitingApproval"
+        :todos="sessionTodos"
+        :last-usage="lastUsage"
         @approve="handleApprove"
         @approve-custom="handleApproveCustom"
         @adjust-plan="handleAdjustPlan"

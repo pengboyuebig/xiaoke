@@ -24,9 +24,10 @@ const (
 	compactMinMessages = 4
 	compactMinBytes    = 1 << 10 // 1KB
 
-	// compactTriggerRatio 是压缩触发的字节水位（占预算的百分比）。
+	// compactTriggerRatio 是压缩触发的水位（占预算的百分比）。
 	// 70%：既保证「上下文真吃紧了才压缩」，又留出余量——
 	// 等到 100% 时被动裁剪已经先丢消息了，压缩就失去了意义。
+	// 配置了 ContextWindow 时水位按 token 计（bytes/4 估算），否则按字节计。
 	compactTriggerRatio = 70
 
 	// compactInputLimit 喂给摘要模型的最大输入字节（防止摘要请求自身超预算）。
@@ -37,6 +38,11 @@ const (
 
 	// compactTimeout 单次摘要调用的超时。
 	compactTimeout = 60 * time.Second
+
+	// 摘要生成最多尝试次数（退化/失败重试一次），重试间隔。
+	compactMaxAttempts     = 2
+	compactRetryDelay      = 2 * time.Second
+	compactMinSummaryRunes = 80 // 剥围栏后少于此长度视为退化输出
 )
 
 // compactLast 记录每个会话上次尝试压缩的时间（失败也计入，避免反复烧钱重试）。
@@ -115,15 +121,22 @@ func maybeCompact(
 	byteBudget int,
 	summarize summarizerFunc,
 	cfg config.LLMConfig,
+	contextWindow int,
 ) summaryView {
 	view := splitBySummary(sess.Messages, sess.Summary, sess.SummaryUpTo)
 
-	// 触发条件（只看字节）：近期窗口的字节占用达到预算的 compactTriggerRatio 才压缩。
-	// 条数不作为触发依据——上游真正限制的是 token 而非条数，几十条一句话消息
-	// 占用极小，条数一超就压缩会在上下文还很充足时白白烧一次模型调用并丢细节；
-	// 条数超限由被动裁剪（trimHistory 的 maxCount）兜底。
+	// 触发条件：条数永远不作为依据（上游真正限制的是 token）。
+	//   - 配置了 ContextWindow：按 token 水位（bytes/4 估算，贴近上游真实约束）
+	//   - 未配置：退回字节水位（256KB 预算），行为与旧版一致
+	//   - 冷却与失败重试间隔由 compactLastTry 统一控制
 	recentBytes := historyBytes(view.Recent)
-	if byteBudget <= 0 || recentBytes < byteBudget*compactTriggerRatio/100 {
+	triggered := false
+	if contextWindow > 0 {
+		triggered = estimateTokens(recentBytes) >= int64(contextWindow)*compactTriggerRatio/100
+	} else {
+		triggered = byteBudget > 0 && recentBytes >= byteBudget*compactTriggerRatio/100
+	}
+	if !triggered {
 		return view
 	}
 
@@ -160,6 +173,12 @@ func maybeCompact(
 		log.Printf("会话 %s 上下文压缩失败（退回被动裁剪）: %v", sess.ID, err)
 		return view
 	}
+	// 缩减率守卫：摘要几乎不比原文短，说明这次总结没有信息密度
+	//（模型复读原文）——压缩还白白丢了细节，宁可放弃本次。
+	if len(summary) >= historyBytes(old)/2 {
+		log.Printf("会话 %s 摘要缩减率不足（摘要 %dB / 原文 %dB），放弃本次压缩", sess.ID, len(summary), historyBytes(old))
+		return view
+	}
 	upTo := old[len(old)-1].CreatedAt
 	if err := st.SetSummary(sess.ID, summary, upTo); err != nil {
 		log.Printf("会话 %s 摘要持久化失败: %v", sess.ID, err)
@@ -170,32 +189,76 @@ func maybeCompact(
 }
 
 // summarizeMessages 调一次非流式补全生成结构化摘要。
+//
+// 质量守卫（对标主流 agent 的 compaction 实践）：
+//   - 最多 compactMaxAttempts 次：空响应/退化输出（剥掉围栏后过短）重试
+//   - 请求被取消（用户停止/断开）不重试，立即返回
+//   - 失败返回最后一次错误，由调用方退回被动裁剪
 func summarizeMessages(ctx context.Context, old []store.Message, summarize summarizerFunc, cfg config.LLMConfig) (string, error) {
-	sys := `你是对话记录摘要器。把下面的对话历史压缩成一份给后续对话用的背景摘要，要求：
-1. 保留：用户的目标与偏好、已完成的动作（引用具体文件路径/命令）、重要决定、尚未完成的事、用户的原话承诺。
-2. 丢弃：寒暄、重复内容、工具输出的原文细节（保留结论即可）。
-3. 用简体中文，条目式，总长不超过 500 字。只输出摘要正文，不要任何开场白或标题。`
+	sys := `你是对话记录摘要器。把下面的对话历史压缩成一份给后续对话用的背景摘要，按以下小节组织（无内容的节省略标题）：
+1. 目标：用户这次对话要做什么
+2. 已完成：已执行的动作与结论（引用具体文件路径/命令）
+3. 重要决定：已确认的方案、约束与偏好
+4. 未完成：还没做的事、进行到哪一步
+5. 用户偏好：明确表达过的要求与纠正
+要求：简体中文、条目式；只保留事实与结论，丢弃寒暄和工具输出的原文细节；总长不超过 500 字；只输出摘要正文，不要任何开场白或代码围栏。`
 	user := transcriptForSummary(old)
 	if user == "" {
 		return "", fmt.Errorf("没有可摘要的内容")
 	}
-	cctx, cancel := context.WithTimeout(ctx, compactTimeout)
-	defer cancel()
-	out, _, err := summarize(cctx, config.LLMConfig{
-		Mode: cfg.Mode, BaseURL: cfg.BaseURL, APIKey: cfg.APIKey,
-		Model: cfg.Model, Temperature: 0.3,
-	}, []ChatMessage{
-		{Role: "system", Content: sys},
-		{Role: "user", Content: user},
-	}, nil, Hooks{}, "")
-	if err != nil {
-		return "", err
+	var lastErr error
+	for attempt := 0; attempt < compactMaxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(compactRetryDelay):
+			}
+		}
+		cctx, cancel := context.WithTimeout(ctx, compactTimeout)
+		out, _, err := summarize(cctx, config.LLMConfig{
+			Mode: cfg.Mode, BaseURL: cfg.BaseURL, APIKey: cfg.APIKey,
+			Model: cfg.Model, Temperature: 0.3,
+		}, []ChatMessage{
+			{Role: "system", Content: sys},
+			{Role: "user", Content: user},
+		}, nil, Hooks{}, "")
+		cancel()
+		if err != nil {
+			lastErr = err
+			if ctx.Err() != nil {
+				return "", ctx.Err() // 请求已取消，重试没有意义
+			}
+			continue
+		}
+		out = cleanSummary(out)
+		if len([]rune(out)) < compactMinSummaryRunes {
+			lastErr = fmt.Errorf("摘要疑似退化输出（清洗后仅 %d 字符）", len([]rune(out)))
+			continue
+		}
+		return out, nil
 	}
-	out = strings.TrimSpace(out)
-	if out == "" {
-		return "", fmt.Errorf("摘要为空")
+	if lastErr == nil {
+		lastErr = fmt.Errorf("摘要生成失败")
 	}
-	return out, nil
+	return "", lastErr
+}
+
+// cleanSummary 清洗摘要输出：剥掉整体包裹的 markdown 代码围栏（模型偶尔
+// 无视「不要围栏」的指令），折叠首尾空白。
+func cleanSummary(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	// 去掉开头的 ```markdown / ```
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		s = strings.TrimSpace(s[idx+1:])
+	}
+	if idx := strings.LastIndex(s, "```"); idx >= 0 {
+		s = strings.TrimSpace(s[:idx])
+	}
+	return s
 }
 
 // transcriptForSummary 把消息列表转成带角色标注的纯文本（截断长工具结果）。

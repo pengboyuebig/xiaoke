@@ -46,8 +46,11 @@ const form = reactive({
   maxToolSteps: 8,
   allowlistText: 'git, npm, node, python, pip',
   maxTokens: 0,
+  contextWindow: 0,
   autoCompact: true,
   commandTimeoutSec: 0,
+  memoryText: '',
+  memoryDirty: false,
   mcpServers: [] as (MCPServerCfg & { argLines: string })[],
 })
 const newMcp = reactive({ name: '', command: '', argsText: '', dir: '' })
@@ -60,9 +63,32 @@ const testing = ref(false)
 const tabMeta = computed(() => TABS.find((t) => t.id === tab.value))
 
 onMounted(async () => {
-  await Promise.all([loadSettings(), refreshAgents(), refreshSkills(), refreshMcpStatus(), refreshTrash()])
+  await Promise.all([loadSettings(), refreshAgents(), refreshSkills(), refreshMcpStatus(), refreshTrash(), loadMemory()])
   loading.value = false
 })
+
+async function loadMemory() {
+  try {
+    form.memoryText = (await api.getMemory()).content
+    form.memoryDirty = false
+  } catch {
+    /* 记忆加载失败不阻塞设置页 */
+  }
+}
+
+async function saveMemory() {
+  saving.value = true
+  saveErr.value = ''
+  try {
+    await api.saveMemory(form.memoryText)
+    form.memoryDirty = false
+    showToast('长期记忆已保存 ✓')
+  } catch (e) {
+    saveErr.value = (e as Error).message
+  } finally {
+    saving.value = false
+  }
+}
 
 async function loadSettings() {
   try {
@@ -79,6 +105,7 @@ async function loadSettings() {
     form.maxToolSteps = s.maxToolSteps
     form.allowlistText = s.commandAllowlist.join(', ')
     form.maxTokens = s.llm.maxTokens || 0
+    form.contextWindow = s.llm.contextWindow || 0
     form.autoCompact = s.autoCompact !== false
     form.commandTimeoutSec = s.commandTimeoutSec || 0
     form.mcpServers = s.mcpServers.map((m) => ({
@@ -293,6 +320,7 @@ async function save() {
           temperature: Number(form.temperature) || 0.7,
           maxHistory: Number(form.maxHistory) || 20,
           maxTokens: Math.max(0, Number(form.maxTokens) || 0),
+          contextWindow: Math.max(0, Number(form.contextWindow) || 0),
         },
         mcpServers: form.mcpServers.map((m) => ({
           name: m.name.trim(),
@@ -539,6 +567,11 @@ async function save() {
               <div class="hint">注入请求体 max_tokens。设太小会把回答拦腰截断，不确定就留空。</div>
             </div>
             <div class="card">
+              <div class="card-title">上下文窗口（token，可选）</div>
+              <input v-model="form.contextWindow" class="inp" type="number" min="0" placeholder="留空或 0 = 未知（按字节水位触发压缩）" />
+              <div class="hint">填模型的真实上下文窗口（如 DeepSeek 128000），自动压缩会按 token 水位判断「什么时候该压缩」，比按字节数估算更准。</div>
+            </div>
+            <div class="card">
               <div class="card-title">命令超时（秒，0 = 默认 30）</div>
               <input v-model="form.commandTimeoutSec" class="inp" type="number" min="0" max="600" />
               <div class="hint">npm install / 构建类命令可能超 30 秒，超时就调大（上限 600）。</div>
@@ -553,6 +586,26 @@ async function save() {
               <div class="hint">
                 历史超过预算时，自动把较早的回合总结成摘要（用当前模型，约几秒），
                 保留更早的语境；关闭后超长历史会被直接裁掉（更快，但丢语境）。
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-title">长期记忆（全局）</div>
+              <div class="hint">
+                跨会话保留的知识：用户偏好、项目结构、纠正过的错误。小柯会通过 memory_append
+                工具自己沉淀，也可以在这里手工整理；每个会话开始时自动注入。项目级记忆由小柯按项目维护，不在这里展示。
+              </div>
+              <textarea
+                v-model="form.memoryText"
+                class="inp memory-editor"
+                rows="8"
+                placeholder="- 用户偏好简洁的中文回复&#10;- 项目 X 的构建命令是 npm run build"
+                @input="form.memoryDirty = true"
+              ></textarea>
+              <div class="memory-actions">
+                <button class="btn primary" :disabled="saving || !form.memoryDirty" @click="saveMemory">
+                  {{ saving ? '保存中…' : '保存记忆' }}
+                </button>
+                <span v-if="form.memoryText" class="hint-inline">{{ form.memoryText.length }} 字符</span>
               </div>
             </div>
           </div>
@@ -1005,6 +1058,27 @@ textarea.inp {
   font-size: 10.5px;
   color: var(--text-faint);
   line-height: 1.55;
+}
+
+/* 长期记忆编辑框 */
+.memory-editor {
+  margin-top: 10px;
+  width: 100%;
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.6;
+}
+
+.memory-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.hint-inline {
+  font-size: 10.5px;
+  color: var(--text-faint);
 }
 
 /* MCP */
