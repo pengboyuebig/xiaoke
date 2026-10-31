@@ -9,6 +9,7 @@ import Composer from './components/Composer.vue'
 import SettingsView from './components/SettingsView.vue'
 import ProjectModal from './components/ProjectModal.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
+import AskDialog from './components/AskDialog.vue'
 import Icon from './components/Icon.vue'
 import { askConfirm } from './lib/confirm'
 
@@ -30,6 +31,28 @@ const model = ref('')
 // 当前会话的待办清单与最近一次用量（todo/usage SSE 事件维护，切会话随会话还原）
 const sessionTodos = ref<Todo[]>([])
 const lastUsage = ref<UsageInfo | null>(null)
+
+// ask 交互（ask_user 提问 / ask 模式审批）：SSE ask 事件 → 弹窗 → POST 回答
+interface AskRequest {
+  id: string
+  kind: 'question' | 'permission'
+  question?: string
+  options?: string[]
+  multiSelect?: boolean
+  tool?: string
+  summary?: string
+  resolve: (answer: string) => void
+}
+const askRequest = ref<AskRequest | null>(null)
+function handleAsk(req: AskRequest) {
+  askRequest.value = req
+}
+function handleAskAnswer(answer: string) {
+  const req = askRequest.value
+  if (!req) return
+  askRequest.value = null
+  req.resolve(answer) // POST 投递由 api.ts 的 SSE 循环统一处理
+}
 
 // 智能体
 const agents = ref<Agent[]>([])
@@ -58,7 +81,7 @@ const reasoning = ref(localStorage.getItem(REASONING_KEY) || 'none')
 
 // 工作模式：plan（先调研出计划，只读）⇄ build（开发，完整能力）
 const MODE_KEY = 'xiaoke.mode'
-type WorkMode = 'plan' | 'build'
+type WorkMode = 'plan' | 'build' | 'ask'
 const workMode = ref<WorkMode>((localStorage.getItem(MODE_KEY) as WorkMode) || 'build')
 function setWorkMode(m: WorkMode) {
   workMode.value = m
@@ -401,6 +424,12 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
       onTodo: (todos) => {
         sessionTodos.value = todos
       },
+      onAsk: (req) => {
+        // SSE ask 事件：挂起等待用户操作（返回的 promise 由按钮点击 resolve）
+        return new Promise<string>((resolve) => {
+          handleAsk({ ...req, resolve })
+        })
+      },
       onDone: (usage) => {
         lastUsage.value = usage || null
       },
@@ -650,6 +679,7 @@ function onSettingsClosed() {
       @created="handleProjectCreated"
     />
     <ConfirmDialog />
+    <AskDialog :request="askRequest" @answer="handleAskAnswer" />
   </div>
 </template>
 

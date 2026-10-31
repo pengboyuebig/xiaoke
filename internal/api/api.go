@@ -92,8 +92,15 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
+	// 设置体很小，1MB 是宽容上限：decode 前先拦，防程序化调用把超大 body 读进内存
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var in settings.Settings
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "请求体过大"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
 		return
 	}

@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testEnv(t *testing.T) (*Env, string) {
@@ -17,6 +19,7 @@ func testEnv(t *testing.T) (*Env, string) {
 		Workspace: ws,
 		ReadDirs:  []string{filepath.Join(ws, "..", "readonly-xiaoke-test")},
 		Allowlist: []string{"git", "python"},
+		Files:     NewFileStateTracker(),
 	}, ws
 }
 
@@ -70,11 +73,21 @@ func TestWriteAndReadFile(t *testing.T) {
 	if err != nil || string(data) != "你好，小柯\n第二行" {
 		t.Fatalf("落盘内容不符: %v %q", err, string(data))
 	}
-	// 读回（带行号头）
+	// 写后立即读：write_file 已把内容带进上下文，应返回「未变化」存根
 	rargs, _ := json.Marshal(map[string]any{"path": "sub/hello.txt"})
 	got, err := execReadFile(context.Background(), env, rargs)
-	if err != nil || !strings.Contains(got, "第二行") {
-		t.Fatalf("read_file 异常: %v %q", err, got)
+	if err != nil || !strings.Contains(got, "没有变化") {
+		t.Fatalf("写后读应返回存根: %v %q", err, got)
+	}
+	// 模拟外部修改（touch）：再读应返回完整内容
+	target := filepath.Join(ws, "sub", "hello.txt")
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(target, future, future); err != nil {
+		t.Fatal(err)
+	}
+	got2, err := execReadFile(context.Background(), env, rargs)
+	if err != nil || !strings.Contains(got2, "第二行") {
+		t.Fatalf("外部修改后重读应有完整内容: %v %q", err, got2)
 	}
 }
 
@@ -94,9 +107,30 @@ func writeTemp(t *testing.T, env *Env, path, content string) {
 	}
 }
 
+// readTemp 编辑前必须先读（新鲜度护栏的测试侧对齐）。
+func readTemp(t *testing.T, env *Env, path string) {
+	t.Helper()
+	args, _ := json.Marshal(map[string]any{"path": path})
+	if _, err := execReadFile(context.Background(), env, args); err != nil {
+		t.Fatalf("readTemp 失败: %v", err)
+	}
+}
+
 func TestEditFileBasic(t *testing.T) {
 	env, ws := testEnv(t)
 	writeTemp(t, env, "app.py", "def main():\n    print(\"hello\")\n    return 0\n")
+	// 新鲜度护栏：writeTemp 走了 write_file（内容已知），不算「没读过」；
+	// 用外部直接创建的文件验证「未读先改」被拒绝
+	if err := os.WriteFile(filepath.Join(ws, "external.txt"), []byte("secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ng, _ := json.Marshal(map[string]string{
+		"path": "external.txt", "old_string": "secret", "new_string": "x",
+	})
+	if _, err := execEditFile(context.Background(), env, ng); err == nil || !strings.Contains(err.Error(), "尚未读取") {
+		t.Fatalf("未读先改应被拒绝: %v", err)
+	}
+	readTemp(t, env, "app.py")
 	args, _ := json.Marshal(map[string]string{
 		"path":       "app.py",
 		"old_string": "print(\"hello\")",
@@ -119,6 +153,7 @@ func TestEditFileBasic(t *testing.T) {
 func TestEditFileNoMatchGivesHint(t *testing.T) {
 	env, _ := testEnv(t)
 	writeTemp(t, env, "a.txt", "alpha beta\ngamma delta\n")
+	readTemp(t, env, "a.txt")
 	// 首行能对上但整段不一致：提示应给出「第 1 行附近」
 	args, _ := json.Marshal(map[string]string{
 		"path": "a.txt", "old_string": "alpha beta\nWRONG LINE", "new_string": "x",
@@ -140,6 +175,7 @@ func TestEditFileNoMatchGivesHint(t *testing.T) {
 func TestEditFileMultipleMatches(t *testing.T) {
 	env, ws := testEnv(t)
 	writeTemp(t, env, "b.txt", "same\nsame\nother\n")
+	readTemp(t, env, "b.txt")
 	args, _ := json.Marshal(map[string]string{
 		"path": "b.txt", "old_string": "same", "new_string": "changed",
 	})
@@ -158,12 +194,58 @@ func TestEditFileMultipleMatches(t *testing.T) {
 	}
 }
 
+// edit_file 批量模式：全部成功一次写入；任一处失败整批不落盘；两种入参互斥。
+func TestEditFileBatch(t *testing.T) {
+	env, ws := testEnv(t)
+	writeTemp(t, env, "m.go", "alpha one\nbeta two\ngamma three\n")
+	readTemp(t, env, "m.go")
+
+	// 全部成功
+	batch, _ := json.Marshal(map[string]any{"path": "m.go", "edits": []map[string]string{
+		{"old_string": "alpha one", "new_string": "alpha ONE"},
+		{"old_string": "gamma three", "new_string": "gamma THREE"},
+	}})
+	out, err := execEditFile(context.Background(), env, batch)
+	if err != nil || !strings.Contains(out, "批量 2 处") {
+		t.Fatalf("批量编辑失败: %v %q", err, out)
+	}
+	data, _ := os.ReadFile(filepath.Join(ws, "m.go"))
+	if string(data) != "alpha ONE\nbeta two\ngamma THREE\n" {
+		t.Fatalf("批量结果不符: %q", string(data))
+	}
+
+	// 第二处失败：整批拒绝，第一处也不生效
+	writeTemp(t, env, "m.go", "alpha one\nbeta two\ngamma three\n")
+	readTemp(t, env, "m.go")
+	bad, _ := json.Marshal(map[string]any{"path": "m.go", "edits": []map[string]string{
+		{"old_string": "alpha one", "new_string": "alpha CHANGED"},
+		{"old_string": "不存在的锚点", "new_string": "x"},
+	}})
+	if _, err := execEditFile(context.Background(), env, bad); err == nil {
+		t.Fatal("批量中一处失败应整批拒绝")
+	}
+	data2, _ := os.ReadFile(filepath.Join(ws, "m.go"))
+	if string(data2) != "alpha one\nbeta two\ngamma three\n" {
+		t.Fatalf("失败批次不应落盘: %q", string(data2))
+	}
+
+	// 两种入参同时传：拒绝
+	both, _ := json.Marshal(map[string]any{
+		"path": "m.go", "old_string": "a", "new_string": "b",
+		"edits": []map[string]string{{"old_string": "c", "new_string": "d"}},
+	})
+	if _, err := execEditFile(context.Background(), env, both); err == nil {
+		t.Fatal("old_string 与 edits 同时传应拒绝")
+	}
+}
+
 func TestEditFilePreservesCRLF(t *testing.T) {
 	env, ws := testEnv(t)
 	p := filepath.Join(ws, "win.txt")
 	if err := os.WriteFile(p, []byte("line1\r\nline2\r\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	readTemp(t, env, "win.txt")
 	args, _ := json.Marshal(map[string]string{
 		"path": "win.txt", "old_string": "line2", "new_string": "line2 edited",
 	})
@@ -179,12 +261,13 @@ func TestEditFilePreservesCRLF(t *testing.T) {
 func TestEditFileRejects(t *testing.T) {
 	env, _ := testEnv(t)
 	writeTemp(t, env, "c.txt", "content\n")
+	readTemp(t, env, "c.txt")
 	cases := []struct {
 		name string
 		args map[string]any
 		want string
 	}{
-		{"old 为空", map[string]any{"path": "c.txt", "old_string": "", "new_string": "x"}, "old_string 不能为空"},
+		{"old 为空", map[string]any{"path": "c.txt", "old_string": "", "new_string": "x"}, "需要 old_string"},
 		{"old==new", map[string]any{"path": "c.txt", "old_string": "content", "new_string": "content"}, "相同"},
 		{"文件不存在", map[string]any{"path": "nope.txt", "old_string": "a", "new_string": "b"}, "文件不存在"},
 		{"越界路径", map[string]any{"path": "../evil.txt", "old_string": "a", "new_string": "b"}, "越出授权根目录"},
@@ -323,6 +406,7 @@ func TestIsWriteCapable(t *testing.T) {
 		"insert_text", "copy_file", "patch_file", "shell_exec", "upload_file",
 		"rm_file", "mv_file", "cp_file", "touch_file", "truncate_file",
 		"save_file", "persist_state", "update_file", "mkfile", "put_file",
+		"task_kill",
 	}
 	for _, n := range write {
 		if !IsWriteCapable(n) {
@@ -333,8 +417,11 @@ func TestIsWriteCapable(t *testing.T) {
 		"read_file", "read_text_file", "list_directory", "list_files",
 		"search_files", "get_file_info", "directory_tree", "read_multiple_files",
 		"list_allowed_directories", "format_text", "confirm_status",
+		"find_files", "task", "task_output", "skill_read",
 		// 智能体内部状态工具：只写自己的待办/记忆，不碰用户文件
 		"todo_write", "memory_append", "memory_read",
+		// 交互/网络类：无文件副作用，plan 模式可用
+		"ask_user", "web_fetch",
 	}
 	for _, n := range read {
 		if IsWriteCapable(n) {
@@ -384,6 +471,257 @@ func TestTodoWrite(t *testing.T) {
 	empty, _ := json.Marshal(map[string]any{"todos": []map[string]string{}})
 	if _, err := execTodoWrite(context.Background(), env, empty); err == nil {
 		t.Fatal("空待办应拒绝")
+	}
+}
+
+// 正则搜索：命中与非法正则报错；结果按文件+行号排序（确定性输出）。
+func TestSearchFilesRegexAndSorting(t *testing.T) {
+	env, ws := testEnv(t)
+	_ = os.WriteFile(filepath.Join(ws, "b.txt"), []byte("id=1\nid=22\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(ws, "a.txt"), []byte("id=3\n"), 0o644)
+
+	// 正则命中
+	re, _ := json.Marshal(map[string]any{"query": `id=\d+`, "regex": true})
+	out, err := execSearchFiles(context.Background(), env, re)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "b.txt:1") || !strings.Contains(out, "b.txt:2") || !strings.Contains(out, "a.txt:1") {
+		t.Fatalf("正则命中不符: %q", out)
+	}
+	// 排序：a.txt 应排在 b.txt 之前，同文件按行号升序
+	if strings.Index(out, "a.txt") > strings.Index(out, "b.txt") {
+		t.Fatalf("输出应按文件排序: %q", out)
+	}
+	if strings.Index(out, "b.txt:1") > strings.Index(out, "b.txt:2") {
+		t.Fatalf("同文件应按行号排序: %q", out)
+	}
+
+	// 非法正则：明确报错而不是静默降级
+	bad, _ := json.Marshal(map[string]any{"query": "id=([", "regex": true})
+	if _, err := execSearchFiles(context.Background(), env, bad); err == nil {
+		t.Fatal("非法正则应报错")
+	}
+}
+
+// find_files：子序列模糊匹配 + 评分排序。
+func TestFindFiles(t *testing.T) {
+	env, ws := testEnv(t)
+	_ = os.MkdirAll(filepath.Join(ws, "src"), 0o755)
+	_ = os.WriteFile(filepath.Join(ws, "src", "user_service.go"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(ws, "src", "user_controller.go"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(ws, "readme.md"), []byte("x"), 0o644)
+
+	// 拼写有出入的缩写也能命中
+	args, _ := json.Marshal(map[string]string{"query": "usrvc"})
+	out, err := execFindFiles(context.Background(), env, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "user_service.go") {
+		t.Fatalf("子序列应命中 user_service.go: %q", out)
+	}
+	// 连续子串的得分应高于散落命中（user_controller 里有 "user_" 边界，但 usrvc 在 service 里也是散落；
+	// 用精确子串查询验证排序稳定性）
+	exact, _ := json.Marshal(map[string]string{"query": "user_service"})
+	out2, err := execFindFiles(context.Background(), env, exact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(out2, "\n")
+	if lines[0] != "src/user_service.go" {
+		t.Fatalf("精确子串应排第一: %q", out2)
+	}
+	// 完全不匹配的查询
+	nope, _ := json.Marshal(map[string]string{"query": "zzzqqq"})
+	out3, err := execFindFiles(context.Background(), env, nope)
+	if err != nil || !strings.Contains(out3, "没有模糊匹配") {
+		t.Fatalf("无匹配应有明确提示: %v %q", err, out3)
+	}
+}
+
+// 后台命令：启动立即返回 task_id → task_output 读输出 → 结束后状态正确；kill 终止运行中的任务。
+func TestBackgroundCommandLifecycle(t *testing.T) {
+	env, ws := testEnv(t)
+
+	// 用 python（白名单默认含 python，脚本跨平台）后台打印并退出；
+	// stdout 与 stderr 都写——验证两条流都进了输出缓冲（曾漏掉 stderr）
+	script := filepath.Join(ws, "bg_echo.py")
+	if err := os.WriteFile(script, []byte("import time, sys\nprint('bg-start', flush=True)\nsys.stderr.write('bg-err-line\\n')\nsys.stderr.flush()\ntime.sleep(0.6)\nprint('bg-end', flush=True)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	start, _ := json.Marshal(map[string]any{
+		"command": "python", "args": []string{script}, "is_background": true,
+	})
+	out, err := execRunCommand(context.Background(), env, start)
+	if err != nil {
+		t.Skipf("本机无 python，跳过: %v", err)
+	}
+	m := regexp.MustCompile(`task_id=(\S+)`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("启动回执应带 task_id: %q", out)
+	}
+	id := m[1]
+
+	// 立即读：应报告运行中（或不稳定地已完成——两种都合法，但不能报错）
+	early, _ := json.Marshal(map[string]any{"task_id": id, "wait_ms": 1200})
+	got, err := execTaskOutput(context.Background(), env, early)
+	if err != nil {
+		t.Fatalf("task_output 不应报错: %v", err)
+	}
+	if !strings.Contains(got, "bg-start") {
+		t.Fatalf("应读到首批输出: %q", got)
+	}
+	// 等待完成后：completed 且含尾部输出
+	done, _ := json.Marshal(map[string]any{"task_id": id, "wait_ms": 3000})
+	got2, err := execTaskOutput(context.Background(), env, done)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got2, "completed") || !strings.Contains(got2, "bg-end") {
+		t.Fatalf("完成后状态/输出不符: %q", got2)
+	}
+	if !strings.Contains(got2, "bg-err-line") {
+		t.Fatalf("stderr 应被捕获进输出缓冲: %q", got2)
+	}
+	// 已结束的任务 kill：提示无需终止
+	kill, _ := json.Marshal(map[string]string{"task_id": id})
+	got3, err := execTaskKill(context.Background(), env, kill)
+	if err != nil || !strings.Contains(got3, "无需终止") {
+		t.Fatalf("kill 已结束任务提示不符: %v %q", err, got3)
+	}
+}
+
+// kill 运行中的任务：进程被终止，状态转为结束。
+func TestBackgroundCommandKill(t *testing.T) {
+	env, ws := testEnv(t)
+	script := filepath.Join(ws, "bg_long.py")
+	if err := os.WriteFile(script, []byte("import time\nprint('long-start', flush=True)\ntime.sleep(30)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	start, _ := json.Marshal(map[string]any{
+		"command": "python", "args": []string{script}, "is_background": true,
+	})
+	out, err := execRunCommand(context.Background(), env, start)
+	if err != nil {
+		t.Skipf("本机无 python，跳过: %v", err)
+	}
+	id := regexp.MustCompile(`task_id=(\S+)`).FindStringSubmatch(out)[1]
+
+	kill, _ := json.Marshal(map[string]string{"task_id": id})
+	got, err := execTaskKill(context.Background(), env, kill)
+	if err != nil || !strings.Contains(got, "已终止") {
+		t.Fatalf("kill 运行中任务失败: %v %q", err, got)
+	}
+	// kill 后读状态：应显示已结束（failed）
+	st, err := execTaskOutput(context.Background(), env, []byte(`{"task_id":"`+id+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(st, "failed") {
+		t.Fatalf("被 kill 的任务应显示 failed: %q", st)
+	}
+}
+
+// task_output / task_kill 参数与未知任务处理。
+func TestTaskOutputErrors(t *testing.T) {
+	env, _ := testEnv(t)
+	if _, err := execTaskOutput(context.Background(), env, nil); err == nil {
+		t.Fatal("缺 task_id 应报错")
+	}
+	_, err := execTaskOutput(context.Background(), env, []byte(`{"task_id":"bg_nope"}`))
+	if err == nil || !strings.Contains(err.Error(), "不存在") {
+		t.Fatalf("未知任务应报错并列出当前任务: %v", err)
+	}
+	if _, err := execTaskKill(context.Background(), env, []byte(`{"task_id":"bg_nope"}`)); err == nil {
+		t.Fatal("kill 未知任务应报错")
+	}
+}
+
+// skill_read：缺 name / 回调缺失报错，回调透传技能名。
+func TestSkillReadTool(t *testing.T) {
+	env := &Env{}
+	args, _ := json.Marshal(map[string]string{"name": "金字塔写作"})
+	if _, err := execSkillRead(context.Background(), env, args); err == nil {
+		t.Fatal("回调未注入时应报错")
+	}
+	if _, err := execSkillRead(context.Background(), env, nil); err == nil {
+		t.Fatal("缺 name 应报错")
+	}
+	env.SkillRead = func(name string) (string, error) {
+		if name != "金字塔写作" {
+			t.Fatalf("技能名透传错误: %q", name)
+		}
+		return "正文内容", nil
+	}
+	if out, err := execSkillRead(context.Background(), env, args); err != nil || out != "正文内容" {
+		t.Fatalf("读取失败: %v %q", err, out)
+	}
+}
+
+// task 子代理工具：参数校验 + 回调透传。
+func TestTaskTool(t *testing.T) {
+	env := &Env{}
+	args, _ := json.Marshal(map[string]string{"prompt": "调研登录实现"})
+	if _, err := execTask(context.Background(), env, args); err == nil {
+		t.Fatal("回调未注入时应报错")
+	}
+	if _, err := execTask(context.Background(), env, nil); err == nil {
+		t.Fatal("缺 prompt 应报错")
+	}
+	bad, _ := json.Marshal(map[string]string{"prompt": "x", "subagent_type": "worker"})
+	if _, err := execTask(context.Background(), env, bad); err == nil {
+		t.Fatal("非法 subagent_type 应报错")
+	}
+	var gotKind, gotPrompt string
+	env.RunSubagent = func(kind, prompt string) (string, error) {
+		gotKind, gotPrompt = kind, prompt
+		return "调研结果：登录在 auth.go:42", nil
+	}
+	if out, err := execTask(context.Background(), env, args); err != nil || !strings.Contains(out, "auth.go") {
+		t.Fatalf("透传失败: %v %q", err, out)
+	}
+	if gotKind != "general-purpose" || gotPrompt != "调研登录实现" {
+		t.Fatalf("默认类型/参数不符: kind=%q prompt=%q", gotKind, gotPrompt)
+	}
+	// 空结果按错误处理
+	env.RunSubagent = func(kind, prompt string) (string, error) { return "  ", nil }
+	if _, err := execTask(context.Background(), env, args); err == nil {
+		t.Fatal("子代理空汇报应报错")
+	}
+}
+
+// SubagentDefs：explore 只留只读、general 全量、task 永远剔除（防递归）。
+func TestSubagentDefs(t *testing.T) {
+	defs := Defs(Builtin())
+	explore := SubagentDefs(defs, "explore")
+	for _, d := range explore {
+		if d.Function.Name == "task" {
+			t.Fatal("子代理工具集不应包含 task（防递归）")
+		}
+		if IsWriteCapable(d.Function.Name) {
+			t.Fatalf("explore 工具集混入写类工具: %s", d.Function.Name)
+		}
+	}
+	names := map[string]bool{}
+	for _, d := range explore {
+		names[d.Function.Name] = true
+	}
+	if !names["list_files"] || !names["read_file"] || !names["search_files"] {
+		t.Fatalf("explore 应保留只读工具: %v", names)
+	}
+	general := SubagentDefs(defs, "general-purpose")
+	haveTask := false
+	for _, d := range general {
+		if d.Function.Name == "task" {
+			haveTask = true
+		}
+	}
+	if haveTask {
+		t.Fatal("general 子代理也不应包含 task")
+	}
+	if len(general) <= len(explore) {
+		t.Fatalf("general 工具集应多于 explore: %d vs %d", len(general), len(explore))
 	}
 }
 

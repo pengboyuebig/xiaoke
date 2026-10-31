@@ -128,6 +128,35 @@ func (s *Store) Read(scope Scope, projectID string) (string, error) {
 	return s.readLocked(path)
 }
 
+// ImportGlobal 批量导入候选记忆（离线整理用）：逐条去重后追加，
+// 返回实际新增条数。行太长/太短/包含敏感样式的行直接跳过。
+func (s *Store) ImportGlobal(candidates []string) (int, error) {
+	added := 0
+	for _, line := range candidates {
+		line = normalizeMemoryText(line)
+		if line == "" || len([]rune(line)) < 4 || len([]rune(line)) > 300 {
+			continue
+		}
+		if strings.ContainsAny(line, "\n") {
+			// 多行候选压成一行（离线整理的输出按行切分，不该再有多行）
+			fields := strings.Fields(line)
+			line = strings.Join(fields, " ")
+		}
+		out, err := s.Append(ScopeGlobal, "", line)
+		if err != nil {
+			if strings.Contains(err.Error(), "已存在") {
+				continue
+			}
+			return added, err
+		}
+		if strings.Contains(out, "已存在") {
+			continue // 幂等跳过，不计入新增
+		}
+		added++
+	}
+	return added, nil
+}
+
 // WriteGlobal 整体覆写全局记忆（设置页编辑入口）。项目记忆只经工具增量维护。
 func (s *Store) WriteGlobal(content string) error {
 	s.mu.Lock()

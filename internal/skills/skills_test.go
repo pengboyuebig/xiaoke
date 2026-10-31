@@ -135,3 +135,52 @@ func TestAssemblyCacheInvalidation(t *testing.T) {
 		t.Fatalf("Delete 后装配应为空: %q", out)
 	}
 }
+
+// 按需加载：清单只含名字+描述（不含正文），ContentByName 只给启用技能的正文。
+func TestListingAndContentByName(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "skills.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(Skill{Name: "技能甲", Description: "结构化表达", Content: "甲的完整方法论正文", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := s.Create(Skill{Name: "技能乙", Description: "已停用", Content: "乙的正文", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Toggle(disabled.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	listing := s.Listing()
+	if !strings.Contains(listing, "技能甲") || !strings.Contains(listing, "结构化表达") {
+		t.Fatalf("清单应含启用的技能: %q", listing)
+	}
+	if strings.Contains(listing, "甲的完整方法论正文") {
+		t.Fatal("清单不应包含正文（正文按需加载）")
+	}
+	if strings.Contains(listing, "技能乙") {
+		t.Fatal("停用技能不应出现在清单")
+	}
+
+	// 读取正文
+	body, err := s.ContentByName("技能甲")
+	if err != nil || !strings.Contains(body, "甲的完整方法论") {
+		t.Fatalf("读取正文失败: %v %q", err, body)
+	}
+	// 禁用读不到
+	if _, err := s.ContentByName("技能乙"); err == nil {
+		t.Fatal("禁用技能应读不到")
+	}
+	// 不存在时报错并列出可用技能名
+	_, err = s.ContentByName("不存在的技能")
+	if err == nil || !strings.Contains(err.Error(), "技能甲") {
+		t.Fatalf("报错应列出可用技能: %v", err)
+	}
+	// 空仓库
+	empty, _ := Open(filepath.Join(t.TempDir(), "empty.json"))
+	if out := empty.Listing(); out != "" {
+		t.Fatalf("无技能时清单应为空: %q", out)
+	}
+}

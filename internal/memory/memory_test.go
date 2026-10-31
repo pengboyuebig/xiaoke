@@ -139,6 +139,30 @@ func TestNormalizeStripsZeroWidth(t *testing.T) {
 	}
 }
 
+// ImportGlobal：逐条去重导入、过滤太短/太长的行、返回真实新增数。
+func TestImportGlobal(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(filepath.Join(dir, "memory"))
+	added, err := s.ImportGlobal([]string{
+		"用户偏好简洁回复",                // 新增
+		"用户偏好简洁回复",                // 重复：不计
+		"项目 X 用 npm run build 构建", // 新增
+		"短",                       // 太短：跳过
+		strings.Repeat("长", 400),  // 太长：跳过
+		"",                        // 空：跳过
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added != 2 {
+		t.Fatalf("应新增 2 条，got %d", added)
+	}
+	got, _ := s.Read(ScopeGlobal, "")
+	if strings.Count(got, "用户偏好简洁回复") != 1 || !strings.Contains(got, "npm run build") {
+		t.Fatalf("导入结果不符: %q", got)
+	}
+}
+
 func TestWriteGlobalOverwrites(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := Open(filepath.Join(dir, "memory"))

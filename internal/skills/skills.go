@@ -205,8 +205,72 @@ func (s *Store) Delete(id string) error {
 // 还挤掉真正的对话历史。
 const maxAssemblyBytes = 16 * 1024
 
+// maxListingBytes 是技能清单（按需加载模式）注入上下文的字节上限。
+// 清单只有名字+一句话描述，几十个技能也远用不满。
+const maxListingBytes = 4 * 1024
+
+// Listing 返回启用技能的清单（名字 + 一句话描述，一行一条），供常驻注入。
+//
+// 对标主流 agent 的 skills 按需加载：正文常驻（旧行为，16KB 上限）会在技能
+// 多起来后挤占任务上下文；清单常驻的成本是 KB 级，正文由模型用 skill_read
+// 工具在与任务相关时按需读取。无启用技能返回空串。
+func (s *Store) Listing() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var b strings.Builder
+	budget := maxListingBytes
+	for _, it := range s.items {
+		if !it.Enabled {
+			continue
+		}
+		line := fmt.Sprintf("\n- %s：%s", it.Name, strings.TrimSpace(it.Description))
+		if strings.TrimSpace(it.Description) == "" {
+			line = fmt.Sprintf("\n- %s", it.Name)
+		}
+		if len(line) > budget {
+			b.WriteString("\n（更多技能未列入清单，可用 skill_read 按名字读取）")
+			break
+		}
+		budget -= len(line)
+		b.WriteString(line)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// ContentByName 返回指定「启用」技能的完整正文（skill_read 工具的读取入口）。
+// 禁用的技能读不到——开关同时是按需加载的准入控制。
+func (s *Store) ContentByName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, it := range s.items {
+		if it.Name == name {
+			if !it.Enabled {
+				return "", fmt.Errorf("技能「%s」已停用：请用户在设置里启用后再用", name)
+			}
+			if strings.TrimSpace(it.Content) == "" {
+				return "", fmt.Errorf("技能「%s」没有正文", name)
+			}
+			return it.Content, nil
+		}
+	}
+	// 不存在时报错列出可用名字，模型一轮就能自纠
+	var names []string
+	for _, it := range s.items {
+		if it.Enabled {
+			names = append(names, it.Name)
+		}
+	}
+	if len(names) == 0 {
+		return "", fmt.Errorf("没有启用的技能（名称需精确匹配）")
+	}
+	return "", fmt.Errorf("没有叫「%s」的技能；可用的有：%s", name, strings.Join(names, "、"))
+}
+
 // Assembly 返回注入系统提示词的技能正文（仅启用的）；无启用技能返回空串。
 // 超过上限时按顺序装载，放不下的技能截断并标注——排在前面的优先。
+//
+// 已被 Listing（清单注入 + skill_read 按需加载）取代，保留供导出/调试。
 func (s *Store) Assembly() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()

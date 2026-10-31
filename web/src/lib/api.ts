@@ -13,6 +13,7 @@ import type {
   Todo,
   TrashItem,
   TreeItem,
+  Automation,
 } from '../types'
 
 /** 一次对话的 token 用量（上游真实 usage 优先，缺失时后端按字节估算） */
@@ -57,6 +58,8 @@ export interface ChatOptions {
   onToolResult?: (info: { id: string; name: string; ok: boolean; preview: string; error?: string; ms: number }) => void
   /** 待办清单更新（todo_write 工具执行成功后推送） */
   onTodo?: (todos: Todo[]) => void
+  /** ask_user 提问 / ask 模式审批：返回的 Promise 在用户作答后 resolve */
+  onAsk?: (req: { id: string; kind: 'question' | 'permission'; question?: string; options?: string[]; multiSelect?: boolean; tool?: string; summary?: string }) => Promise<string>
   /** 对话结束：携带本次累计的 token 用量 */
   onDone?: (usage?: UsageInfo) => void
 }
@@ -174,7 +177,24 @@ export const api = {
     return jfetch('/api/mcp/retry', { method: 'POST' })
   },
 
+  // ---------- 定时任务 ----------
+  listAutomations(): Promise<{ items: Automation[] }> {
+    return jfetch('/api/automations')
+  },
+  createAutomation(a: { title: string; cron: string; prompt: string; projectId?: string; maxRuns?: number }): Promise<Automation> {
+    return jfetch('/api/automations', jsonBody('POST', a))
+  },
+  updateAutomation(id: string, patch: { title?: string; cron?: string; prompt?: string; maxRuns?: number; enabled?: boolean }): Promise<Automation> {
+    return jfetch(`/api/automations/${encodeURIComponent(id)}`, jsonBody('PUT', patch))
+  },
+  deleteAutomation(id: string): Promise<{ ok: string }> {
+    return jfetch(`/api/automations/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  },
+
   // ---------- 长期记忆（全局层；项目记忆由模型经工具维护） ----------
+  answerQuestion(qid: string, answer: string): Promise<{ ok: string }> {
+    return jfetch(`/api/questions/${encodeURIComponent(qid)}`, jsonBody('POST', { answer }))
+  },
   getMemory(): Promise<{ content: string }> {
     return jfetch('/api/memory')
   },
@@ -259,6 +279,31 @@ export const api = {
                   case 'todo':
                     opts.onTodo?.((evt.todos as Todo[]) || [])
                     break
+                  case 'ask': {
+                    if (opts.onAsk) {
+                      const answer = await opts.onAsk({
+                        id: (evt.id as string) || '',
+                        kind: (evt.kind as 'question' | 'permission') || 'question',
+                        question: evt.question as string | undefined,
+                        options: evt.options as string[] | undefined,
+                        multiSelect: evt.multi_select as boolean | undefined,
+                        tool: evt.tool as string | undefined,
+                        summary: evt.summary as string | undefined,
+                      })
+                      // 答案投回后端（工具侧的 AskWait 已在 Promise resolve 时继续，
+                      // 这里 POST 只是通知前端意图持久化；失败不阻断对话）
+                      try {
+                        await fetch(`/api/questions/${encodeURIComponent((evt.id as string) || '')}`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ answer }),
+                        })
+                      } catch {
+                        /* 超时失效由后端超时语义兜底 */
+                      }
+                    }
+                    break
+                  }
                   case 'error':
                     throw new Error((evt.error as string) || '未知错误')
                   case 'done': {

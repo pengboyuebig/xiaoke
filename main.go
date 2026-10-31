@@ -21,6 +21,7 @@ import (
 	"xiaoke/internal/api"
 	"xiaoke/internal/chat"
 	"xiaoke/internal/config"
+	"xiaoke/internal/cron"
 	"xiaoke/internal/mcp"
 	"xiaoke/internal/memory"
 	"xiaoke/internal/persona"
@@ -100,14 +101,23 @@ func main() {
 		log.Fatalf("初始化长期记忆失败: %v", err)
 	}
 	rulesStore := rules.New()
+	cronStore, err := cron.Open(filepath.Join(cfg.DataDir, "automations.json"))
+	if err != nil {
+		log.Fatalf("初始化定时任务失败: %v", err)
+	}
 
 	// 自动备份：启动时立即备份一份，之后每 24 小时一次，只保留最近 14 份。
 	// 备份失败只记日志，不影响服务启动。
 	go autoBackup(st, filepath.Join(cfg.DataDir, "backups"))
 
 	mux := http.NewServeMux()
-	chatHandler := chat.NewHandler(cfg, st, setStore, projectsMgr, mcpMgr, agentsStore, skillsStore, memStore, rulesStore)
+	chatHandler := chat.NewHandler(cfg, st, setStore, projectsMgr, mcpMgr, agentsStore, skillsStore, memStore, rulesStore, cronStore)
 	chatHandler.Register(mux)
+	// 长期记忆离线整理（对标 autoDream）：每 24 小时把近期会话蒸馏成记忆条目
+	//（真实模型模式才生效；mock/无 Key 自动跳过）。
+	chatHandler.StartDreamLoop()
+	// 定时任务调度器：每 30s 领取到期任务，无人值守执行（build 模式）。
+	chatHandler.StartAutomationLoop()
 	res := &api.Resources{
 		Agents: agentsStore, Skills: skillsStore,
 		AvatarsDir: "avatars", AssetsDir: cfg.AssetsDir,

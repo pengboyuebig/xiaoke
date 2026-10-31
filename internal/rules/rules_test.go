@@ -78,6 +78,33 @@ func TestSingleFileTruncation(t *testing.T) {
 	}
 }
 
+// 子目录规则文件也会被发现（深度 ≤2），浅层在前、深层在后；依赖目录不扫。
+func TestDiscoverNested(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "web", "src"), 0o755)
+	os.MkdirAll(filepath.Join(root, "node_modules", "x"), 0o755)
+	os.MkdirAll(filepath.Join(root, "too", "deep", "er"), 0o755)
+	os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("根级规则"), 0o644)
+	os.WriteFile(filepath.Join(root, "web", "CLAUDE.md"), []byte("web 层规则"), 0o644)
+	os.WriteFile(filepath.Join(root, "web", "src", "AGENTS.md"), []byte("src 层规则"), 0o644)
+	os.WriteFile(filepath.Join(root, "node_modules", "x", "AGENTS.md"), []byte("依赖目录不应出现"), 0o644)
+	os.WriteFile(filepath.Join(root, "too", "deep", "er", "AGENTS.md"), []byte("超深不应出现"), 0o644)
+
+	s := New()
+	out := s.Discover([]string{root})
+	if !strings.Contains(out, "根级规则") || !strings.Contains(out, "web 层规则") || !strings.Contains(out, "src 层规则") {
+		t.Fatalf("浅层与深层规则都应注入: %q", out)
+	}
+	if strings.Contains(out, "依赖目录") || strings.Contains(out, "超深") {
+		t.Fatalf("依赖目录与超深目录不应扫描: %q", out)
+	}
+	// 浅层在前、深层在后
+	if strings.Index(out, "根级规则") > strings.Index(out, "web 层规则") ||
+		strings.Index(out, "web 层规则") > strings.Index(out, "src 层规则") {
+		t.Fatalf("注入应浅→深: %q", out)
+	}
+}
+
 func TestCacheInvalidatesOnMtime(t *testing.T) {
 	root := t.TempDir()
 	p := filepath.Join(root, "AGENTS.md")

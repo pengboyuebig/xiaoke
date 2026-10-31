@@ -15,7 +15,7 @@ func TestBuildStructure(t *testing.T) {
 		ProjectPath:    "D:/work/test",
 		ReadDirs:       []string{"D:/other"},
 		ToolsAvailable: true,
-		SkillsAssembly: "\n\n【技能：测试】测试技能正文",
+		SkillsListing:  "- 测试技能：一句话用途",
 		Instructions:   "【当前为开发模式（Build Mode）】",
 	})
 	// 人格在前，签名铁律必须保留
@@ -29,9 +29,9 @@ func TestBuildStructure(t *testing.T) {
 	if !strings.Contains(out, "今天是 ") || !strings.Contains(out, "星期") {
 		t.Fatal("缺少日期锚点")
 	}
-	// 技能区有说明头
-	if !strings.Contains(out, "【已启用技能】") {
-		t.Fatal("技能区缺少说明头")
+	// 技能清单区有说明头 + 按需加载指引
+	if !strings.Contains(out, "【可用技能】") || !strings.Contains(out, "skill_read") {
+		t.Fatal("技能清单区缺少说明头或按需加载指引")
 	}
 	// 项目上下文与只读目录
 	if !strings.Contains(out, "当前项目：测试项目") || !strings.Contains(out, "D:/other") {
@@ -40,6 +40,25 @@ func TestBuildStructure(t *testing.T) {
 	// 补充指令在最后
 	if !strings.HasSuffix(strings.TrimSpace(out), "Build Mode）】") {
 		t.Fatalf("补充指令应在末尾: %q", out[len(out)-60:])
+	}
+}
+
+// 规则文件与长期记忆段：有内容才注入，空串不产生空段。
+func TestBuildRulesAndMemory(t *testing.T) {
+	out := Build(Request{
+		AgentName: "小柯",
+		Rules:     "## 来自 /proj/AGENTS.md\n构建命令：npm run build",
+		Memory:    "【全局记忆】\n- 用户偏好简洁回复",
+	})
+	if !strings.Contains(out, "【项目规则】") || !strings.Contains(out, "npm run build") {
+		t.Fatalf("规则段缺失: %q", out)
+	}
+	if !strings.Contains(out, "【长期记忆】") || !strings.Contains(out, "用户偏好简洁回复") {
+		t.Fatalf("记忆段缺失: %q", out)
+	}
+	bare := Build(Request{AgentName: "小柯"})
+	if strings.Contains(bare, "【项目规则】") || strings.Contains(bare, "【长期记忆】") || strings.Contains(bare, "【可用技能】") {
+		t.Fatal("空内容不应产生空段")
 	}
 }
 

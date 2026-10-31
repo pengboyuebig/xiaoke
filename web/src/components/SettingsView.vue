@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../lib/api'
-import type { Agent, MCPServerCfg, MCPStatus, SettingsView, Skill, TrashItem } from '../types'
+import type { Agent, Automation, MCPServerCfg, MCPStatus, SettingsView, Skill, TrashItem } from '../types'
 import AgentSection from './AgentSection.vue'
 import SkillSection from './SkillSection.vue'
 import Icon from './Icon.vue'
@@ -30,6 +30,9 @@ const agents = ref<Agent[]>([])
 const skills = ref<Skill[]>([])
 const mcpStatuses = ref<MCPStatus[]>([])
 const trashItems = ref<TrashItem[]>([])
+const automations = ref<Automation[]>([])
+const autoBusy = ref('')
+const newAuto = reactive({ title: '', cron: '', prompt: '' })
 const trashBusy = ref('')
 
 const form = reactive({
@@ -63,7 +66,7 @@ const testing = ref(false)
 const tabMeta = computed(() => TABS.find((t) => t.id === tab.value))
 
 onMounted(async () => {
-  await Promise.all([loadSettings(), refreshAgents(), refreshSkills(), refreshMcpStatus(), refreshTrash(), loadMemory()])
+  await Promise.all([loadSettings(), refreshAgents(), refreshSkills(), refreshMcpStatus(), refreshTrash(), loadMemory(), refreshAutomations()])
   loading.value = false
 })
 
@@ -75,6 +78,57 @@ async function loadMemory() {
     /* 记忆加载失败不阻塞设置页 */
   }
 }
+
+async function refreshAutomations() {
+  try {
+    automations.value = (await api.listAutomations()).items
+  } catch {
+    automations.value = []
+  }
+}
+async function createAutomation() {
+  if (!newAuto.title.trim() || !newAuto.cron.trim() || !newAuto.prompt.trim()) return
+  autoBusy.value = 'create'
+  try {
+    await api.createAutomation({ title: newAuto.title.trim(), cron: newAuto.cron.trim(), prompt: newAuto.prompt.trim() })
+    newAuto.title = newAuto.cron = newAuto.prompt = ''
+    await refreshAutomations()
+    showToast('定时任务已创建 ✓')
+  } catch (e) {
+    saveErr.value = (e as Error).message
+  } finally {
+    autoBusy.value = ''
+  }
+}
+async function toggleAutomation(a: Automation) {
+  autoBusy.value = a.id
+  try {
+    await api.updateAutomation(a.id, { enabled: !a.enabled })
+    await refreshAutomations()
+  } catch (e) {
+    saveErr.value = (e as Error).message
+  } finally {
+    autoBusy.value = ''
+  }
+}
+async function deleteAutomation(a: Automation) {
+  const ok = await askConfirm({
+    title: `删除定时任务「${a.title}」`,
+    message: '删除后不再执行，且立即释放名额。',
+    confirmText: '删除',
+  })
+  if (!ok) return
+  autoBusy.value = a.id
+  try {
+    await api.deleteAutomation(a.id)
+    await refreshAutomations()
+  } catch (e) {
+    saveErr.value = (e as Error).message
+  } finally {
+    autoBusy.value = ''
+  }
+}
+const fmtTime = (t?: string) => (t ? new Date(t).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-')
 
 async function saveMemory() {
   saving.value = true
@@ -608,6 +662,41 @@ async function save() {
                 <span v-if="form.memoryText" class="hint-inline">{{ form.memoryText.length }} 字符</span>
               </div>
             </div>
+
+            <div class="card">
+              <div class="card-title">定时任务（{{ automations.length }}/20）</div>
+              <div class="hint">
+                按 cron 表达式（本地时区，5 段：分 时 日 月 周）无人值守执行一段指令，
+                每次运行新建独立会话；小柯也可以在对话里自己创建。构建/部署提醒、定时汇总都是典型用法。
+              </div>
+              <div v-if="automations.length" class="auto-list">
+                <div v-for="a in automations" :key="a.id" class="auto-row" :class="{ off: !a.enabled }">
+                  <div class="auto-main">
+                    <b>{{ a.title }}</b>
+                    <code>{{ a.cron }}</code>
+                    <span class="hint-inline">
+                      已运行 {{ a.runCount }} 次 · 下次 {{ fmtTime(a.nextRunAt) }}
+                      <template v-if="a.lastError"> · ⚠ {{ a.lastError.slice(0, 40) }}</template>
+                    </span>
+                  </div>
+                  <div class="auto-ops">
+                    <button class="ab-btn ghost" :disabled="autoBusy === a.id" @click="toggleAutomation(a)">
+                      {{ a.enabled ? '停用' : '启用' }}
+                    </button>
+                    <button class="ab-btn danger" :disabled="autoBusy === a.id" @click="deleteAutomation(a)">删除</button>
+                  </div>
+                </div>
+              </div>
+              <p v-else class="hint-inline">还没有定时任务。</p>
+              <div class="auto-new">
+                <input v-model="newAuto.title" class="inp" placeholder="任务名（如「每天早上9点汇总待办」）" />
+                <input v-model="newAuto.cron" class="inp" placeholder="cron 表达式，如 0 9 * * * 或 */30 * * * *" />
+                <textarea v-model="newAuto.prompt" class="inp" rows="2" placeholder="每次触发执行的指令（自包含）"></textarea>
+                <button class="btn primary" :disabled="autoBusy === 'create' || !newAuto.title || !newAuto.cron || !newAuto.prompt" @click="createAutomation">
+                  {{ autoBusy === 'create' ? '创建中…' : '创建任务' }}
+                </button>
+              </div>
+            </div>
           </div>
 
           <div class="card backup-card">
@@ -1080,6 +1169,43 @@ textarea.inp {
   font-size: 10.5px;
   color: var(--text-faint);
 }
+
+/* 定时任务管理 */
+.auto-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.auto-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.auto-row.off { opacity: 0.55; }
+.auto-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+}
+.auto-main code {
+  font-size: 11.5px;
+  color: var(--accent);
+}
+.auto-ops { display: flex; gap: 6px; }
+.auto-new {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.auto-new .btn { align-self: flex-start; }
 
 /* MCP */
 .mcp-card {

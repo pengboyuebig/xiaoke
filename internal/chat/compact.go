@@ -126,13 +126,19 @@ func maybeCompact(
 	view := splitBySummary(sess.Messages, sess.Summary, sess.SummaryUpTo)
 
 	// 触发条件：条数永远不作为依据（上游真正限制的是 token）。
-	//   - 配置了 ContextWindow：按 token 水位（bytes/4 估算，贴近上游真实约束）
+	//   - 配置了 ContextWindow 且本会话已有用量记录：按 LastPromptTokens 触发
+	//     （上游返回的真实值，最贴近约束；没有则按 bytes/4 估算）
 	//   - 未配置：退回字节水位（256KB 预算），行为与旧版一致
 	//   - 冷却与失败重试间隔由 compactLastTry 统一控制
 	recentBytes := historyBytes(view.Recent)
 	triggered := false
 	if contextWindow > 0 {
-		triggered = estimateTokens(recentBytes) >= int64(contextWindow)*compactTriggerRatio/100
+		threshold := int64(contextWindow) * compactTriggerRatio / 100
+		if sess.LastPromptTokens > 0 {
+			triggered = sess.LastPromptTokens >= threshold
+		} else {
+			triggered = estimateTokens(recentBytes) >= threshold
+		}
 	} else {
 		triggered = byteBudget > 0 && recentBytes >= byteBudget*compactTriggerRatio/100
 	}

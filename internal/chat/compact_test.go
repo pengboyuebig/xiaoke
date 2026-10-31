@@ -291,6 +291,64 @@ func TestCompactTokenWatermark(t *testing.T) {
 	}
 }
 
+// 真实 usage 触发：LastPromptTokens 有值时优先于字节估算。
+func TestCompactTriggeredByRealUsage(t *testing.T) {
+	st, _ := store.New(t.TempDir())
+	sess, _ := st.Create("真实usage", "")
+	base := time.Now()
+	// 材料过 1KB 门槛（12 条 ~100B），但 bytes/4 估算 ≈ 300 token 远低于水位；
+	// 触发只能来自上一次请求的真实 prompt tokens
+	for i := 0; i < 6; i++ {
+		_ = st.Append(sess.ID, store.Message{Role: "user", Content: strings.Repeat("消", 50), CreatedAt: base})
+		_ = st.Append(sess.ID, store.Message{Role: "assistant", Content: strings.Repeat("回", 40), CreatedAt: base})
+	}
+	_ = st.AddUsage(sess.ID, 9000, 100) // LastPromptTokens=9000
+	full, _ := st.Get(sess.ID)
+	if full.LastPromptTokens != 9000 {
+		t.Fatalf("前置：LastPromptTokens 应落库: %d", full.LastPromptTokens)
+	}
+	compactLastTry = map[string]time.Time{}
+	calls := 0
+	// 窗口 10000 → 水位 7000：真实 usage 9000 ≥ 7000 应触发
+	view := maybeCompact(context.Background(), st, full, 4, 256*1024, testSummarizer(&calls, goodSummary), config.LLMConfig{}, 10000)
+	if calls == 0 || view.Summary == "" {
+		t.Fatalf("真实 usage 超水位应触发压缩: calls=%d", calls)
+	}
+	// 对照：真实 usage 不足时不触发（字节估算同样不足）
+	_ = st.AddUsage(sess.ID, 100, 10)
+	compactLastTry = map[string]time.Time{}
+	full2, _ := st.Get(sess.ID)
+	calls2 := 0
+	maybeCompact(context.Background(), st, full2, 4, 256*1024, testSummarizer(&calls2, goodSummary), config.LLMConfig{}, 10000)
+	if calls2 != 0 {
+		t.Fatalf("真实 usage 不足时不应触发，calls=%d", calls2)
+	}
+}
+
+// todo 提醒：显式编号步骤 / ≥3 个连接词 且没有待办才提醒；已有待办不打扰。
+func TestTodoNudgeHeuristic(t *testing.T) {
+	numbered := "帮我做三件事：\n1. 调研\n2. 实现\n3. 测试"
+	if !planOrBuildNeedsNudge(numbered, nil) {
+		t.Fatal("编号步骤应触发提醒")
+	}
+	chained := "先帮我调研一下这个项目，然后写实现，接着补测试，最后更新文档，再帮我跑一遍构建"
+	if !planOrBuildNeedsNudge(chained, nil) {
+		t.Fatal("多连接词应触发提醒")
+	}
+	// 已有待办：不再打扰
+	if planOrBuildNeedsNudge(numbered, []store.Todo{{Content: "x", Status: "pending"}}) {
+		t.Fatal("已有待办不应提醒")
+	}
+	// 单步请求：不打扰
+	if planOrBuildNeedsNudge("帮我看看这个报错是什么意思", nil) {
+		t.Fatal("单步请求不应提醒")
+	}
+	// 两个连接词：不到阈值
+	if planOrBuildNeedsNudge("先调研，然后实现，看看再说", nil) {
+		t.Fatal("连接词不足 3 个不应提醒")
+	}
+}
+
 // 退化摘要：第一次输出过短判退化 → 重试成功。
 func TestCompactDegenerateRetry(t *testing.T) {
 	st, _ := store.New(t.TempDir())

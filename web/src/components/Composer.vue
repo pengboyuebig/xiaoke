@@ -6,7 +6,7 @@ const emit = defineEmits<{
   send: [content: string]
   stop: []
   'update:reasoning': [v: string]
-  setMode: [m: 'plan' | 'build']
+  setMode: [m: 'plan' | 'build' | 'ask']
 }>()
 
 const text = ref('')
@@ -58,7 +58,8 @@ watch(text, (v) => saveDraft(props.sessionId, v))
 const modeMenuOpen = ref(false)
 const modeWrap = ref<HTMLElement | null>(null)
 const isPlan = () => props.mode === 'plan'
-function pickMode(m: 'plan' | 'build') {
+const isAsk = () => props.mode === 'ask'
+function pickMode(m: 'plan' | 'build' | 'ask') {
   emit('setMode', m)
   modeMenuOpen.value = false
 }
@@ -123,7 +124,15 @@ function onLevelChange(e: Event) {
             </span>
             <span v-if="isPlan()" class="mo-check"><Icon name="check" :size="13" /></span>
           </button>
-          <button class="mode-opt" :class="{ active: !isPlan() }" @click="pickMode('build')">
+          <button class="mode-opt" :class="{ active: isAsk() }" @click="pickMode('ask')">
+            <span class="mo-icon"><Icon name="lock" :size="16" /></span>
+            <span class="mo-text">
+              <b>询问模式</b>
+              <i>每一步写操作都先征求你的批准</i>
+            </span>
+            <span v-if="isAsk()" class="mo-check"><Icon name="check" :size="13" /></span>
+          </button>
+          <button class="mode-opt" :class="{ active: !isPlan() && !isAsk() }" @click="pickMode('build')">
             <span class="mo-icon"><Icon name="build" :size="16" /></span>
             <span class="mo-text">
               <b>开发模式</b>
@@ -134,12 +143,12 @@ function onLevelChange(e: Event) {
         </div>
         <button
           class="mode-btn"
-          :class="isPlan() ? 'plan' : 'build'"
-          :title="isPlan() ? '计划模式：先调研再开发（点击切换）' : '开发模式：完整能力（点击切换）'"
+          :class="isPlan() ? 'plan' : isAsk() ? 'plan' : 'build'"
+          :title="isPlan() ? '计划模式：先调研再开发（点击切换）' : isAsk() ? '询问模式：每步写操作先征批（点击切换）' : '开发模式：完整能力（点击切换）'"
           @click="modeMenuOpen = !modeMenuOpen"
         >
-          <span class="mb-icon"><Icon :name="isPlan() ? 'plan' : 'build'" :size="15" /></span>
-          <span class="mb-label">{{ isPlan() ? '计划' : '开发' }}</span>
+          <span class="mb-icon"><Icon :name="isPlan() ? 'plan' : isAsk() ? 'lock' : 'build'" :size="15" /></span>
+          <span class="mb-label">{{ isPlan() ? '计划' : isAsk() ? '询问' : '开发' }}</span>
         </button>
       </div>
 
@@ -149,6 +158,8 @@ function onLevelChange(e: Event) {
         rows="1"
         :placeholder="props.mode === 'plan'
           ? '计划模式：告诉小柯要调研什么，先出计划再开发…（Enter 发送）'
+          : props.mode === 'ask'
+          ? '询问模式：每步写操作都会先征求你的批准…（Enter 发送）'
           : '问问小柯…（Enter 发送，Shift+Enter 换行）'"
         @keydown="onKeydown"
       ></textarea>

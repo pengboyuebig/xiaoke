@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -58,16 +59,29 @@ var toolReadFile = Tool{
 
 var toolEditFile = Tool{
 	Name:        "edit_file",
-	Description: "对工作区内已有文件做精确替换编辑：用 old_string 定位（必须唯一匹配）并替换为 new_string。修改文件优先用它，只传改动片段，不要用 write_file 重写整个文件。",
+	Description: "对工作区内已有文件做精确替换编辑：用 old_string 定位（必须唯一匹配）并替换为 new_string。修改文件优先用它，只传改动片段，不要用 write_file 重写整个文件。多处修改可传 edits 数组一次完成（任一处失败则整批不落盘）。",
 	Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
     "path": {"type": "string", "description": "文件相对路径（相对项目根）"},
     "old_string": {"type": "string", "description": "要被替换的原文片段，必须与文件内容逐字符一致（含缩进）"},
     "new_string": {"type": "string", "description": "替换后的新片段；删除内容时传空串"},
-    "replace_all": {"type": "boolean", "description": "true 时替换全部匹配，默认 false（仅允许唯一匹配）"}
+    "replace_all": {"type": "boolean", "description": "true 时替换全部匹配，默认 false（仅允许唯一匹配）"},
+    "edits": {
+      "type": "array",
+      "description": "批量编辑（与单编辑二选一）：全部校验通过才一次性写入，任一处失败整批拒绝",
+      "items": {
+        "type": "object",
+        "properties": {
+          "old_string": {"type": "string"},
+          "new_string": {"type": "string"},
+          "replace_all": {"type": "boolean"}
+        },
+        "required": ["old_string", "new_string"]
+      }
+    }
   },
-  "required": ["path", "old_string", "new_string"]
+  "required": ["path"]
 }`),
 	Execute: execEditFile,
 }
@@ -87,17 +101,32 @@ var toolWriteFile = Tool{
 }
 
 var toolSearchFiles = Tool{
-	Description: "在工作区内做全文搜索（大小写不敏感的子串匹配），返回「文件:行号: 内容」列表（≤100 条）。忽略 node_modules/.git 等目录和大于 1MB 的文件。",
+	Description: "在工作区内做全文搜索，返回「文件:行号: 内容」列表（≤100 条，按文件与行号排序）。默认大小写不敏感的子串匹配；regex=true 时按正则匹配（Go 语法，大小写敏感）。忽略 node_modules/.git 等目录和大于 1MB 的文件。",
 	Name:        "search_files",
 	Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
-    "query": {"type": "string", "description": "搜索关键词"},
-    "path": {"type": "string", "description": "搜索起点，默认工作区根"}
+    "query": {"type": "string", "description": "搜索关键词或正则表达式"},
+    "path": {"type": "string", "description": "搜索起点，默认工作区根"},
+    "regex": {"type": "boolean", "description": "true = query 按正则解析（默认 false）"}
   },
   "required": ["query"]
 }`),
 	Execute: execSearchFiles,
+}
+
+var toolFindFiles = Tool{
+	Description: "按名字模糊找文件（适合记不清确切名字/拼写有出入的场景）：对工作区内相对路径做子序列评分排序，返回最像的 top 20。知道确切路径用 list_files；找文件内容用 search_files。",
+	Name:        "find_files",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "query": {"type": "string", "description": "文件名片段（子序列匹配，如 usrvc 能找到 user_service.go）"},
+    "path": {"type": "string", "description": "搜索起点，默认工作区根"}
+  },
+  "required": ["query"]
+}`),
+	Execute: execFindFiles,
 }
 
 var toolMemoryAppend = Tool{
@@ -150,19 +179,163 @@ var toolTodoWrite = Tool{
 	Execute: execTodoWrite,
 }
 
+var toolTask = Tool{
+	Name:        "task",
+	Description: "派一个子代理独立完成子任务并把结果汇报给你。适用：大范围代码调研、多文件分析、可以拆出去的独立子任务。\nAgent types:\n- explore: 只读调研（list/read/search/memory_read），适合找实现、摸清结构、汇总现状；多个 explore 可并行派出（最多 2 个同时跑）\n- general-purpose: 完整工具（含写文件与命令），适合需要动手的执行类任务；同一时刻只跑一个，且与其它 general-purpose 互斥\n用法注意：prompt 必须自包含（子代理看不到本会话历史，把背景、目标、期望的汇报格式写全）。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "prompt": {"type": "string", "description": "给子代理的完整任务说明（自包含：背景 + 目标 + 汇报要求）"},
+    "subagent_type": {"type": "string", "enum": ["general-purpose", "explore"], "description": "子代理类型，默认 general-purpose"},
+    "description": {"type": "string", "description": "一句话说明这个子任务是什么（给自己和用户看）"}
+  },
+  "required": ["prompt"]
+}`),
+	Execute: execTask,
+}
+
+var toolSkillRead = Tool{
+	Name:        "skill_read",
+	Description: "读取一个已启用技能的完整方法论（系统提示词里只有技能清单）。当清单里有技能与当前任务相关时，先读它的正文再动手；与任务无关的技能不要读。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "name": {"type": "string", "description": "技能名，需与清单里的名字精确一致"}
+  },
+  "required": ["name"]
+}`),
+	Execute: execSkillRead,
+}
+
+var toolWebFetch = Tool{
+	Name:        "web_fetch",
+	Description: "抓取公网网页并转为纯文本（HTML 自动剥标签，JSON/纯文本原样返回；30 秒超时，正文上限 16KB）。跨主机重定向不会自动跟随，会返回目标地址让你显式确认。仅支持 http/https 公网地址；本地地址或内网服务不可用。适合：查文档、读在线文章、验证 API 返回。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "url": {"type": "string", "description": "要抓取的 http/https 地址"}
+  },
+  "required": ["url"]
+}`),
+	Execute: execWebFetch,
+}
+
+var toolAskUser = Tool{
+	Name:        "ask_user",
+	Description: "向用户提问并等待回答。仅用于「卡在真正需要用户拍板的选择」上：方案二选一、需求不明确的关键分歧。不要用它问「我可以继续吗」这类自己能决定的事。给 2-4 个选项时用户可单选/多选，也可以自由输入；不给选项就是开放式提问。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "question": {"type": "string", "description": "完整、具体的问题（用户看不到对话历史之外任何上下文）"},
+    "options": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "候选选项（2-4 个，可省略 = 开放式提问）；推荐项放第一个并在末尾注明（推荐）"
+    },
+    "multi_select": {"type": "boolean", "description": "true = 允许多选（默认单选）"}
+  },
+  "required": ["question"]
+}`),
+	Execute: execAskUser,
+}
+
+var toolCronCreate = Tool{
+	Name:        "cron_create",
+	Description: "创建定时任务：按 cron 表达式（用户本地时区）或一次性延迟，定期无人值守执行一段 prompt（每次运行会新建一个会话）。标准 5 段表达式（分 时 日 月 周），支持 */n、列表、区间；不支持秒级与 @宏。相对延迟（delay_minutes）绝不能换算成绝对 cron 时间。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "title": {"type": "string", "description": "任务名（展示给用户，保留用户的自然语言时间表述，如「每天早上9点」「每20分钟」）"},
+    "cron": {"type": "string", "description": "标准 5 段 cron 表达式（本地时区）；与 delay_minutes 二选一"},
+    "delay_minutes": {"type": "integer", "description": "从现在起的延迟分钟数（一次性任务）；与 cron 二选一"},
+    "prompt": {"type": "string", "description": "每次触发要执行的完整指令（自包含：无人值守时用户不在线，必须写明目标与产出）"},
+    "project_id": {"type": "string", "description": "绑定项目（可选）"},
+    "max_runs": {"type": "integer", "description": "最多执行次数（0 或省略 = 不限）"}
+  },
+  "required": ["title", "prompt"]
+}`),
+	Execute: execCronCreate,
+}
+
+var toolCronList = Tool{
+	Name:        "cron_list",
+	Description: "列出全部定时任务（含下次运行时间、已运行次数、启停状态）。",
+	Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+	Execute:     execCronList,
+}
+
+var toolCronUpdate = Tool{
+	Name:        "cron_update",
+	Description: "修改定时任务：标题/表达式/prompt/次数上限/启停。省略的字段保持不变；重新启用会重算下次运行时间。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "id": {"type": "string", "description": "任务 ID（cron_list 可查）"},
+    "title": {"type": "string"},
+    "cron": {"type": "string"},
+    "prompt": {"type": "string"},
+    "max_runs": {"type": "integer", "description": "-1 = 保持不变"},
+    "enabled": {"type": "boolean"}
+  },
+  "required": ["id"]
+}`),
+	Execute: execCronUpdate,
+}
+
+var toolCronDelete = Tool{
+	Name:        "cron_delete",
+	Description: "删除一个定时任务（同时释放名额）。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "id": {"type": "string", "description": "任务 ID（cron_list 可查）"}
+  },
+  "required": ["id"]
+}`),
+	Execute: execCronDelete,
+}
+
 var toolRunCommand = Tool{
-	Description: "在工作区内执行白名单命令（git/npm/npx/node/python/pip）。argv 直传不经 shell，30 秒超时，输出截断 8KB。例：command=\"git\", args=[\"status\"]。",
+	Description: "在工作区内执行白名单命令（git/npm/npx/node/python/pip）。argv 直传不经 shell，30 秒超时，输出截断 8KB。例：command=\"git\", args=[\"status\"]。is_background=true 时立即返回 task_id（适合构建/安装等长命令），用 task_output 读输出、task_kill 终止。",
 	Name:        "run_command",
 	Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
     "command": {"type": "string", "description": "命令名，如 git、npm、python"},
     "args": {"type": "array", "items": {"type": "string"}, "description": "参数列表"},
-    "cwd": {"type": "string", "description": "工作目录（相对项目根，默认项目根）"}
+    "cwd": {"type": "string", "description": "工作目录（相对项目根，默认项目根）"},
+    "is_background": {"type": "boolean", "description": "true = 后台运行，立即返回 task_id（默认 false）"}
   },
   "required": ["command"]
 }`),
 	Execute: execRunCommand,
+}
+
+var toolTaskOutput = Tool{
+	Name:        "task_output",
+	Description: "读取后台命令任务的输出与状态（running/completed/failed）。wait_ms>0 时最多等这么久让它完成（上限 30000）。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "task_id": {"type": "string", "description": "run_command is_background 返回的任务 ID"},
+    "wait_ms": {"type": "integer", "description": "等待完成的时长（毫秒，默认 0 = 不等待）"}
+  },
+  "required": ["task_id"]
+}`),
+	Execute: execTaskOutput,
+}
+
+var toolTaskKill = Tool{
+	Name:        "task_kill",
+	Description: "终止一个还在运行的后台命令任务。已结束的任务无需终止。",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "task_id": {"type": "string", "description": "要终止的任务 ID"}
+  },
+  "required": ["task_id"]
+}`),
+	Execute: execTaskKill,
 }
 
 // ---------- 实现 ----------
@@ -258,8 +431,17 @@ func execReadFile(ctx context.Context, env *Env, args json.RawMessage) (string, 
 	if err != nil {
 		return "", err
 	}
+	if info, statErr := os.Stat(abs); statErr == nil && env.Files != nil {
+		// 同视图且文件未变：不重读，返回存根（省 token，内容已在上文）
+		if env.Files.Observe(abs, info, in.Offset, in.Limit) {
+			return "(文件自上次读取后没有变化，完整内容仍在你已有的上下文里，无需重读；要基于它编辑请直接用 edit_file)", nil
+		}
+	}
 	f, err := os.Open(abs)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("文件不存在：%s%s", in.Path, similarFileHint(env, abs))
+		}
 		return "", err
 	}
 	defer f.Close()
@@ -300,6 +482,92 @@ func execReadFile(ctx context.Context, env *Env, args json.RawMessage) (string, 
 	return header + out, nil
 }
 
+// similarFileHint 文件不存在时给出工作区内相近文件名建议（Levenshtein≤3），
+// 把「打错文件名→报错→重猜」的三轮往返压成一轮。
+func similarFileHint(env *Env, abs string) string {
+	if env == nil || strings.TrimSpace(env.Workspace) == "" {
+		return ""
+	}
+	target := strings.ToLower(filepath.Base(abs))
+	type cand struct {
+		rel   string
+		score int
+	}
+	var best []cand
+	count := 0
+	_ = filepath.WalkDir(env.Workspace, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			if err == nil && d.IsDir() && SkipDirs[d.Name()] {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if count >= 800 {
+			return fs.SkipAll
+		}
+		count++
+		rel, rerr := filepath.Rel(env.Workspace, p)
+		if rerr != nil {
+			return nil
+		}
+		score := levenshtein(strings.ToLower(d.Name()), target)
+		if score <= 3 {
+			best = append(best, cand{filepath.ToSlash(rel), score})
+		}
+		return nil
+	})
+	if len(best) == 0 {
+		return ""
+	}
+	sort.Slice(best, func(i, j int) bool { return best[i].score < best[j].score })
+	if len(best) > 3 {
+		best = best[:3]
+	}
+	names := make([]string, 0, len(best))
+	for _, c := range best {
+		names = append(names, c.rel)
+	}
+	return "；你是想找这些文件吗：" + strings.Join(names, "、")
+}
+
+// levenshtein 编辑距离（两行 DP，O(len*len) 内存压缩到单行）。
+func levenshtein(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	if len(ra) == 0 {
+		return len(rb)
+	}
+	if len(rb) == 0 {
+		return len(ra)
+	}
+	prev := make([]int, len(rb)+1)
+	cur := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ra); i++ {
+		cur[0] = i
+		for j := 1; j <= len(rb); j++ {
+			cost := 1
+			if ra[i-1] == rb[j-1] {
+				cost = 0
+			}
+			cur[j] = min3(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(rb)]
+}
+
+func min3(a, b, c int) int {
+	if b < a {
+		a = b
+	}
+	if c < a {
+		a = c
+	}
+	return a
+}
+
 func execWriteFile(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
 	var in struct {
 		Path    string `json:"path"`
@@ -318,9 +586,16 @@ func execWriteFile(ctx context.Context, env *Env, args json.RawMessage) (string,
 	if err != nil {
 		return "", err
 	}
+	// 覆盖已有文件 = 修改操作：同样要求先读过（新建文件豁免）
+	if info, statErr := os.Stat(abs); statErr == nil && !info.IsDir() {
+		if err := env.Files.CheckEditable(abs); err != nil {
+			return "", fmt.Errorf("目标文件已存在，%w", err)
+		}
+	}
 	if err := writeAtomic(abs, in.Content); err != nil {
 		return "", err
 	}
+	env.Files.MarkEdited(abs)
 	return fmt.Sprintf("已写入 %s（%d 字节）", filepath.ToSlash(in.Path), len(in.Content)), nil
 }
 
@@ -342,10 +617,8 @@ func writeAtomic(abs, content string) error {
 }
 
 // execEditFile 精确替换编辑：old_string 必须与文件内容唯一匹配（或 replace_all）。
-//
-// 对标主流 agent 的 search_replace：整文件覆盖会让模型重输出整个文件——长文件既浪费
-// token 又容易在重写中丢失无关内容；精确替换只传改动片段，且唯一性校验把「改错位置」
-// 从静默损坏变成显式错误。
+// 支持批量（edits 数组）：全部编辑对同一份 pre-edit 快照校验、一次写入——
+// 任一处失败整批拒绝，杜绝「改了一半」的中间态（对标批量编辑的原子性）。
 //
 // 匹配策略：CRLF→LF 归一化后做精确匹配（不做模糊匹配——模糊容错会把「相似但不同」
 // 的两处代码混为一处）；写回时按原文件行尾风格还原。
@@ -355,6 +628,11 @@ func execEditFile(ctx context.Context, env *Env, args json.RawMessage) (string, 
 		OldString  string `json:"old_string"`
 		NewString  string `json:"new_string"`
 		ReplaceAll bool   `json:"replace_all"`
+		Edits      []struct {
+			OldString  string `json:"old_string"`
+			NewString  string `json:"new_string"`
+			ReplaceAll bool   `json:"replace_all"`
+		} `json:"edits"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", err
@@ -362,14 +640,41 @@ func execEditFile(ctx context.Context, env *Env, args json.RawMessage) (string, 
 	if in.Path == "" {
 		return "", fmt.Errorf("需要 path 参数")
 	}
-	if in.OldString == "" {
-		return "", fmt.Errorf("old_string 不能为空（新建文件请用 write_file）")
+	// 单编辑与批量二选一：都传拒绝（模型容易拼错格式，宁可报错不猜）
+	if len(in.Edits) > 0 && (in.OldString != "" || in.NewString != "") {
+		return "", fmt.Errorf("old_string/new_string 与 edits 不能同时传：单处修改用前者，多处修改用后者")
 	}
-	if in.OldString == in.NewString {
-		return "", fmt.Errorf("old_string 与 new_string 相同，没有需要替换的内容")
+	type editOp struct {
+		old, new   string
+		replaceAll bool
 	}
-	if len(in.NewString) > maxWriteBytes {
-		return "", fmt.Errorf("new_string 超过 %dKB 上限", maxWriteBytes/1024)
+	ops := make([]editOp, 0, len(in.Edits)+1)
+	if len(in.Edits) > 0 {
+		if len(in.Edits) > 20 {
+			return "", fmt.Errorf("edits 过多（%d 处，上限 20）：拆成多次调用，每次改一个函数/区块", len(in.Edits))
+		}
+		for i, e := range in.Edits {
+			if e.OldString == "" {
+				return "", fmt.Errorf("edits[%d].old_string 不能为空", i)
+			}
+			if e.OldString == e.NewString {
+				return "", fmt.Errorf("edits[%d] 的 old_string 与 new_string 相同", i)
+			}
+			ops = append(ops, editOp{old: e.OldString, new: e.NewString, replaceAll: e.ReplaceAll})
+		}
+	} else {
+		if in.OldString == "" {
+			return "", fmt.Errorf("需要 old_string（或用 edits 批量编辑）；新建文件请用 write_file")
+		}
+		if in.OldString == in.NewString {
+			return "", fmt.Errorf("old_string 与 new_string 相同，没有需要替换的内容")
+		}
+		ops = append(ops, editOp{old: in.OldString, new: in.NewString, replaceAll: in.ReplaceAll})
+	}
+	for _, op := range ops {
+		if len(op.new) > maxWriteBytes {
+			return "", fmt.Errorf("new_string 超过 %dKB 上限", maxWriteBytes/1024)
+		}
 	}
 	// 编辑走写路径校验：只读授权目录里的文件不可修改
 	abs, err := env.resolveWrite(in.Path)
@@ -383,38 +688,57 @@ func execEditFile(ctx context.Context, env *Env, args json.RawMessage) (string, 
 		}
 		return "", err
 	}
+	// 新鲜度护栏：必须先读过全文、且读取后未被外部改动
+	if err := env.Files.CheckEditable(abs); err != nil {
+		return "", err
+	}
 	if bytes.IndexByte(raw, 0) >= 0 {
 		return "", fmt.Errorf("%s 是二进制文件，无法按文本编辑", in.Path)
 	}
 	crlf := bytes.Contains(raw, []byte("\r\n"))
 	norm := func(s string) string { return strings.ReplaceAll(s, "\r\n", "\n") }
 	content := norm(string(raw))
-	oldS, newS := norm(in.OldString), norm(in.NewString)
 
-	count := strings.Count(content, oldS)
-	switch {
-	case count == 0:
-		return "", fmt.Errorf("old_string 在 %s 中没有找到匹配%s", in.Path, editNearestHint(content, oldS))
-	case count > 1 && !in.ReplaceAll:
-		return "", fmt.Errorf("old_string 在 %s 中匹配到 %d 处（需要唯一匹配）：包含更多上下文使其唯一，或确认要全部替换时传 replace_all=true", in.Path, count)
-	}
-	updated := content
-	if in.ReplaceAll {
-		updated = strings.ReplaceAll(content, oldS, newS)
-	} else {
-		updated = strings.Replace(content, oldS, newS, 1)
+	// 先对 pre-edit 快照逐条校验（数量与唯一性），任何一条不过 → 整批拒绝、
+	// 不产生任何写入；通过后再按顺序应用（后续编辑作用在前面编辑的结果上，
+	// 与模型从上到下写编辑列表的心智一致）。
+	totalReplaced := 0
+	for i, op := range ops {
+		oldS, newS := norm(op.old), norm(op.new)
+		count := strings.Count(content, oldS)
+		label := "old_string"
+		if len(ops) > 1 {
+			label = fmt.Sprintf("edits[%d]", i)
+		}
+		switch {
+		case count == 0:
+			return "", fmt.Errorf("%s 在 %s 中没有找到匹配%s", label, in.Path, editNearestHint(content, op.old))
+		case count > 1 && !op.replaceAll:
+			return "", fmt.Errorf("%s 在 %s 中匹配到 %d 处（需要唯一匹配）：包含更多上下文使其唯一，或确认要全部替换时传 replace_all=true", label, in.Path, count)
+		}
+		// 校验通过才能应用；应用后 content 变化，后续编辑基于新内容校验
+		//（这里把校验+应用合并在同一循环里：失败时直接 return，文件未被写过，
+		// 天然保持「整批不落盘」的原子语义）
+		if op.replaceAll {
+			totalReplaced += count
+			content = strings.ReplaceAll(content, oldS, newS)
+		} else {
+			totalReplaced++
+			content = strings.Replace(content, oldS, newS, 1)
+		}
 	}
 	if crlf {
-		updated = strings.ReplaceAll(updated, "\n", "\r\n")
+		content = strings.ReplaceAll(content, "\n", "\r\n")
 	}
-	if err := writeAtomic(abs, updated); err != nil {
+	if err := writeAtomic(abs, content); err != nil {
 		return "", err
 	}
-	replaced := count
-	if !in.ReplaceAll {
-		replaced = 1
+	env.Files.MarkEdited(abs)
+	batchNote := ""
+	if len(ops) > 1 {
+		batchNote = fmt.Sprintf("（批量 %d 处）", len(ops))
 	}
-	return fmt.Sprintf("已修改 %s（替换 %d 处）", filepath.ToSlash(in.Path), replaced), nil
+	return fmt.Sprintf("已修改 %s%s（替换 %d 处）", filepath.ToSlash(in.Path), batchNote, totalReplaced), nil
 }
 
 // editNearestHint 在 0 匹配时给出「最近似位置」提示，把「失败→重读→重试」的
@@ -497,6 +821,7 @@ func execSearchFiles(ctx context.Context, env *Env, args json.RawMessage) (strin
 	var in struct {
 		Query string `json:"query"`
 		Path  string `json:"path"`
+		Regex bool   `json:"regex"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil || strings.TrimSpace(in.Query) == "" {
 		return "", fmt.Errorf("需要 query 参数")
@@ -505,7 +830,16 @@ func execSearchFiles(ctx context.Context, env *Env, args json.RawMessage) (strin
 	if err != nil {
 		return "", err
 	}
+	// 匹配器二选一：正则（大小写敏感，Go 语法）或子串（大小写不敏感）。
+	// 非法正则明确报错而不是静默降级成子串——模型写的 pattern 语法错了该重写。
+	var re *regexp.Regexp
 	q := strings.ToLower(in.Query)
+	if in.Regex {
+		re, err = regexp.Compile(in.Query)
+		if err != nil {
+			return "", fmt.Errorf("正则表达式不合法: %v", err)
+		}
+	}
 
 	// 两阶段：先串行收集待扫描文件（WalkDir 本身是 IO 串行的），
 	// 再用 worker 池并行读文件做匹配——大仓库搜索时长以 IO 为主，并行收益明显。
@@ -542,9 +876,14 @@ func execSearchFiles(ctx context.Context, env *Env, args json.RawMessage) (strin
 		return "", walkErr
 	}
 
+	type searchHit struct {
+		rel  string
+		line int
+		text string
+	}
 	var (
 		mu        sync.Mutex
-		hits      []string
+		hits      []searchHit
 		scanned   int
 		truncated bool
 	)
@@ -554,6 +893,12 @@ func execSearchFiles(ctx context.Context, env *Env, args json.RawMessage) (strin
 	}
 	if workers < 2 {
 		workers = 1
+	}
+	match := func(line string) bool {
+		if re != nil {
+			return re.MatchString(line)
+		}
+		return strings.Contains(strings.ToLower(line), q)
 	}
 	jobs := make(chan candidate)
 	var wg sync.WaitGroup
@@ -568,7 +913,7 @@ func execSearchFiles(ctx context.Context, env *Env, args json.RawMessage) (strin
 				if full {
 					continue
 				}
-				fileHits := searchOneFile(c.path, c.rel, q, maxSearchHits)
+				fileHits := searchOneFile(c.path, c.rel, match, maxSearchHits)
 				mu.Lock()
 				scanned++
 				for _, h := range fileHits {
@@ -599,29 +944,56 @@ func execSearchFiles(ctx context.Context, env *Env, args json.RawMessage) (strin
 	wg.Wait()
 
 	if len(hits) == 0 {
-		return fmt.Sprintf("未找到包含 %q 的内容（扫描 %d 个文件）", in.Query, scanned), nil
+		hint := ""
+		if re != nil {
+			hint = "（正则模式）"
+		}
+		return fmt.Sprintf("未找到包含 %q 的内容%s（扫描 %d 个文件）", in.Query, hint, scanned), nil
 	}
-	out := strings.Join(hits, "\n")
+	// 确定性输出：并行 worker 的完成顺序不定，按「文件 + 行号」排序，
+	// 模型连续两次搜索同一内容看到同样的结果，才能稳定引用。
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].rel != hits[j].rel {
+			return hits[i].rel < hits[j].rel
+		}
+		return hits[i].line < hits[j].line
+	})
+	out := make([]string, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, fmt.Sprintf("%s:%d: %s", h.rel, h.line, h.text))
+	}
 	if truncated {
-		out += fmt.Sprintf("\n…（已达 %d 条上限）", maxSearchHits)
+		out = append(out, fmt.Sprintf("…（已达 %d 条上限）", maxSearchHits))
 	}
-	return out, nil
+	return strings.Join(out, "\n"), nil
 }
 
-// searchOneFile 读单个文件做大小写不敏感匹配，返回命中行（带 文件:行号 前缀）。
-func searchOneFile(path, rel, q string, limit int) []string {
+// searchOneFile 读单个文件做匹配，返回命中行（调用方决定子串或正则）。
+func searchOneFile(path, rel string, match func(string) bool, limit int) []struct {
+	rel  string
+	line int
+	text string
+} {
 	raw, err := os.ReadFile(path)
 	if err != nil || bytes.IndexByte(raw, 0) >= 0 {
 		return nil
 	}
-	hits := []string{}
+	hits := []struct {
+		rel  string
+		line int
+		text string
+	}{}
 	for i, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
-		if strings.Contains(strings.ToLower(line), q) {
+		if match(line) {
 			trimmed := strings.TrimSpace(line)
 			if len([]rune(trimmed)) > 200 {
 				trimmed = truncateRunes(trimmed, 200) + "…"
 			}
-			hits = append(hits, fmt.Sprintf("%s:%d: %s", rel, i+1, trimmed))
+			hits = append(hits, struct {
+				rel  string
+				line int
+				text string
+			}{rel, i + 1, trimmed})
 			if len(hits) >= limit {
 				break
 			}
@@ -630,7 +1002,171 @@ func searchOneFile(path, rel, q string, limit int) []string {
 	return hits
 }
 
+// ---------- find_files：路径模糊搜索 ----------
+
+// fuzzyPathScore 对相对路径做子序列匹配评分：query 的每个字符按顺序出现在
+// path 中才算命中；分数偏向「连续片段」「路径段边界」「靠前位置」。
+// 对标主流编辑器的模糊匹配启发式（fzf/nucleo 的简化版）。
+func fuzzyPathScore(path, query string) (int, bool) {
+	if query == "" {
+		return 0, false
+	}
+	p := []rune(path)
+	q := []rune(query)
+	if len(q) > len(p) {
+		return 0, false
+	}
+	score := 0
+	pi := 0
+	lastMatch := -2
+	for _, qc := range q {
+		found := -1
+		for i := pi; i < len(p); i++ {
+			if p[i] == qc {
+				found = i
+				break
+			}
+		}
+		if found < 0 {
+			return 0, false
+		}
+		score += 10
+		if found == lastMatch+1 {
+			score += 15 // 连续匹配：query 是 path 的一段连续子串
+		}
+		if found == 0 || isPathBoundary(p[found-1]) {
+			score += 12 // 段边界（文件名开头 / 分隔符后）：名字级命中比散落命中值钱
+		}
+		lastMatch = found
+		pi = found + 1
+	}
+	// 总长惩罚：同样的命中，短路径信息密度更高
+	score -= len(p) - len(q)
+	return score, true
+}
+
+func isPathBoundary(r rune) bool {
+	switch r {
+	case '/', '\\', '_', '-', '.', ' ':
+		return true
+	}
+	return false
+}
+
+func execFindFiles(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		Query string `json:"query"`
+		Path  string `json:"path"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil || strings.TrimSpace(in.Query) == "" {
+		return "", fmt.Errorf("需要 query 参数")
+	}
+	base, err := env.resolveRead(in.Path)
+	if err != nil {
+		return "", err
+	}
+	const (
+		maxFuzzyCandidates = 2000
+		maxFuzzyResults    = 20
+	)
+	type scored struct {
+		rel   string
+		score int
+	}
+	var matches []scored
+	count := 0
+	walkErr := filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if SkipDirs[d.Name()] {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if count >= maxFuzzyCandidates {
+			return fs.SkipAll
+		}
+		count++
+		rel, rerr := filepath.Rel(base, p)
+		if rerr != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if s, ok := fuzzyPathScore(strings.ToLower(rel), strings.ToLower(in.Query)); ok {
+			matches = append(matches, scored{rel, s})
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return "", walkErr
+	}
+	if len(matches) == 0 {
+		return fmt.Sprintf("没有模糊匹配到 %q（扫描 %d 个文件）。知道部分内容时改用 search_files。", in.Query, count), nil
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].score != matches[j].score {
+			return matches[i].score > matches[j].score
+		}
+		return matches[i].rel < matches[j].rel
+	})
+	if len(matches) > maxFuzzyResults {
+		matches = matches[:maxFuzzyResults]
+	}
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		out = append(out, fmt.Sprintf("%s", m.rel))
+	}
+	return strings.Join(out, "\n"), nil
+}
+
 // ---------- 会话级工具（依赖 Env 注入的回调；回调为 nil 时明确报错） ----------
+
+// validSubagentTypes 是子代理的合法类型（与工具 schema 的 enum 一致）。
+var validSubagentTypes = map[string]bool{
+	"general-purpose": true,
+	"explore":         true,
+}
+
+// maxSubagentPromptBytes 子任务说明的字节上限（子代理拿不到会话历史，
+// 但也不该把整本书塞进一条任务说明）。
+const maxSubagentPromptBytes = 32 * 1024
+
+func execTask(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		Prompt       string `json:"prompt"`
+		SubagentType string `json:"subagent_type"`
+		Description  string `json:"description"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(in.Prompt) == "" {
+		return "", fmt.Errorf("需要 prompt 参数（子代理看不到本会话历史，任务说明必须自包含）")
+	}
+	if len(in.Prompt) > maxSubagentPromptBytes {
+		return "", fmt.Errorf("prompt 过大（%dKB，上限 %dKB）：把任务拆小，或先让子代理读项目里的文件", len(in.Prompt)/1024, maxSubagentPromptBytes/1024)
+	}
+	kind := in.SubagentType
+	if kind == "" {
+		kind = "general-purpose"
+	}
+	if !validSubagentTypes[kind] {
+		return "", fmt.Errorf("未知子代理类型 %q（可选：general-purpose / explore）", in.SubagentType)
+	}
+	if env.RunSubagent == nil {
+		return "", fmt.Errorf("子代理功能当前不可用")
+	}
+	out, err := env.RunSubagent(kind, in.Prompt)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(out) == "" {
+		return "", fmt.Errorf("子代理没有返回任何内容，请换更具体的任务说明重试")
+	}
+	return out, nil
+}
 
 // validTodoStatus 是 todo 状态的合法取值。
 var validTodoStatus = map[string]bool{
@@ -723,11 +1259,149 @@ func execMemoryRead(ctx context.Context, env *Env, args json.RawMessage) (string
 	return env.MemoryRead(scope)
 }
 
+func execSkillRead(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil || strings.TrimSpace(in.Name) == "" {
+		return "", fmt.Errorf("需要 name 参数（技能名，与清单精确一致）")
+	}
+	if env.SkillRead == nil {
+		return "", fmt.Errorf("技能功能当前不可用")
+	}
+	return env.SkillRead(in.Name)
+}
+
+// execAskUser 阻塞等待用户回答（Env.AskUser 回调）。ctx 取消（用户停止生成/
+// 断开连接）时立即返回，不给回调留悬挂等待。
+func execAskUser(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		Question    string   `json:"question"`
+		Options     []string `json:"options"`
+		MultiSelect bool     `json:"multi_select"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(in.Question) == "" {
+		return "", fmt.Errorf("需要 question 参数")
+	}
+	if len(in.Options) > 6 {
+		return "", fmt.Errorf("选项过多（%d 个，上限 6 个）：只给真正候选的方案", len(in.Options))
+	}
+	if env.AskUser == nil {
+		return "", fmt.Errorf("当前会话无法向用户提问")
+	}
+	done := make(chan struct{})
+	var answer, askErr string
+	go func() {
+		defer close(done)
+		a, err := env.AskUser(in.Question, in.Options, in.MultiSelect)
+		answer, askErr = a, ""
+		if err != nil {
+			askErr = err.Error()
+		}
+	}()
+	select {
+	case <-done:
+		if askErr != "" {
+			return "", fmt.Errorf("%s", askErr)
+		}
+		return answer, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// ---------- 定时任务工具（依赖 Env 回调） ----------
+
+func execCronCreate(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		Title     string `json:"title"`
+		Cron      string `json:"cron"`
+		DelayMin  int    `json:"delay_minutes"`
+		Prompt    string `json:"prompt"`
+		ProjectID string `json:"project_id"`
+		MaxRuns   int    `json:"max_runs"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(in.Title) == "" || strings.TrimSpace(in.Prompt) == "" {
+		return "", fmt.Errorf("需要 title 与 prompt 参数")
+	}
+	if in.Cron == "" && in.DelayMin <= 0 {
+		return "", fmt.Errorf("需要 cron 表达式或 delay_minutes（二选一）")
+	}
+	if in.Cron != "" && in.DelayMin > 0 {
+		return "", fmt.Errorf("cron 与 delay_minutes 只能二选一")
+	}
+	if env.CronCreate == nil {
+		return "", fmt.Errorf("当前会话不允许创建定时任务（自动化触发的会话禁止再建，防递归）")
+	}
+	expr := in.Cron
+	maxRuns := in.MaxRuns
+	if in.DelayMin > 0 {
+		if in.DelayMin < 1 || in.DelayMin > 525600 {
+			return "", fmt.Errorf("delay_minutes 取值 1..525600")
+		}
+		// 一次性延迟任务：以「每分钟检查」的表达式 + maxRuns=1 表达，
+		// 真实下一次触发由调度器按 anchor 语义换算（见 cron 包）
+		expr = fmt.Sprintf("once:%d", in.DelayMin)
+		if maxRuns <= 0 {
+			maxRuns = 1
+		}
+	}
+	return env.CronCreate(in.Title, expr, in.Prompt, in.ProjectID, maxRuns)
+}
+
+func execCronList(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	if env.CronList == nil {
+		return "", fmt.Errorf("定时任务功能当前不可用")
+	}
+	return env.CronList()
+}
+
+func execCronUpdate(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		ID      string `json:"id"`
+		Title   string `json:"title"`
+		Cron    string `json:"cron"`
+		Prompt  string `json:"prompt"`
+		MaxRuns int    `json:"max_runs"`
+		Enabled *bool  `json:"enabled"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(in.ID) == "" {
+		return "", fmt.Errorf("需要 id 参数")
+	}
+	if env.CronUpdate == nil {
+		return "", fmt.Errorf("定时任务功能当前不可用")
+	}
+	return env.CronUpdate(in.ID, in.Title, in.Cron, in.Prompt, in.MaxRuns, in.Enabled)
+}
+
+func execCronDelete(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil || strings.TrimSpace(in.ID) == "" {
+		return "", fmt.Errorf("需要 id 参数")
+	}
+	if env.CronDelete == nil {
+		return "", fmt.Errorf("定时任务功能当前不可用")
+	}
+	return env.CronDelete(in.ID)
+}
+
 func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
 	var in struct {
-		Command string   `json:"command"`
-		Args    []string `json:"args"`
-		Cwd     string   `json:"cwd"`
+		Command      string   `json:"command"`
+		Args         []string `json:"args"`
+		Cwd          string   `json:"cwd"`
+		IsBackground bool     `json:"is_background"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil || in.Command == "" {
 		return "", fmt.Errorf("需要 command 参数")
@@ -763,6 +1437,9 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 	if info, err := os.Stat(cwd); err != nil || !info.IsDir() {
 		return "", fmt.Errorf("工作目录不存在：%s（请先在侧栏选择或重建项目）", cwd)
 	}
+	if in.IsBackground {
+		return startBackgroundCommand(in.Command, in.Args, cwd)
+	}
 	cctx, cancel := context.WithTimeout(ctx, commandTimeout(env))
 	defer cancel()
 	cmd := exec.CommandContext(cctx, in.Command, in.Args...)
@@ -774,6 +1451,19 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	runErr := cmd.Run()
+	// 超时自动转后台（对标主流 agent 的 auto_on_timeout）：前台超时不杀掉任务
+	// 判定失败，而是把同一条命令转为后台任务继续跑，返回 task_id 让模型
+	// 用 task_output 追进度——长构建/长测试不再被超时腰斩。
+	if runErr != nil && cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+		bgID, bgErr := startBackgroundCommand(in.Command, in.Args, cwd)
+		if bgErr == nil {
+			head := fmt.Sprintf("$ %s %s\n", in.Command, strings.Join(in.Args, " "))
+			timed := fmt.Sprintf("%s\n（前台等待 %s 超时，已自动转为后台继续运行：%s\n用 task_output 读取进度与结果）",
+				head, commandTimeout(env), bgID)
+			return timed, nil
+		}
+		// 转后台失败：按普通超时失败处理
+	}
 	out := buf.String()
 	if len(out) > maxOutBytes {
 		out = truncateBytes(out, maxOutBytes) + "\n…(输出已按 8KB 截断)"
@@ -792,6 +1482,219 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 		return head + "(无输出)", nil
 	}
 	return head + out, nil
+}
+
+// ---------- 后台命令任务（对标主流 agent 的 is_background + task_output/kill） ----------
+
+// backgroundTaskMaxDuration 是后台任务的硬超时：防「忘了杀」的任务永远挂着。
+const backgroundTaskMaxDuration = 10 * time.Minute
+
+// maxBackgroundTasks 是注册表里保留的任务数上限（含已完成）：超限清最旧的完成项。
+const maxBackgroundTasks = 32
+
+type backgroundTask struct {
+	id      string
+	cmdline string
+	cmd     *exec.Cmd
+	wait    chan struct{} // cmd.Wait 返回后关闭
+	exitErr error
+	bufMu   sync.Mutex
+	buf     []byte // 输出累计（超 64KB 丢头部，保留尾部——错误信息常在尾部）
+	started time.Time
+}
+
+func (t *backgroundTask) appendOutput(p []byte) {
+	t.bufMu.Lock()
+	defer t.bufMu.Unlock()
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > maxBackgroundOutputBytes {
+		t.buf = append([]byte(nil), t.buf[len(t.buf)-maxBackgroundOutputBytes:]...)
+	}
+}
+
+func (t *backgroundTask) output() string {
+	t.bufMu.Lock()
+	defer t.bufMu.Unlock()
+	return string(t.buf)
+}
+
+const maxBackgroundOutputBytes = 64 * 1024
+
+var (
+	bgMu    sync.Mutex
+	bgSeq   int
+	bgTasks = map[string]*backgroundTask{}
+)
+
+// startBackgroundCommand 启动后台任务。生命周期独立于 HTTP 请求：
+// 用独立的超时 context（10 分钟硬顶），请求结束/断开不影响任务运行。
+func startBackgroundCommand(command string, args []string, cwd string) (string, error) {
+	cctx, cancel := context.WithTimeout(context.Background(), backgroundTaskMaxDuration)
+	cmd := exec.CommandContext(cctx, command, args...)
+	cmd.Dir = cwd
+	cmd.Env = append(os.Environ(), "GIT_PAGER=cat", "PAGER=cat", "GIT_TERMINAL_PROMPT=0")
+
+	bgMu.Lock()
+	// 注册表超限：先清最旧的已完成任务
+	for len(bgTasks) >= maxBackgroundTasks {
+		var oldest string
+		var oldestT time.Time
+		for id, t := range bgTasks {
+			select {
+			case <-t.wait: // 已结束
+			default:
+				continue
+			}
+			if oldest == "" || t.started.Before(oldestT) {
+				oldest, oldestT = id, t.started
+			}
+		}
+		if oldest == "" {
+			break // 全部还在跑：不再清理，让上限被突破一次（极端场景）
+		}
+		delete(bgTasks, oldest)
+	}
+	bgSeq++
+	id := fmt.Sprintf("bg_%d_%d", time.Now().UnixMilli(), bgSeq)
+	t := &backgroundTask{
+		id:      id,
+		cmdline: strings.TrimSpace(command + " " + strings.Join(args, " ")),
+		cmd:     cmd,
+		wait:    make(chan struct{}),
+		started: time.Now(),
+	}
+	bgTasks[id] = t
+	bgMu.Unlock()
+
+	// 显式建管道合并 stdout+stderr：StdoutPipe() 不会填充 cmd.Stdout 字段，
+	// 「cmd.Stderr = cmd.Stdout」实际等于把 stderr 设成 nil（输出漏到服务控制台）。
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		cancel()
+		return "", err
+	}
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		pr.Close()
+		cancel()
+		return "", fmt.Errorf("启动后台命令失败: %w", err)
+	}
+	// 父进程侧立即关掉写端：子进程退出时 reader 才能读到 EOF
+	pw.Close()
+	go func() {
+		defer close(t.wait)
+		defer cancel()
+		defer pr.Close()
+		buf := make([]byte, 4096)
+		for {
+			n, rerr := pr.Read(buf)
+			if n > 0 {
+				t.appendOutput(buf[:n])
+			}
+			if rerr != nil {
+				break
+			}
+		}
+		t.exitErr = cmd.Wait()
+	}()
+	return fmt.Sprintf("后台任务已启动 task_id=%s\n$ %s\n用 task_output 读取输出与状态；长命令（构建/安装）不要用前台模式干等。", id, t.cmdline), nil
+}
+
+// getBackgroundTask 查任务（不存在报错并列出当前任务）。
+func getBackgroundTask(id string) (*backgroundTask, error) {
+	bgMu.Lock()
+	defer bgMu.Unlock()
+	t, ok := bgTasks[id]
+	if !ok {
+		var ids []string
+		for tid, tk := range bgTasks {
+			select {
+			case <-tk.wait:
+				ids = append(ids, tid+"(已完成)")
+			default:
+				ids = append(ids, tid+"(运行中)")
+			}
+		}
+		if len(ids) == 0 {
+			return nil, fmt.Errorf("任务 %q 不存在；当前没有后台任务", id)
+		}
+		return nil, fmt.Errorf("任务 %q 不存在；当前任务：%s", id, strings.Join(ids, ", "))
+	}
+	return t, nil
+}
+
+func execTaskOutput(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		TaskID string `json:"task_id"`
+		WaitMs int    `json:"wait_ms"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil || strings.TrimSpace(in.TaskID) == "" {
+		return "", fmt.Errorf("需要 task_id 参数")
+	}
+	t, err := getBackgroundTask(in.TaskID)
+	if err != nil {
+		return "", err
+	}
+	// 可选等待：最多 30 秒
+	if in.WaitMs > 0 {
+		wait := time.Duration(in.WaitMs) * time.Millisecond
+		if wait > 30*time.Second {
+			wait = 30 * time.Second
+		}
+		select {
+		case <-t.wait:
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	out := t.output()
+	if len(out) > maxOutBytes {
+		out = truncateBytes(out, maxOutBytes) + "\n…(输出已按 8KB 截断)"
+	}
+	select {
+	case <-t.wait:
+		status := "completed"
+		if t.exitErr != nil {
+			status = fmt.Sprintf("failed（%v）", t.exitErr)
+		}
+		return fmt.Sprintf("任务 %s 已结束：%s\n$ %s\n%s", t.id, status, t.cmdline, orLine(out)), nil
+	default:
+		return fmt.Sprintf("任务 %s 仍在运行（已 %d 秒）\n$ %s\n%s", t.id, int(time.Since(t.started).Seconds()), t.cmdline, orLine(out)), nil
+	}
+}
+
+func execTaskKill(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil || strings.TrimSpace(in.TaskID) == "" {
+		return "", fmt.Errorf("需要 task_id 参数")
+	}
+	t, err := getBackgroundTask(in.TaskID)
+	if err != nil {
+		return "", err
+	}
+	select {
+	case <-t.wait:
+		return fmt.Sprintf("任务 %s 已经结束，无需终止", t.id), nil
+	default:
+	}
+	if err := t.cmd.Process.Kill(); err != nil {
+		return "", fmt.Errorf("终止失败: %w", err)
+	}
+	<-t.wait // 等 Wait 回收，避免僵尸进程
+	return fmt.Sprintf("已终止任务 %s（$ %s）", t.id, t.cmdline), nil
+}
+
+// orLine 给空输出一个占位（task_output 用）。
+func orLine(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "（暂无输出）"
+	}
+	return s
 }
 
 // commandTimeout 返回命令超时：settings 可配（秒），缺省 30s。

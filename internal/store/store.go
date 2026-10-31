@@ -88,6 +88,9 @@ type Session struct {
 	PromptTokens     int64 `json:"promptTokens,omitempty"`
 	CompletionTokens int64 `json:"completionTokens,omitempty"`
 	Requests         int64 `json:"requests,omitempty"`
+	// LastPromptTokens 是上一次请求的真实 prompt tokens（usage 缺失时为估算值）。
+	// 配置了 ContextWindow 时，压缩触发优先用它——比 bytes/4 估算更贴近上游真实约束。
+	LastPromptTokens int64 `json:"lastPromptTokens,omitempty"`
 }
 
 // Meta 是会话列表里展示的摘要（不含消息体）。
@@ -1013,6 +1016,7 @@ func (s *Store) SetTodos(id string, todos []Todo) error {
 }
 
 // AddUsage 累计会话用量（每次对话请求结束时调用一次）。
+// lastPrompt 同时覆盖 LastPromptTokens（压缩触发优先用这个真实值）。
 func (s *Store) AddUsage(id string, prompt, completion int64) error {
 	if !validID.MatchString(id) {
 		return ErrNotFound
@@ -1026,6 +1030,7 @@ func (s *Store) AddUsage(id string, prompt, completion int64) error {
 	sess.PromptTokens += prompt
 	sess.CompletionTokens += completion
 	sess.Requests++
+	sess.LastPromptTokens = prompt
 	if err := s.saveSnapshot(sess); err != nil {
 		return err
 	}

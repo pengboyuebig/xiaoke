@@ -10,9 +10,11 @@
 package rules
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -59,7 +61,9 @@ func New() *Store {
 	return &Store{cache: map[string]cacheEntry{}}
 }
 
-// Discover 扫描 roots（项目工作区 + 只读授权目录）下根级规则文件。
+// Discover 扫描 roots（项目工作区 + 只读授权目录）下的规则文件：
+// 根目录的命名文件 + 子目录里的规则文件（深度 ≤2，跳过依赖目录）。
+// 注入顺序浅→深，提示词里声明「深层优先」——对齐主流 agent 的分层规则发现。
 // 返回拼接好的注入文本；没有任何规则文件时返回空串。
 func (s *Store) Discover(roots []string) string {
 	var b strings.Builder
@@ -89,30 +93,67 @@ func (s *Store) Discover(roots []string) string {
 	return strings.TrimSpace(b.String())
 }
 
-// discoverRoot 扫描单个根目录，带目录级缓存。
+// nestedMaxDepth 是子目录规则文件的扫描深度（相对根目录；1 = 直接子目录）。
+const nestedMaxDepth = 2
+
+// skipDirs 是嵌套扫描时跳过的依赖/构建目录（与 tools.SkipDirs 同一套约定，
+// 不直接 import tools——规则包保持轻量）。
+var skipDirs = map[string]bool{
+	"node_modules": true, ".git": true, ".svn": true, "dist": true,
+	"build": true, "__pycache__": true, ".venv": true, "venv": true, ".idea": true,
+}
+
+// discoverRoot 扫描单个根目录（根级命名文件 + 深度 ≤2 的子目录规则文件），带缓存。
 func (s *Store) discoverRoot(root string) []RuleFile {
-	var names []string
+	type found struct {
+		abs, rel string
+		modTime  time.Time
+		size     int64
+	}
+	var foundFiles []found
 	var modTime time.Time
 	var size int64
-	seen := map[string]bool{}
-	for _, name := range ruleNames {
-		// Windows 等大小写不敏感文件系统上 AGENTS.md 与 Agents.md 是同一个文件：
-		// 按小写名去重，优先级高的先占位
-		lower := strings.ToLower(name)
-		if seen[lower] {
-			continue
-		}
-		p := filepath.Join(root, name)
-		if info, err := os.Stat(p); err == nil && info.Mode().IsRegular() {
-			seen[lower] = true
-			names = append(names, name)
-			if info.ModTime().After(modTime) {
-				modTime = info.ModTime()
+	seenNames := map[string]bool{}
+
+	// collect 检查 dir 下的命名规则文件（大小写不敏感去重，优先级高的先占位）。
+	collect := func(dir, rel string) {
+		for _, name := range ruleNames {
+			lower := strings.ToLower(name)
+			if seenNames[dir+"\x00"+lower] {
+				continue
 			}
-			size += info.Size()
+			p := filepath.Join(dir, name)
+			if info, err := os.Stat(p); err == nil && info.Mode().IsRegular() {
+				seenNames[dir+"\x00"+lower] = true
+				foundFiles = append(foundFiles, found{abs: p, rel: rel, modTime: info.ModTime(), size: info.Size()})
+				if info.ModTime().After(modTime) {
+					modTime = info.ModTime()
+				}
+				size += info.Size()
+			}
 		}
 	}
-	if len(names) == 0 {
+	collect(root, "")
+	// 子目录扫描：深度 ≤2，跳过依赖/构建目录；路径缓存键带 rel 保持确定性
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, p)
+		if rerr != nil || rel == "." {
+			return nil
+		}
+		depth := strings.Count(rel, string(filepath.Separator)) + 1
+		if depth > nestedMaxDepth {
+			return fs.SkipDir
+		}
+		if skipDirs[d.Name()] {
+			return fs.SkipDir
+		}
+		collect(p, filepath.ToSlash(rel))
+		return nil
+	})
+	if len(foundFiles) == 0 {
 		return nil
 	}
 
@@ -124,10 +165,13 @@ func (s *Store) discoverRoot(root string) []RuleFile {
 	}
 	s.mu.Unlock()
 
-	files := make([]RuleFile, 0, len(names))
-	for _, name := range names {
-		p := filepath.Join(root, name)
-		data, err := os.ReadFile(p)
+	// 浅→深注入：根级在前（foundFiles 天然如此），同层按相对路径排序
+	sort.SliceStable(foundFiles, func(i, j int) bool {
+		return foundFiles[i].rel < foundFiles[j].rel
+	})
+	files := make([]RuleFile, 0, len(foundFiles))
+	for _, f := range foundFiles {
+		data, err := os.ReadFile(f.abs)
 		if err != nil {
 			continue
 		}
@@ -138,7 +182,7 @@ func (s *Store) discoverRoot(root string) []RuleFile {
 		if len(content) > maxFileBytes {
 			content = truncateRunes(content, maxFileBytes) + "\n…（因单文件上限截断）"
 		}
-		files = append(files, RuleFile{Path: p, Content: content})
+		files = append(files, RuleFile{Path: f.abs, Content: content})
 	}
 	if len(files) == 0 {
 		files = nil

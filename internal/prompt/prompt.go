@@ -18,7 +18,7 @@ type Request struct {
 	ProjectPath    string
 	ReadDirs       []string // 只读授权目录
 	ToolsAvailable bool     // 本次会话实际可用工具（内置+MCP > 0）
-	SkillsAssembly string   // 启用技能的注入正文
+	SkillsListing  string   // 启用技能的清单（正文由模型用 skill_read 按需读取）
 	Rules          string   // 项目规则文件（AGENTS.md / CLAUDE.md 等，已转义）
 	Memory         string   // 长期记忆（全局 + 项目两层，budget 内）
 	Instructions   string   // 追加的补充指令
@@ -48,16 +48,17 @@ func Build(r Request) string {
 		}
 	}
 
-	// 3) 技能：明确「何时遵循」，避免技能正文被当成普通背景
-	if s := strings.TrimSpace(r.SkillsAssembly); s != "" {
-		b.WriteString("\n\n【已启用技能】以下是用户启用的技能说明；与当前任务相关时遵循其方法论，无关时忽略：")
+	// 3) 技能清单：只注入「有什么可用」，正文按需读取——常驻成本是 KB 级，
+	// 正文常驻（旧行为）会在技能多起来后挤占任务上下文。
+	if s := strings.TrimSpace(r.SkillsListing); s != "" {
+		b.WriteString("\n\n【可用技能】以下技能与当前任务相关时，先用 skill_read 读取其完整方法论再动手；无关时不要读也不要理会：")
 		b.WriteString(s)
 	}
 
 	// 3.5) 项目规则文件：仓库约定跟着项目走（构建命令、风格、结构）。
-	// 优先级声明：用户当前指令 > 深层规则文件 > 浅层规则文件。
+	// 注入顺序浅→深；优先级声明：用户当前指令 > 深层规则文件 > 浅层规则文件。
 	if rules := strings.TrimSpace(r.Rules); rules != "" {
-		b.WriteString("\n\n【项目规则】以下是项目里的规则文件（AGENTS.md / CLAUDE.md 等），是对你如何在这个项目工作的约定，与当前任务相关时必须遵守；用户当前对话里的明确指令优先于规则文件：")
+		b.WriteString("\n\n【项目规则】以下是项目里的规则文件（AGENTS.md / CLAUDE.md 等，浅层在前、深层在后），是对你如何在这个项目工作的约定，与当前任务相关时必须遵守；深层规则比浅层规则优先，用户当前对话里的明确指令优先于一切规则文件：")
 		b.WriteString("\n" + rules)
 	}
 
@@ -103,7 +104,7 @@ func PlanGuideFor(planMode bool) string {
 	if planMode {
 		return `【当前为计划模式（Plan Mode）】
 你处于「先计划、后开发」的计划模式，规则：
-1. 只允许调研：用 list_files / read_file / search_files（及只读 MCP 工具）查看代码与文档；写文件与执行命令这两类工具已对你会话禁用，不要尝试也不要向用户索要权限。
+1. 只允许调研：用 list_files / read_file / search_files（及只读 MCP 工具、explore 子代理）查看代码与文档；写文件与执行命令这两类工具已对你会话禁用，不要尝试也不要向用户索要权限。
 2. 调研充分后，输出一份结构化实施计划，必须包含：
    - 目标：一句话说明要做什么
    - 现状调研：发现了什么（引用具体文件/函数/行号，写你确认过的，不写猜的）

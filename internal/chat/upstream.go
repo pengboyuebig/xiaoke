@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"xiaoke/internal/breaker"
 	"xiaoke/internal/config"
 	"xiaoke/internal/tools"
 )
@@ -123,6 +124,10 @@ var streamClient = func() *http.Client {
 	return &http.Client{Transport: t}
 }()
 
+// upstreamBreakers 按 baseURL+model 复用熔断器：上游持续 5xx/超时时快速失败，
+// 冷却后放单探测请求验证恢复（internal/breaker）。
+var upstreamBreakers = breaker.NewRegistry()
+
 // streamOpenAI 调用 OpenAI 兼容 /chat/completions（stream=true），
 // 解析文本增量与 tool_calls 增量。baseURL 示例：
 //   - DeepSeek 官方:  https://api.deepseek.com
@@ -130,6 +135,19 @@ var streamClient = func() *http.Client {
 func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMessage, toolDefs []tools.ToolDef, hooks Hooks, reasoning string) (string, []ToolCall, error) {
 	if strings.TrimSpace(cfg.APIKey) == "" {
 		return "", nil, fmt.Errorf("缺少 API Key：请在设置里填写，或设置环境变量 XIAOKE_API_KEY")
+	}
+	br := upstreamBreakers.For(cfg.BaseURL + "|" + cfg.Model)
+	if d := br.Allow(); d == breaker.Tripped {
+		return "", nil, fmt.Errorf("上游 %s 连续失败已被熔断（10 秒后自动放一个探测请求），请检查服务状态或稍后重试", cfg.BaseURL)
+	}
+	success := false
+	// 记录点从「请求真正发向网络」开始：本地的 payload 序列化/URL 构造错误
+	// 不是上游故障，不该计入熔断窗口。用户主动停止/断开（ctx 取消）同样不记录，
+	// 否则几次手动停止就可能错误地踢开熔断器。
+	recordBreaker := func() {
+		if ctx.Err() == nil {
+			br.Record(success)
+		}
 	}
 	body := map[string]any{
 		"model":       cfg.Model,
@@ -165,9 +183,13 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 
 	resp, err := streamClient.Do(req)
 	if err != nil {
+		recordBreaker()
 		return "", nil, fmt.Errorf("请求上游失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		resp.Body.Close()
+		recordBreaker()
+	}()
 	if resp.StatusCode != http.StatusOK {
 		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return "", nil, fmt.Errorf("上游返回 %s: %s", resp.Status, truncateRunes(strings.TrimSpace(string(limited)), 500))
@@ -242,6 +264,7 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 	if full.Len() == 0 && len(calls) == 0 {
 		return "", nil, fmt.Errorf("上游没有返回任何内容")
 	}
+	success = true // HTTP 200 + 流完整读完 = 上游可用（空回复是模型行为，不算基础设施故障）
 	if !gotUsage {
 		// 上游没回 usage（部分兼容网关不支持 stream_options）：按 bytes/4 估算兜底
 		estIn, estOut := estimateTokens(reqBytes), estimateTokens(full.Len())+int64(len(calls))
@@ -351,6 +374,25 @@ func streamMock(ctx context.Context, cfg config.LLMConfig, messages []ChatMessag
 		hooks.reportUsage(180, estimateTokens(len(reply)))
 		out, err := streamChars(ctx, reply, hooks.OnDelta)
 		return out, nil, err
+	}
+
+	// 第一轮A：用户要求「问我」→ 演示 ask_user（阻塞提问，回答回灌后总结）
+	if strings.Contains(lastUser, "问我") {
+		askArgs, _ := json.Marshal(map[string]any{
+			"question": "mock 演示：你更喜欢哪个颜色？",
+			"options":  []string{"蓝色（推荐）", "红色"},
+		})
+		askCall := ToolCall{ID: fmt.Sprintf("mock_%d_a", time.Now().UnixMilli()), Type: "function"}
+		askCall.Function.Name = "ask_user"
+		askCall.Function.Arguments = string(askArgs)
+		note := "我先问一下你的偏好。"
+		if hooks.OnDelta != nil {
+			if _, err := streamChars(ctx, note, hooks.OnDelta); err != nil {
+				return note, nil, err
+			}
+		}
+		hooks.reportUsage(60, 10)
+		return note, []ToolCall{askCall}, nil
 	}
 
 	// 第一轮：命中关键词 → 演示待办 + 写文件的组合调用

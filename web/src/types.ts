@@ -168,6 +168,22 @@ export interface Skill {
   updatedAt: string
 }
 
+/** 定时任务（cron_create 族工具维护，无人值守执行） */
+export interface Automation {
+  id: string
+  title: string
+  cron: string
+  prompt: string
+  projectId?: string
+  enabled: boolean
+  maxRuns?: number
+  runCount: number
+  nextRunAt?: string
+  lastRunAt?: string
+  createdAt: string
+  lastError?: string
+}
+
 export interface TreeItem {
   path: string
   isDir: boolean

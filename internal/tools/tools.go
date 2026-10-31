@@ -29,12 +29,33 @@ type Env struct {
 	// CommandTimeoutSec run_command 超时（秒；<=0 用默认 30）。构建/安装类命令可能需要调大。
 	CommandTimeoutSec int
 
-	// SetTodos / MemoryAppend / MemoryRead 是会话级能力的回调，由 handler 在
-	// 每次请求时用闭包注入（携带会话 ID、项目 ID 等上下文），tools 包保持零依赖。
-	// 为 nil 表示该能力本次不可用（工具执行时报错并提示）。
+	// SetTodos / MemoryAppend / MemoryRead / RunSubagent 是会话级能力的回调，
+	// 由 handler 在每次请求时用闭包注入（携带会话 ID、项目 ID 等上下文），
+	// tools 包保持零依赖。为 nil 表示该能力本次不可用（工具执行时报错并提示）。
 	SetTodos     func(todos []TodoItem) error
 	MemoryAppend func(scope, content string) (string, error)
 	MemoryRead   func(scope string) (string, error)
+	// RunSubagent 派一个子代理执行子任务：kind 为 "explore"（只读）或
+	// "general-purpose"（完整工具），prompt 必须自包含。返回子代理的最终汇报。
+	RunSubagent func(kind, prompt string) (string, error)
+	// SkillRead 读取一个已启用技能的完整正文（系统提示词只注入技能清单）。
+	SkillRead func(name string) (string, error)
+	// AskUser 阻塞式向用户提问（ask_user 工具回调）：问题 + 选项（可空 = 自由输入）
+	// + 是否多选。返回用户回答（多选时逗号分隔 / 自由输入时原文）。
+	// 为 nil 表示本次会话无法交互（工具执行时报错）。
+	AskUser func(question string, options []string, multiSelect bool) (string, error)
+	// PermissionAsk 是 ask 模式的执行前审批回调（仅对写类工具调用）：
+	// 返回 false = 用户拒绝，工具不执行。nil = 不拦截（非 ask 模式）。
+	PermissionAsk func(toolName, summary string) bool
+	// Cron 族回调：定时任务管理。CronCreate 为 nil 表示当前会话禁建
+	//（自动化触发的会话，防递归）；其余 nil = 功能不可用。
+	CronCreate func(title, expr, prompt, projectID string, maxRuns int) (string, error)
+	CronList   func() (string, error)
+	CronUpdate func(id, title, expr, prompt string, maxRuns int, enabled *bool) (string, error)
+	CronDelete func(id string) (string, error)
+	// Files 是会话级「已读文件」状态表（nil = 未启用新鲜度护栏）。
+	// read_file 登记、edit_file/write_file 修改已有文件前校验，防盲写覆盖。
+	Files *FileStateTracker
 }
 
 func (e *Env) clone() *Env {
@@ -56,9 +77,33 @@ type Tool struct {
 func Builtin() []Tool {
 	return []Tool{
 		toolListFiles, toolReadFile, toolEditFile, toolWriteFile,
-		toolSearchFiles, toolTodoWrite, toolMemoryAppend, toolMemoryRead,
-		toolRunCommand,
+		toolSearchFiles, toolFindFiles, toolTodoWrite, toolMemoryAppend,
+		toolMemoryRead, toolSkillRead, toolWebFetch, toolTask,
+		toolAskUser, toolCronCreate, toolCronList, toolCronUpdate,
+		toolCronDelete, toolRunCommand, toolTaskOutput, toolTaskKill,
 	}
+}
+
+// SubagentDefs 按子代理类型筛选工具集：
+//   - explore：只保留只读工具（复用 IsWriteCapable 过滤，含只读 MCP）
+//   - general-purpose：全量，但剔除 task 本身（防止子代理再派子代理的无限递归；
+//     深度上限在最外层控制，这里直接从源头去掉递归入口）
+func SubagentDefs(defs []ToolDef, kind string) []ToolDef {
+	out := make([]ToolDef, 0, len(defs))
+	for _, d := range defs {
+		name := d.Function.Name
+		if d.FromMCP != "" {
+			name = d.MCPTool
+		}
+		if name == "task" {
+			continue
+		}
+		if kind == "explore" && IsWriteCapable(name) {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 // ToolDef 是发给上游 OpenAI 接口的 tools 数组元素。
@@ -114,7 +159,10 @@ func IsWriteCapable(name string) bool {
 		return false
 	}
 	switch n {
-	case "write_file", "run_command":
+	case "write_file", "run_command", "task_kill":
+		return true
+	case "cron_create", "cron_update", "cron_delete":
+		// 调度类副作用：plan 模式过滤，ask 模式审批
 		return true
 	case "todo_write", "memory_append":
 		// 只写智能体自己的内部状态（会话待办 / 长期记忆文件），不碰用户项目文件：
