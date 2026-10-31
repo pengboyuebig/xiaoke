@@ -423,6 +423,28 @@ func TestE2EForkSearchExport(t *testing.T) {
 		t.Fatal("分叉会话消息数不一致")
 	}
 
+	// 源会话被占用（正在生成）时 fork 应 409
+	if unlock, locked := f.st.TryLockSession(sid); locked {
+		fresp2, err := http.Post(f.srv.URL+"/api/sessions/"+sid+"/fork", "application/json", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fresp2.Body.Close()
+		if fresp2.StatusCode != http.StatusConflict {
+			t.Fatalf("占用中的会话 fork 应 409，got %d", fresp2.StatusCode)
+		}
+		unlock()
+		// 释放后应能正常分叉
+		fresp3, err := http.Post(f.srv.URL+"/api/sessions/"+sid+"/fork", "application/json", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fresp3.Body.Close()
+		if fresp3.StatusCode != http.StatusOK {
+			t.Fatalf("释放后 fork 应 200，got %d", fresp3.StatusCode)
+		}
+	}
+
 	// 全文搜索：能找到源会话与分叉会话
 	sresp, err := http.Get(f.srv.URL + "/api/search?q=searchable+needle")
 	if err != nil {
@@ -438,7 +460,7 @@ func TestE2EForkSearchExport(t *testing.T) {
 	if err := json.NewDecoder(sresp.Body).Decode(&sr); err != nil {
 		t.Fatal(err)
 	}
-	if len(sr.Hits) != 2 {
+	if len(sr.Hits) < 2 {
 		t.Fatalf("源会话与分叉会话都应命中: %+v", sr.Hits)
 	}
 

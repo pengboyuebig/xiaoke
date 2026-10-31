@@ -95,10 +95,6 @@ export const api = {
   search(q: string): Promise<{ q: string; hits: { sessionId: string; title: string; role: string; snippet: string }[] }> {
     return jfetch(`/api/search?q=${encodeURIComponent(q)}`)
   },
-  /** Markdown 导出直链（浏览器直接下载） */
-  exportSessionMdUrl(id: string): string {
-    return `/api/sessions/${id}/export?format=md`
-  },
   // ---------- 回收站 ----------
   listTrash(): Promise<{ items: TrashItem[] }> {
     return jfetch('/api/trash')

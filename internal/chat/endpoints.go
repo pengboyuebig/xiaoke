@@ -10,8 +10,16 @@ import (
 )
 
 // forkSession 处理 POST /api/sessions/{id}/fork：复制会话为全新会话。
+// 先取会话锁：正在生成回复时拒绝（409）——否则会复制到「半轮」内容
+//（assistant 带着工具调用、结果还没落库）。
 func (h *Handler) forkSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	unlock, ok := h.store.TryLockSession(id)
+	if !ok {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "该会话正在生成回复，稍后再分叉"})
+		return
+	}
+	defer unlock()
 	dst, err := h.store.Fork(id, "（分叉）")
 	if err == store.ErrNotFound {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "会话不存在"})

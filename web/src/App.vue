@@ -71,6 +71,7 @@ interface QueuedMsg {
   hidden?: boolean
 }
 const sendQueue = ref<QueuedMsg[]>([])
+const QUEUE_CAP = 200
 let draining = false
 function drainQueue() {
   if (draining) return
@@ -82,6 +83,15 @@ function drainQueue() {
     // 队列里还有？下一帧继续取（避免深递归）
     if (sendQueue.value.length) window.setTimeout(drainQueue, 50)
   })
+}
+/** 清空队列（切会话/项目/智能体时必须：排队消息属于原上下文，漏到新会话就是数据错位） */
+function clearSendQueue() {
+  sendQueue.value = []
+}
+function flashNotice(text: string) {
+  compactNotice.value = text
+  if (compactTimer) window.clearTimeout(compactTimer)
+  compactTimer = window.setTimeout(() => (compactNotice.value = ''), 6000)
 }
 
 // 自定义斜杠命令（设置 → 高级维护）：Composer 补全与模板展开
@@ -146,9 +156,9 @@ function onModeChange(m: WorkMode) {
   if (m === 'build') clearApproval()
 }
 
-/** 批准计划：切开发模式 → 自动发送「开始」按计划开工（该消息不显示在对话里） */
+/** 批准计划：切开发模式 → 自动发送「开始」按计划开工（该消息不显示在对话里）。
+ *  流式进行中不再静默丢弃——handleSend 会把它排队，轮到时自动开工。 */
 function handleApprove() {
-  if (streaming.value) return
   clearApproval()
   setWorkMode('build')
   handleSend('开始', { hidden: true })
@@ -157,7 +167,7 @@ function handleApprove() {
 /** 批准但用自己的实现方式：切开发模式 → 发送用户写的指令（正常显示） */
 function handleApproveCustom(text: string) {
   const t = text.trim()
-  if (!t || streaming.value) return
+  if (!t) return
   clearApproval()
   setWorkMode('build')
   handleSend(t)
@@ -270,6 +280,7 @@ function handleSelectAgent(id: string) {
   if (currentAgentId.value === id && !currentId.value) return
   if (streaming.value) handleStop()
   clearApproval()
+  clearSendQueue()
   currentAgentId.value = id
   currentId.value = ''
   rememberSession('')
@@ -404,7 +415,11 @@ const turns = computed<Turn[]>(() => {
 async function handleSend(content: string, opts?: { hidden?: boolean }) {
   // 流式进行中：消息进入队列，当前轮结束后自动发送（Composer 的排队按钮/Enter 都会走到这里）
   if (streaming.value) {
-    if (sendQueue.value.length < 20) sendQueue.value.push({ content, hidden: opts?.hidden })
+    if (sendQueue.value.length >= QUEUE_CAP) {
+      flashNotice(`排队消息已达 ${QUEUE_CAP} 条上限，这条没有加入队列——请等当前回复结束后再发`)
+      return
+    }
+    sendQueue.value.push({ content, hidden: opts?.hidden })
     return
   }
   error.value = ''
@@ -538,6 +553,8 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
     // 无论成功/停止/出错都刷新会话列表：会话已落库，必须出现在侧栏（持久化可见）
     refreshSessions()
     refreshCommands()
+    // 自动起标题在服务端异步完成（晚于本次刷新），稍后再刷一次捡回新标题
+    if (mode.value !== 'mock') window.setTimeout(refreshSessions, 8000)
     // 队列里有排队的消息：自动继续发送
     if (sendQueue.value.length) window.setTimeout(drainQueue, 120)
   }
@@ -597,6 +614,7 @@ async function handleFork(id: string) {
 function handleNewChat() {
   if (streaming.value) handleStop()
   clearApproval()
+  clearSendQueue()
   currentId.value = ''
   rememberSession('')
   messages.value = []
@@ -610,6 +628,7 @@ async function handleSelect(id: string) {
   if (id === currentId.value) return
   if (streaming.value) handleStop()
   clearApproval()
+  clearSendQueue()
   try {
     const s = await api.getSession(id)
     currentId.value = s.id
@@ -665,6 +684,7 @@ async function handleRemove(id: string) {
 function handleSelectProject(id: string) {
   if (currentProjectId.value === id && !currentId.value) return
   if (streaming.value) handleStop()
+  clearSendQueue()
   currentProjectId.value = id
   currentId.value = ''
   messages.value = []
@@ -676,6 +696,7 @@ function handleSelectProject(id: string) {
 // 解绑项目，回到通用对话
 function unbindProject() {
   if (streaming.value) handleStop()
+  clearSendQueue()
   currentProjectId.value = ''
   currentId.value = ''
   messages.value = []

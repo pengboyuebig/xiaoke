@@ -109,29 +109,31 @@ const searchScanLimit = 200 << 10
 // SearchMessages 跨会话搜索消息内容（大小写不敏感）。q 少于 2 个 rune 返回空。
 // 会话按最近更新排序，最多返回 maxHits 条命中；任何失败静默跳过该会话
 //（搜索不能因个别损坏会话而整体失败）。
+// 加锁策略：全局锁只用来取「会话清单」，随后逐会话加锁读取——
+// 全程占全局锁会让搜索期间的所有会话写入卡住。
 func (s *Store) SearchMessages(q string, maxHits int) []SearchHit {
 	q = strings.TrimSpace(q)
 	if len([]rune(q)) < 2 || maxHits <= 0 {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return nil
-	}
-	ids := s.listIDsLocked(entries)
 	type sessMeta struct {
 		id    string
 		title string
 		at    time.Time
 	}
-	list := make([]sessMeta, 0, len(ids))
-	for _, id := range ids {
+	s.mu.Lock()
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		s.mu.Unlock()
+		return nil
+	}
+	list := make([]sessMeta, 0, len(entries))
+	for _, id := range s.listIDsLocked(entries) {
 		if m, err := s.loadMeta(id); err == nil {
 			list = append(list, sessMeta{id, m.Title, m.UpdatedAt})
 		}
 	}
+	s.mu.Unlock()
 	sort.Slice(list, func(i, j int) bool { return list[i].at.After(list[j].at) })
 
 	needle := strings.ToLower(q)
@@ -140,7 +142,7 @@ func (s *Store) SearchMessages(q string, maxHits int) []SearchHit {
 		if len(hits) >= maxHits {
 			break
 		}
-		sess, err := s.loadFullLocked(sm.id)
+		sess, err := s.Get(sm.id) // 每个会话短暂持锁，会话间可插入其他写入
 		if err != nil {
 			continue
 		}

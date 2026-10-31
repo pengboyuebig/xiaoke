@@ -510,6 +510,7 @@ onUpdated(highlight)
 
 /* ---------- 编辑 diff ---------- */
 .diff-view {
+  flex-basis: 100%; /* tl-row 是 flex 横排：diff 必须独占整行，否则会挤在结果右侧 */
   margin: 6px 0 2px 26px;
   border: 1px solid var(--border);
   border-radius: 9px;
@@ -580,6 +581,7 @@ onUpdated(highlight)
 .tl-row {
   position: relative;
   display: flex;
+  flex-wrap: wrap; /* 编辑 diff 需要另起一行（diff-view 独占 100% 宽） */
   align-items: baseline;
   gap: 7px;
   font-size: 12px;
