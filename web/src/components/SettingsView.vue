@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../lib/api'
-import type { Agent, Automation, MCPServerCfg, MCPStatus, SettingsView, Skill, TrashItem } from '../types'
+import type { Agent, Automation, CustomCommand, MCPServerCfg, MCPStatus, PermissionRule, SettingsView, Skill, TrashItem } from '../types'
 import AgentSection from './AgentSection.vue'
 import SkillSection from './SkillSection.vue'
 import Icon from './Icon.vue'
@@ -50,10 +50,13 @@ const form = reactive({
   allowlistText: 'git, npm, node, python, pip',
   maxTokens: 0,
   contextWindow: 0,
+  smallModel: '',
   autoCompact: true,
   commandTimeoutSec: 0,
   memoryText: '',
   memoryDirty: false,
+  permissions: [] as PermissionRule[],
+  commands: [] as CustomCommand[],
   mcpServers: [] as (MCPServerCfg & { argLines: string })[],
 })
 const newMcp = reactive({ name: '', command: '', argsText: '', dir: '' })
@@ -100,6 +103,22 @@ async function createAutomation() {
     autoBusy.value = ''
   }
 }
+// ---------- 权限规则 ----------
+function addPermission() {
+  form.permissions.push({ tool: '', pattern: '', effect: 'ask' })
+}
+function removePermission(i: number) {
+  form.permissions.splice(i, 1)
+}
+
+// ---------- 斜杠命令 ----------
+function addCommand() {
+  form.commands.push({ name: '', template: '' })
+}
+function removeCommand(i: number) {
+  form.commands.splice(i, 1)
+}
+
 async function toggleAutomation(a: Automation) {
   autoBusy.value = a.id
   try {
@@ -160,8 +179,11 @@ async function loadSettings() {
     form.allowlistText = s.commandAllowlist.join(', ')
     form.maxTokens = s.llm.maxTokens || 0
     form.contextWindow = s.llm.contextWindow || 0
+    form.smallModel = s.llm.smallModel || ''
     form.autoCompact = s.autoCompact !== false
     form.commandTimeoutSec = s.commandTimeoutSec || 0
+    form.permissions = (s.permissions || []).map((r) => ({ ...r }))
+    form.commands = (s.commands || []).map((c) => ({ ...c }))
     form.mcpServers = s.mcpServers.map((m) => ({
       ...m,
       args: [...m.args],
@@ -375,6 +397,7 @@ async function save() {
           maxHistory: Number(form.maxHistory) || 20,
           maxTokens: Math.max(0, Number(form.maxTokens) || 0),
           contextWindow: Math.max(0, Number(form.contextWindow) || 0),
+          smallModel: form.smallModel.trim(),
         },
         mcpServers: form.mcpServers.map((m) => ({
           name: m.name.trim(),
@@ -391,6 +414,15 @@ async function save() {
         autoCompact: form.autoCompact !== false,
         compactKeepCount: 0,
         commandTimeoutSec: Math.max(0, Number(form.commandTimeoutSec) || 0),
+        permissions: form.permissions.filter((r) => r.tool.trim()).map((r) => ({
+          tool: r.tool.trim(),
+          pattern: (r.pattern || '').trim(),
+          effect: r.effect,
+        })),
+        commands: form.commands.filter((c) => c.name.trim() && c.template.trim()).map((c) => ({
+          name: c.name.trim().replace(/^\/+/, ''),
+          template: c.template.trim(),
+        })),
       },
       form.clearApiKey,
     )
@@ -503,6 +535,13 @@ async function save() {
                 <button class="btn ghost" :disabled="testing" @click="runTest">{{ testing ? '测试中…' : '测试连接' }}</button>
               </div>
               <div v-if="testResult" class="test" :class="testResult.ok ? 'ok' : 'bad'">{{ testResult.text }}</div>
+            </div>
+            <div class="card">
+              <div class="card-title">轻量模型（可选）</div>
+              <input v-model="form.smallModel" class="inp" list="model-options" placeholder="留空 = 主模型" />
+              <div class="hint">
+                上下文压缩摘要、会话自动起标题等辅助调用走它——不需要强推理，用便宜的小模型（如 deepseek-chat 配主 deepseek-reasoner）省钱且更快。
+              </div>
             </div>
             <div class="grid">
               <div class="card">
@@ -661,6 +700,48 @@ async function save() {
                 </button>
                 <span v-if="form.memoryText" class="hint-inline">{{ form.memoryText.length }} 字符</span>
               </div>
+            </div>
+
+            <div class="card">
+              <div class="card-title">权限规则（{{ form.permissions.length }}/64）</div>
+              <div class="hint">
+                按书写顺序评估、取最后命中的规则（last-match-wins）。工具名支持 * ? 通配；
+                资源模式匹配参数摘要（如 path=hello.txt、command=git status），留空 = 任意参数。
+                effect：allow 直接放行 / ask 弹窗审批 / deny 直接拒绝。
+              </div>
+              <div v-for="(r, ri) in form.permissions" :key="ri" class="rule-row">
+                <input v-model="r.tool" class="inp rule-tool" placeholder="工具名，如 write_file 或 run_command" />
+                <input v-model="r.pattern" class="inp rule-pattern" placeholder="资源模式（可空），如 git status* 或 *.env" />
+                <select v-model="r.effect" class="inp rule-effect">
+                  <option value="allow">allow</option>
+                  <option value="ask">ask</option>
+                  <option value="deny">deny</option>
+                </select>
+                <button class="ab-btn danger" @click="removePermission(ri)">
+                  <Icon name="trash" :size="13" />
+                </button>
+              </div>
+              <button class="btn ghost tiny" @click="addPermission">
+                <Icon name="plus" :size="13" /> 添加规则
+              </button>
+            </div>
+
+            <div class="card">
+              <div class="card-title">斜杠命令（{{ form.commands.length }}/64）</div>
+              <div class="hint">
+                输入框里敲 / 触发补全。模板变量：$ARGUMENTS = 全部参数文本；$1..$9 = 按空白分词的位置参数。
+                例：模板「把 $ARGUMENTS 翻译成英文」→ 输入 /tr 你好世界 → 发送「把 你好世界 翻译成英文」。
+              </div>
+              <div v-for="(c, ci) in form.commands" :key="ci" class="cmd-row">
+                <input v-model="c.name" class="inp cmd-name" placeholder="命令名（不带 /）" />
+                <textarea v-model="c.template" class="inp cmd-template" rows="2" placeholder="提示词模板，如：把 $ARGUMENTS 整理成待办清单"></textarea>
+                <button class="ab-btn danger" @click="removeCommand(ci)">
+                  <Icon name="trash" :size="13" />
+                </button>
+              </div>
+              <button class="btn ghost tiny" @click="addCommand">
+                <Icon name="plus" :size="13" /> 添加命令
+              </button>
             </div>
 
             <div class="card">
@@ -1171,6 +1252,40 @@ textarea.inp {
 }
 
 /* 定时任务管理 */
+/* ---------- 权限规则 & 斜杠命令 ---------- */
+.rule-row,
+.cmd-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-bottom: 7px;
+}
+
+.rule-tool {
+  width: 34%;
+  flex-shrink: 0;
+}
+
+.rule-pattern {
+  flex: 1;
+}
+
+.rule-effect {
+  width: 96px;
+  flex-shrink: 0;
+}
+
+.cmd-name {
+  width: 180px;
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+}
+
+.cmd-template {
+  flex: 1;
+  resize: vertical;
+}
+
 .auto-list {
   margin-top: 10px;
   display: flex;

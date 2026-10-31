@@ -34,6 +34,8 @@ export interface ToolActivity {
   preview?: string
   error?: string
   ms?: number
+  /** 编辑 diff（tool_result 事件携带，仅本次流式会话内可见） */
+  diff?: string
 }
 
 /** 同一回合的工具调用与结果（按 toolCallId 配对） */
@@ -43,6 +45,8 @@ export interface ToolPair {
   arguments: string
   result?: string
   ok?: boolean
+  /** 编辑 diff（tool_result 事件携带，流式期间可见） */
+  diff?: string
 }
 
 /** 前端把连续的 assistant/tool 消息合并后的渲染分组 */
@@ -74,6 +78,8 @@ export interface Turn {
   streaming?: boolean
   /** 用户中途停止生成（无正文时显示「已停止」而不是「没有收到内容」） */
   stopped?: boolean
+  /** 回合起始 user 消息在 messages 里的下标（回退「重来」定位用） */
+  msgIndex?: number
 }
 
 export interface SessionMeta {
@@ -208,6 +214,7 @@ export interface SettingsView {
     apiKeySet: boolean
     apiKeyTail: string
     model: string
+    smallModel: string
     temperature: number
     maxHistory: number
     maxTokens: number
@@ -222,6 +229,21 @@ export interface SettingsView {
   autoCompact: boolean
   compactKeepCount: number
   commandTimeoutSec: number
+  permissions: PermissionRule[]
+  commands: CustomCommand[]
+}
+
+/** 一条权限规则：工具名与资源模式支持 * ? 通配，按书写顺序取最后命中 */
+export interface PermissionRule {
+  tool: string
+  pattern?: string
+  effect: 'allow' | 'ask' | 'deny'
+}
+
+/** 斜杠命令模板：$ARGUMENTS=全部参数，$1..$9=位置参数 */
+export interface CustomCommand {
+  name: string
+  template: string
 }
 
 export interface MCPStatus {
@@ -244,6 +266,7 @@ export interface SettingsPayload {
     baseURL: string
     apiKey: string
     model: string
+    smallModel: string
     temperature: number
     maxHistory: number
     maxTokens: number
@@ -257,4 +280,6 @@ export interface SettingsPayload {
   autoCompact: boolean
   compactKeepCount: number
   commandTimeoutSec: number
+  permissions: PermissionRule[]
+  commands: CustomCommand[]
 }

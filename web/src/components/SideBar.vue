@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type { Agent, Project, SessionMeta } from '../types'
+import { api } from '../lib/api'
 import AvatarBadge from './AvatarBadge.vue'
 import Icon from './Icon.vue'
 
@@ -25,6 +26,8 @@ const emit = defineEmits<{
   removeProject: [id: string]
   selectAgent: [id: string]
   openSettings: []
+  /** 分叉会话：复制全部消息为新会话 */
+  fork: [id: string]
 }>()
 
 
@@ -47,7 +50,8 @@ function cancelRename() {
   renamingText.value = ''
 }
 
-// 会话搜索：标题/ID 本地过滤（纯前端，无请求）
+// 会话搜索：标题/ID 本地过滤；输入 ≥2 字符按回车 → 后端全文搜索消息内容
+//（跨会话找「哪次聊过」，点击命中跳转会话）
 const sessionQuery = ref('')
 const filteredSessions = computed(() => {
   const q = sessionQuery.value.trim().toLowerCase()
@@ -56,6 +60,43 @@ const filteredSessions = computed(() => {
     (s) => (s.title || '').toLowerCase().includes(q) || s.id.includes(q),
   )
 })
+
+interface ContentHit {
+  sessionId: string
+  title: string
+  role: string
+  snippet: string
+}
+const contentHits = ref<ContentHit[]>([])
+const searchBusy = ref(false)
+const searchErr = ref('')
+async function searchContent() {
+  const q = sessionQuery.value.trim()
+  if (q.length < 2) return
+  searchBusy.value = true
+  searchErr.value = ''
+  try {
+    const r = await api.search(q)
+    contentHits.value = r.hits
+    if (!r.hits.length) searchErr.value = '没有会话内容命中。'
+  } catch (e) {
+    searchErr.value = (e as Error).message
+  } finally {
+    searchBusy.value = false
+  }
+}
+function clearContentHits() {
+  contentHits.value = []
+  searchErr.value = ''
+}
+watch(sessionQuery, (v) => {
+  if (!v.trim()) clearContentHits()
+})
+function jumpToHit(id: string) {
+  clearContentHits()
+  sessionQuery.value = ''
+  emit('select', id)
+}
 
 // 智能体切换下拉
 const expanding = ref(false)
@@ -146,8 +187,17 @@ function projectName(projects: Project[], id?: string): string {
       v-model="sessionQuery"
       class="sess-search"
       type="search"
-      placeholder="搜索会话…"
+      placeholder="搜索会话…（回车搜内容）"
+      @keydown.enter.prevent="searchContent"
     />
+    <!-- 全文搜索结果（跨会话搜消息内容） -->
+    <div v-if="contentHits.length || searchErr" class="search-drop">
+      <div v-if="searchErr" class="empty">{{ searchErr }}</div>
+      <button v-for="(h, hi) in contentHits" :key="hi" class="hit-item" :title="h.snippet" @click="jumpToHit(h.sessionId)">
+        <span class="hit-title">{{ h.title || '新对话' }}</span>
+        <span class="hit-snippet">{{ h.role === 'user' ? '🧑' : '🤖' }} {{ h.snippet }}</span>
+      </button>
+    </div>
     <div class="list">
       <div
         v-for="s in filteredSessions"
@@ -176,6 +226,9 @@ function projectName(projects: Project[], id?: string): string {
           @dblclick.stop="startRename(s)"
         >{{ s.title || '新对话' }}</span>
         <span class="item-time">{{ fmtTime(s.updatedAt) }}</span>
+        <button class="item-export" title="分叉会话：复制全部消息为独立副本" @click.stop="emit('fork', s.id)">
+          <Icon name="clipboard" :size="12" />
+        </button>
         <a
           class="item-export"
           :href="`/api/sessions/${s.id}/export`"
@@ -184,6 +237,15 @@ function projectName(projects: Project[], id?: string): string {
           @click.stop
         >
           <Icon name="download" :size="12" />
+        </a>
+        <a
+          class="item-export"
+          :href="`/api/sessions/${s.id}/export?format=md`"
+          :download="`session-${s.id}.md`"
+          title="导出这个会话（Markdown）"
+          @click.stop
+        >
+          <Icon name="book" :size="12" />
         </a>
         <button class="item-del" title="删除会话" @click.stop="emit('remove', s.id)">
           <Icon name="x" :size="12" :stroke="2" />
@@ -242,6 +304,54 @@ function projectName(projects: Project[], id?: string): string {
   font-size: 13px;
   color: var(--text);
   outline: none;
+}
+
+/* ---------- 全文搜索下拉 ---------- */
+.search-drop {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 0 8px;
+  padding: 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: linear-gradient(180deg, #1c202a 0%, #14171f 100%);
+  box-shadow: var(--shadow);
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.hit-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 9px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+
+.hit-item:hover {
+  background: rgba(255, 154, 61, 0.09);
+}
+
+.hit-title {
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hit-snippet {
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sess-search {

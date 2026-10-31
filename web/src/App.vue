@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api } from './lib/api'
-import type { Agent, Message, MsgGroup, Project, SessionMeta, Skill, Todo, ToolActivity, ToolPair, Turn } from './types'
+import type { Agent, CustomCommand, Message, MsgGroup, Project, SessionMeta, Skill, Todo, ToolActivity, ToolPair, Turn } from './types'
 import type { UsageInfo } from './lib/api'
 import SideBar from './components/SideBar.vue'
 import ChatView from './components/ChatView.vue'
@@ -43,15 +43,56 @@ interface AskRequest {
   summary?: string
   resolve: (answer: string) => void
 }
-const askRequest = ref<AskRequest | null>(null)
+const askQueue = ref<AskRequest[]>([])
+// AskDialog 一次只展示队首；并行工具/子代理可同时提问，排队逐个回答
+const askRequest = computed<AskRequest | null>(() => askQueue.value[0] ?? null)
 function handleAsk(req: AskRequest) {
-  askRequest.value = req
+  askQueue.value.push(req)
 }
 function handleAskAnswer(answer: string) {
-  const req = askRequest.value
+  const req = askQueue.value.shift()
   if (!req) return
-  askRequest.value = null
   req.resolve(answer) // POST 投递由 api.ts 的 SSE 循环统一处理
+}
+function clearAskQueue() {
+  // 流结束/出错：未决提问全部按「跳过」结清，弹窗不残留
+  for (const req of askQueue.value) req.resolve('')
+  askQueue.value = []
+}
+
+// 上游重试横幅：retry SSE 事件驱动，展示几秒后自动消失
+const retryNotice = ref('')
+let retryTimer: number | undefined
+
+// 消息队列：流式输出期间继续输入的消息先进队列，当前轮结束后自动逐条发送
+//（对标 opencode 的 queue 模式；steer 需要后端 SSE 多路复用，收益不成比例，不做）
+interface QueuedMsg {
+  content: string
+  hidden?: boolean
+}
+const sendQueue = ref<QueuedMsg[]>([])
+let draining = false
+function drainQueue() {
+  if (draining) return
+  const next = sendQueue.value.shift()
+  if (!next) return
+  draining = true
+  handleSend(next.content, { hidden: next.hidden }).finally(() => {
+    draining = false
+    // 队列里还有？下一帧继续取（避免深递归）
+    if (sendQueue.value.length) window.setTimeout(drainQueue, 50)
+  })
+}
+
+// 自定义斜杠命令（设置 → 高级维护）：Composer 补全与模板展开
+const slashCommands = ref<CustomCommand[]>([])
+async function refreshCommands() {
+  try {
+    const s = await api.getSettings()
+    slashCommands.value = s.commands || []
+  } catch {
+    /* 忽略 */
+  }
 }
 
 // 智能体
@@ -204,6 +245,7 @@ onMounted(async () => {
   refreshProjects()
   refreshAgents()
   refreshHealth()
+  refreshCommands()
   await refreshSessions()
   // 恢复上次的会话（刷新后不丢）
   try {
@@ -278,11 +320,12 @@ const turns = computed<Turn[]>(() => {
     t.endTime = iso
   }
 
-  for (const m of messages.value) {
+  for (let mi = 0; mi < messages.value.length; mi++) {
+    const m = messages.value[mi]
     if (m.role === 'user') {
       flushRound()
       // 隐藏消息（如批准计划的自动指令）不显示问题气泡，但仍开启一个新回合承接回复
-      cur = { question: m.hidden ? '' : m.content, groups: [], startTime: m.createdAt }
+      cur = { question: m.hidden ? '' : m.content, groups: [], startTime: m.createdAt, msgIndex: mi }
       roundNo = 0
       out.push(cur)
       continue
@@ -344,6 +387,7 @@ const turns = computed<Turn[]>(() => {
       arguments: t.args || '',
       result: t.done ? [t.error, t.preview].filter(Boolean).join(' | ') : undefined,
       ok: t.done ? t.ok : undefined,
+      diff: t.diff,
     }))
     cur.groups.push({
       kind: 'live',
@@ -358,7 +402,11 @@ const turns = computed<Turn[]>(() => {
 })
 
 async function handleSend(content: string, opts?: { hidden?: boolean }) {
-  if (streaming.value) return
+  // 流式进行中：消息进入队列，当前轮结束后自动发送（Composer 的排队按钮/Enter 都会走到这里）
+  if (streaming.value) {
+    if (sendQueue.value.length < 20) sendQueue.value.push({ content, hidden: opts?.hidden })
+    return
+  }
   error.value = ''
   // 新一轮开始：旧的批准条作废；记录本次发送的模式
   clearApproval()
@@ -419,7 +467,13 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
           t.preview = info.preview
           t.error = info.error
           t.ms = info.ms
+          t.diff = info.diff
         }
+      },
+      onRetry: (info) => {
+        retryNotice.value = `上游临时故障，${Math.round(info.delayMs / 1000)} 秒后自动重试（第 ${info.attempt}/${info.maxAttempts} 次）`
+        if (retryTimer) window.clearTimeout(retryTimer)
+        retryTimer = window.setTimeout(() => (retryNotice.value = ''), Math.min(info.delayMs + 2500, 15000))
       },
       onTodo: (todos) => {
         sessionTodos.value = todos
@@ -434,6 +488,7 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
         lastUsage.value = usage || null
       },
     })
+    clearAskQueue()
     // 无论正常结束还是中途停止，都以服务端落库为准刷新一次
     let serverHadThis = false
     if (r.sessionId === currentId.value || !currentId.value) {
@@ -475,12 +530,16 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
   } catch (e) {
     error.value = (e as Error).message || '出错了，请稍后再试'
   } finally {
+    clearAskQueue() // 流已结束/出错：未决的提问弹窗全部结清，不残留
     streaming.value = false
     streamingText.value = ''
     liveTools.value = []
     controller = null
     // 无论成功/停止/出错都刷新会话列表：会话已落库，必须出现在侧栏（持久化可见）
     refreshSessions()
+    refreshCommands()
+    // 队列里有排队的消息：自动继续发送
+    if (sendQueue.value.length) window.setTimeout(drainQueue, 120)
   }
 }
 
@@ -488,6 +547,51 @@ function handleStop() {
   abortedByUser = true
   clearApproval()
   controller?.abort()
+}
+
+/** 取消一条排队中的消息 */
+function cancelQueued(i: number) {
+  sendQueue.value.splice(i, 1)
+}
+
+/** 回退会话到第 index 条用户消息重来（文件随之恢复） */
+async function handleRevert(index: number | undefined) {
+  if (index === undefined || !currentId.value) return
+  if (streaming.value) return
+  const n = index + 1
+  const ok = await askConfirm({
+    title: '回到这条消息重来',
+    message: `将删除这条消息之后的所有对话（保留前 ${n} 条），并把它之后小柯改动过的文件恢复原状。确定继续？`,
+    confirmText: '回退',
+  })
+  if (!ok) return
+  try {
+    const r = await api.revertSession(currentId.value, index)
+    const s = await api.getSession(currentId.value)
+    messages.value = s.messages
+    sessionTodos.value = s.todos || []
+    const touched = r.files?.length
+      ? '；恢复文件：' + r.files.map((f) => `${f.path}(${f.action === 'deleted' ? '已删除' : f.action === 'restored' ? '已恢复' : '跳过'})`).join('、')
+      : ''
+    error.value = ''
+    compactNotice.value = `已回退到第 ${n} 条消息${touched}`
+    if (compactTimer) window.clearTimeout(compactTimer)
+    compactTimer = window.setTimeout(() => (compactNotice.value = ''), 6000)
+    refreshSessions()
+  } catch (e) {
+    error.value = (e as Error).message
+  }
+}
+
+/** 分叉会话：复制全部消息为独立副本继续聊 */
+async function handleFork(id: string) {
+  try {
+    const r = await api.forkSession(id)
+    await refreshSessions()
+    await handleSelect(r.id)
+  } catch (e) {
+    error.value = (e as Error).message
+  }
 }
 
 function handleNewChat() {
@@ -626,6 +730,7 @@ function onSettingsClosed() {
       @remove-project="handleDeleteProject"
       @select-agent="handleSelectAgent"
       @open-settings="settingsOpen = true"
+      @fork="handleFork"
     />
     <main class="main">
       <div v-if="currentProject" class="proj-banner">
@@ -641,6 +746,17 @@ function onSettingsClosed() {
       <transition name="toast">
         <div v-if="compactNotice" class="compact-notice">{{ compactNotice }}</div>
       </transition>
+      <transition name="toast">
+        <div v-if="retryNotice" class="compact-notice retry-notice">{{ retryNotice }}</div>
+      </transition>
+      <!-- 排队中的消息（当前轮结束后自动逐条发送，点击移除） -->
+      <div v-if="sendQueue.length" class="queue-strip">
+        <span v-for="(q, i) in sendQueue" :key="i" class="queue-chip" :title="q.content + '\n（点击移除）'" @click="cancelQueued(i)">
+          <Icon name="queue" :size="12" />
+          <span class="qc-text">{{ q.content.slice(0, 40) }}</span>
+          <Icon name="x" :size="11" :stroke="2" />
+        </span>
+      </div>
       <ChatView
         :turns="turns"
         :streaming="streaming"
@@ -659,12 +775,14 @@ function onSettingsClosed() {
         @approve-custom="handleApproveCustom"
         @adjust-plan="handleAdjustPlan"
         @quick="handleSend"
+        @revert="handleRevert"
       />
       <Composer
         :busy="streaming"
         :reasoning="reasoning"
         :mode="workMode"
         :session-id="currentId"
+        :commands="slashCommands"
         @send="handleSend"
         @stop="handleStop"
         @update:reasoning="setReasoning"
@@ -773,6 +891,48 @@ function onSettingsClosed() {
   backdrop-filter: blur(18px);
   z-index: 60;
   pointer-events: none;
+}
+
+.retry-notice {
+  top: 122px;
+  background: rgba(250, 204, 21, 0.1);
+  border-color: rgba(250, 204, 21, 0.35);
+}
+
+.queue-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: var(--content-w);
+  margin: 0 auto;
+  padding: 0 28px 6px;
+  width: 100%;
+}
+
+.queue-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  padding: 4px 10px;
+  border: 1px dashed rgba(255, 154, 61, 0.4);
+  border-radius: 999px;
+  background: rgba(255, 154, 61, 0.07);
+  color: var(--text-muted);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.queue-chip:hover {
+  border-color: rgba(251, 113, 133, 0.5);
+  background: rgba(251, 113, 133, 0.08);
+}
+
+.qc-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (max-width: 720px) {

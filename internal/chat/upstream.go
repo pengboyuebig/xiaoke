@@ -7,10 +7,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,6 +57,9 @@ type Hooks struct {
 	// OnUsage 上报本轮 token 用量（上游真实 usage 优先，缺失时字节估算兜底）。
 	// 由 streamFn 在调用方 goroutine 内顺序调用，无并发。
 	OnUsage func(prompt, completion int64)
+	// OnRetry 上游请求即将重试（attempt 从 1 开始；delayMs 为本次退避时长）。
+	// HTTP 场景用于向前端发 retry 事件；无人值守场景为 nil，静默重试。
+	OnRetry func(attempt, maxAttempts int, delayMs int64, reason string)
 }
 
 // reportUsage 统一上报入口：nil 安全。
@@ -98,6 +103,8 @@ func withReasoning(body map[string]any, effort string) {
 type StreamFn func(ctx context.Context, llm config.LLMConfig, messages []ChatMessage, toolDefs []tools.ToolDef, hooks Hooks, reasoning string) (string, []ToolCall, error)
 
 // Upstream 按 mode 返回对应实现（每次请求时构造，支持设置热更新）。
+// openai 实现外包一层重试：网络错误 / 429 / 5xx / 首个增量前的流中断
+// 按指数退避自动重试（详见 streamOpenAIRetry）；mock 模式不重试。
 func Upstream(llm config.LLMConfig) StreamFn {
 	if strings.EqualFold(llm.Mode, "mock") {
 		return func(ctx context.Context, cfg config.LLMConfig, messages []ChatMessage, toolDefs []tools.ToolDef, hooks Hooks, reasoning string) (string, []ToolCall, error) {
@@ -105,7 +112,116 @@ func Upstream(llm config.LLMConfig) StreamFn {
 		}
 	}
 	return func(ctx context.Context, cfg config.LLMConfig, messages []ChatMessage, toolDefs []tools.ToolDef, hooks Hooks, reasoning string) (string, []ToolCall, error) {
-		return streamOpenAI(ctx, cfg, messages, toolDefs, hooks, reasoning)
+		return streamOpenAIRetry(ctx, cfg, messages, toolDefs, hooks, reasoning, streamOpenAI)
+	}
+}
+
+// ---------- 上游重试 ----------
+
+// 重试参数用变量而非常量：测试里可以临时调小退避，不必真等几秒。
+var (
+	// upstreamMaxRetries 最多重试次数（不含首次请求）。
+	upstreamMaxRetries = 3
+	// 退避基数与封顶：2s → 4s → 8s，封顶 10s。
+	upstreamBaseDelay = 2 * time.Second
+	upstreamMaxDelay  = 10 * time.Second
+	// Retry-After 尊重但封顶：上游让等 15 分钟对交互式对话没有意义，
+	// 等满 1 分钟还不过就重试（失败也只损失一次尝试）。
+	upstreamRetryAfterCap = 60 * time.Second
+)
+
+// upstreamErr 带类别的上游错误：重试策略按 kind 决定。
+type upstreamErr struct {
+	kind       string // network | status | midstream | breaker
+	status     int
+	retryAfter time.Duration // 429/503 响应头给的建议等待（0 = 未知）
+	msg        string
+}
+
+func (e *upstreamErr) Error() string { return e.msg }
+
+// parseRetryAfter 解析 Retry-After 响应头（秒数或 HTTP 日期），无法解析返回 0。
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if sec, err := strconv.Atoi(v); err == nil && sec > 0 {
+		return time.Duration(sec) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// retryableUpstream 判断一次失败是否值得重试。
+// 熔断跳闸（快速失败的本意就是别再打了）、内容为空、本地参数错误都不重试。
+func retryableUpstream(err error) bool {
+	var ue *upstreamErr
+	if !errors.As(err, &ue) {
+		return false
+	}
+	switch ue.kind {
+	case "network", "midstream":
+		return true
+	case "status":
+		return ue.status == http.StatusTooManyRequests || ue.status >= 500
+	}
+	return false
+}
+
+// retryDelay 计算第 attempt 次重试（0 起）前的等待：优先 Retry-After（封顶），否则指数退避。
+func retryDelay(ue *upstreamErr, attempt int) time.Duration {
+	if ue != nil && ue.retryAfter > 0 {
+		if ue.retryAfter > upstreamRetryAfterCap {
+			return upstreamRetryAfterCap
+		}
+		return ue.retryAfter
+	}
+	d := upstreamBaseDelay << attempt
+	if d > upstreamMaxDelay || d <= 0 {
+		return upstreamMaxDelay
+	}
+	return d
+}
+
+// streamOpenAIRetry 给单轮流式请求包一层重试。关键约束：
+// 只有在「尚未向用户输出任何增量」时才允许重试——已经吐出去的字没法撤回，
+// 重试会造成重复输出。每次尝试独立计熔断（连续失败自然触发跳闸短路重试循环）。
+func streamOpenAIRetry(
+	ctx context.Context, cfg config.LLMConfig, messages []ChatMessage,
+	toolDefs []tools.ToolDef, hooks Hooks, reasoning string, impl StreamFn,
+) (string, []ToolCall, error) {
+	for attempt := 0; ; attempt++ {
+		sent := false
+		wh := hooks
+		if wh.OnDelta != nil {
+			orig := wh.OnDelta
+			wh.OnDelta = func(s string) { sent = true; orig(s) }
+		}
+		if wh.OnToolCall != nil {
+			orig := wh.OnToolCall
+			wh.OnToolCall = func(d ToolDelta) { sent = true; orig(d) }
+		}
+		text, calls, err := impl(ctx, cfg, messages, toolDefs, wh, reasoning)
+		if err == nil || ctx.Err() != nil || sent || attempt >= upstreamMaxRetries || !retryableUpstream(err) {
+			return text, calls, err
+		}
+		var ue *upstreamErr
+		_ = errors.As(err, &ue)
+		delay := retryDelay(ue, attempt)
+		log.Printf("上游请求失败，%s 后进行第 %d/%d 次重试: %v", delay.Round(time.Millisecond), attempt+1, upstreamMaxRetries, err)
+		if hooks.OnRetry != nil {
+			hooks.OnRetry(attempt+1, upstreamMaxRetries, delay.Milliseconds(), err.Error())
+		}
+		select {
+		case <-ctx.Done():
+			return "", nil, ctx.Err()
+		case <-time.After(delay):
+		}
 	}
 }
 
@@ -138,7 +254,7 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 	}
 	br := upstreamBreakers.For(cfg.BaseURL + "|" + cfg.Model)
 	if d := br.Allow(); d == breaker.Tripped {
-		return "", nil, fmt.Errorf("上游 %s 连续失败已被熔断（10 秒后自动放一个探测请求），请检查服务状态或稍后重试", cfg.BaseURL)
+		return "", nil, &upstreamErr{kind: "breaker", msg: fmt.Sprintf("上游 %s 连续失败已被熔断（10 秒后自动放一个探测请求），请检查服务状态或稍后重试", cfg.BaseURL)}
 	}
 	success := false
 	// 记录点从「请求真正发向网络」开始：本地的 payload 序列化/URL 构造错误
@@ -184,7 +300,7 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 	resp, err := streamClient.Do(req)
 	if err != nil {
 		recordBreaker()
-		return "", nil, fmt.Errorf("请求上游失败: %w", err)
+		return "", nil, &upstreamErr{kind: "network", msg: fmt.Sprintf("请求上游失败: %v", err)}
 	}
 	defer func() {
 		resp.Body.Close()
@@ -192,7 +308,12 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 	}()
 	if resp.StatusCode != http.StatusOK {
 		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return "", nil, fmt.Errorf("上游返回 %s: %s", resp.Status, truncateRunes(strings.TrimSpace(string(limited)), 500))
+		return "", nil, &upstreamErr{
+			kind:       "status",
+			status:     resp.StatusCode,
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+			msg:        fmt.Sprintf("上游返回 %s: %s", resp.Status, truncateRunes(strings.TrimSpace(string(limited)), 500)),
+		}
 	}
 
 	var full strings.Builder
@@ -247,7 +368,7 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 			if rerr == io.EOF {
 				break
 			}
-			return full.String(), nil, fmt.Errorf("读取上游流中断: %w", rerr)
+			return full.String(), nil, &upstreamErr{kind: "midstream", msg: fmt.Sprintf("读取上游流中断: %v", rerr)}
 		}
 	}
 	calls := make([]ToolCall, 0, len(order))

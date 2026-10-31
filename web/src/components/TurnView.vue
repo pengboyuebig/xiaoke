@@ -5,6 +5,18 @@ import type { MsgGroup, ToolPair } from '../types'
 import Icon from './Icon.vue'
 import { renderMarkdownCollapsed } from '../lib/markdown'
 
+// ---------- 编辑 diff 渲染 ----------
+const DIFF_NL = '\n'
+function diffLines(diff: string): string[] {
+  return (diff || '').split(DIFF_NL)
+}
+function diffClass(line: string): string {
+  if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) return 'diff-meta'
+  if (line.startsWith('+')) return 'diff-add'
+  if (line.startsWith('-')) return 'diff-del'
+  return 'diff-ctx'
+}
+
 const props = defineProps<{
   /** 回合内的分组（assistant 工具块 + 正文；流式实时组已由 App 并入） */
   groups: MsgGroup[]
@@ -262,6 +274,10 @@ onUpdated(highlight)
             {{ t.ok ? resultLabel(t) : '失败' }}
           </span>
           <span v-else class="tl-run">运行中…</span>
+          <!-- 编辑 diff（tool_result 事件携带）：+绿 -红 -->
+          <div v-if="t.diff" class="diff-view">
+            <div v-for="(dl, di) in diffLines(t.diff)" :key="'d' + i + '-' + di" :class="diffClass(dl)">{{ dl || ' ' }}</div>
+          </div>
         </div>
       </div>
 
@@ -278,6 +294,9 @@ onUpdated(highlight)
           </div>
           <pre v-if="t.arguments" class="ri-args">{{ t.arguments }}</pre>
           <pre v-if="t.result !== undefined" class="ri-res" :class="t.ok ? 'ok' : 'bad'">{{ t.result }}</pre>
+          <div v-if="t.diff" class="diff-view">
+            <div v-for="(dl, di) in diffLines(t.diff)" :key="'rd' + i + '-' + di" :class="diffClass(dl)">{{ dl || ' ' }}</div>
+          </div>
         </div>
       </details>
 
@@ -487,6 +506,44 @@ onUpdated(highlight)
   margin-left: auto;
   display: flex;
   color: var(--text-faint);
+}
+
+/* ---------- 编辑 diff ---------- */
+.diff-view {
+  margin: 6px 0 2px 26px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: rgba(0, 0, 0, 0.28);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  overflow-x: auto;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 6px 0;
+  white-space: pre;
+}
+
+.diff-view > div {
+  padding: 0 10px;
+}
+
+.diff-add {
+  color: #4ade80;
+  background: rgba(74, 222, 128, 0.07);
+}
+
+.diff-del {
+  color: #fb7185;
+  background: rgba(251, 113, 133, 0.07);
+}
+
+.diff-meta {
+  color: var(--text-faint);
+}
+
+.diff-ctx {
+  color: var(--text-muted);
 }
 
 /* ---------- 明细 ---------- */

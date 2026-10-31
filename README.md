@@ -97,6 +97,19 @@ xiaoke.exe
 - **长代码自动折叠**：回答里超过 10 行的代码块默认只显示一行摘要（`html · 43 行（点击展开）`），
   步骤标题与短命令照常可见，点摘要展开完整代码（带语法高亮）
 
+## 对话流与安全网（对标 opencode 的一批能力）
+
+- **消息排队**：流式输出期间继续输入不会被打断——发送即排队（输入框出现「排队」按钮与队列条），当前轮结束后自动逐条发出，排队中的消息可点击撤回。
+- **上游自动重试**：网络错误 / 429 / 5xx / 首字前的流中断按指数退避（2s→4s→8s）自动重试至多 3 次，尊重 Retry-After（封顶 60s）；已输出内容后不再重试（防重复输出）；前端显示黄色重试横幅。
+- **会话回退（重来）**：任意用户气泡悬停出「重来」——之后的消息删除、期间被 write/edit 改动的文件按写前快照恢复（不依赖 git，台账存于 `data/revert/`）。
+- **编辑 diff**：write_file 覆盖 / edit_file 修改已有文件时，工具结果附带统一 diff（+绿 -红），只在展示层，不进模型上下文。
+- **doom loop 防护**：完全相同的工具调用连续 3 轮 → 自动注入系统提醒，要求换方法或询问用户。
+- **权限规则**：设置 → 高级可配「工具名 + 资源通配 → allow/ask/deny」（last-match-wins），allow 免审批、deny 直接拒绝。
+- **斜杠命令**：设置 → 高级定义 `/名字 + 模板`（`$ARGUMENTS`/`$1..$9` 变量），输入框敲 `/` 即补全。
+- **后台任务完成自动唤醒**：`run_command is_background` 的任务结束后自动把结果注入会话继续处理（不再需要轮询 task_output）。
+- **small_model 分工**：配置「轻量模型」后，上下文压缩摘要与会话自动起标题走小模型；首轮结束后自动生成 16 字内标题（失败静默，用户改过的标题不覆盖）。
+- **会话分叉 / 全文搜索 / Markdown 导出**：侧栏悬停一键分叉；搜索框回车跨会话搜消息内容；导出按钮新增 Markdown 格式。
+
 ## 计划模式 ⇄ 开发模式（先调研，再批准，后开工）
 
 输入框左侧的胶囊按钮切换工作模式，选择记在浏览器本地：
@@ -171,7 +184,11 @@ xiaoke.exe
 | POST | `/api/trash/{dir}/restore` | 从回收站恢复一条会话（同 ID 仍在时返回 409） |
 | DELETE | `/api/trash/{dir}` | 彻底删除回收站里的一条记录 |
 | GET/PUT | `/api/memory` | 全局长期记忆读取/覆写（设置页「高级」编辑框） |
-| POST | `/api/chat` | 流式对话（SSE：start/delta/tool/tool_result/todo/done/error，请求可带 agentId/reasoning；done 携带本次 token 用量） |
+| POST | `/api/sessions/{id}/revert` | 会话回退：回到第 index 条用户消息重来（之后消息删除，期间改写的文件按台账恢复） |
+| POST | `/api/sessions/{id}/fork` | 分叉会话：复制全部消息/摘要/待办为独立副本 |
+| GET | `/api/search?q=` | 跨会话全文搜索消息内容（≥2 字符，返回命中会话与片段） |
+| GET | `/api/sessions/{id}/export?format=md` | 以 Markdown 导出会话（默认仍为 JSON） |
+| POST | `/api/chat` | 流式对话（SSE：start/delta/tool/tool_result（含 diff）/todo/ask/retry/done/error，请求可带 agentId/reasoning/mode；done 携带本次 token 用量） |
 
 ## 目录结构
 

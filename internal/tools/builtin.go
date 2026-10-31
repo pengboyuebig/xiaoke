@@ -587,16 +587,40 @@ func execWriteFile(ctx context.Context, env *Env, args json.RawMessage) (string,
 		return "", err
 	}
 	// 覆盖已有文件 = 修改操作：同样要求先读过（新建文件豁免）
+	existed := false
+	oldContent := ""
 	if info, statErr := os.Stat(abs); statErr == nil && !info.IsDir() {
+		existed = true
 		if err := env.Files.CheckEditable(abs); err != nil {
 			return "", fmt.Errorf("目标文件已存在，%w", err)
 		}
+		oldContent = readForDiff(abs)
 	}
 	if err := writeAtomic(abs, in.Content); err != nil {
 		return "", err
 	}
 	env.Files.MarkEdited(abs)
+	if oldContent != "" {
+		env.emitDiff(UnifiedDiff(oldContent, in.Content, 3))
+	}
+	if env.OnFileChange != nil {
+		env.OnFileChange(abs, oldContent, existed)
+	}
 	return fmt.Sprintf("已写入 %s（%d 字节）", filepath.ToSlash(in.Path), len(in.Content)), nil
+}
+
+// readForDiff 读文件内容供 diff 预览；超过 1MB 返回空串（预览不值得读入超大文件）。
+func readForDiff(abs string) string {
+	f, err := os.Open(abs)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 1<<20+1))
+	if err != nil || len(data) > 1<<20 {
+		return ""
+	}
+	return string(data)
 }
 
 // writeAtomic 原子写：先写同目录临时文件再 rename。直接 WriteFile 时进程被杀/断电
@@ -734,6 +758,10 @@ func execEditFile(ctx context.Context, env *Env, args json.RawMessage) (string, 
 		return "", err
 	}
 	env.Files.MarkEdited(abs)
+	env.emitDiff(UnifiedDiff(string(raw), content, 3))
+	if env.OnFileChange != nil {
+		env.OnFileChange(abs, string(raw), true)
+	}
 	batchNote := ""
 	if len(ops) > 1 {
 		batchNote = fmt.Sprintf("（批量 %d 处）", len(ops))
@@ -785,6 +813,26 @@ func truncateRunes(s string, n int) string {
 		return s
 	}
 	return string(rs[:n]) + "…"
+}
+
+// TruncateMiddle 中间截断：保留头尾砍中缝（导出供 chat 包复用）。
+// 错误信息常在尾部、正文常在头部，一刀切尾会丢报错。UTF-8 边界安全。
+func TruncateMiddle(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	const marker = "\n…(中间输出已截断)…\n"
+	head := max*2/3 - len(marker)/2
+	tail := max - head - len(marker)
+	if head < 1 || tail < 1 {
+		return truncateBytes(s, max)
+	}
+	start := len(s) - tail
+	// 尾部对齐到 rune 起始边界：向后收缩（不是向前扩，否则总长会超 max）
+	for start < len(s) && s[start]&0xC0 == 0x80 {
+		start++
+	}
+	return truncateBytes(s, head) + marker + s[start:]
 }
 
 // truncateBytes 按字节数截断，但不会切碎 UTF-8 序列。
@@ -1438,7 +1486,7 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 		return "", fmt.Errorf("工作目录不存在：%s（请先在侧栏选择或重建项目）", cwd)
 	}
 	if in.IsBackground {
-		return startBackgroundCommand(in.Command, in.Args, cwd)
+		return startBackgroundCommand(in.Command, in.Args, cwd, env.OnTaskDone)
 	}
 	cctx, cancel := context.WithTimeout(ctx, commandTimeout(env))
 	defer cancel()
@@ -1455,7 +1503,7 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 	// 判定失败，而是把同一条命令转为后台任务继续跑，返回 task_id 让模型
 	// 用 task_output 追进度——长构建/长测试不再被超时腰斩。
 	if runErr != nil && cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-		bgID, bgErr := startBackgroundCommand(in.Command, in.Args, cwd)
+		bgID, bgErr := startBackgroundCommand(in.Command, in.Args, cwd, env.OnTaskDone)
 		if bgErr == nil {
 			head := fmt.Sprintf("$ %s %s\n", in.Command, strings.Join(in.Args, " "))
 			timed := fmt.Sprintf("%s\n（前台等待 %s 超时，已自动转为后台继续运行：%s\n用 task_output 读取进度与结果）",
@@ -1528,7 +1576,9 @@ var (
 
 // startBackgroundCommand 启动后台任务。生命周期独立于 HTTP 请求：
 // 用独立的超时 context（10 分钟硬顶），请求结束/断开不影响任务运行。
-func startBackgroundCommand(command string, args []string, cwd string) (string, error) {
+// onDone 在任务进程结束（含失败/被杀）时以 task_id 回调（nil = 不回调），
+// 供会话层做「任务完成自动唤醒」。
+func startBackgroundCommand(command string, args []string, cwd string, onDone func(taskID string)) (string, error) {
 	cctx, cancel := context.WithTimeout(context.Background(), backgroundTaskMaxDuration)
 	cmd := exec.CommandContext(cctx, command, args...)
 	cmd.Dir = cwd
@@ -1598,13 +1648,41 @@ func startBackgroundCommand(command string, args []string, cwd string) (string, 
 			}
 		}
 		t.exitErr = cmd.Wait()
+		if onDone != nil {
+			onDone(t.id)
+		}
 	}()
 	return fmt.Sprintf("后台任务已启动 task_id=%s\n$ %s\n用 task_output 读取输出与状态；长命令（构建/安装）不要用前台模式干等。", id, t.cmdline), nil
 }
 
-// getBackgroundTask 查任务（不存在报错并列出当前任务）。
-func getBackgroundTask(id string) (*backgroundTask, error) {
+// BackgroundTaskResult 供 chat 层实现「后台任务完成唤醒」：返回命令行、
+// 输出尾部（4KB）与状态（completed/failed/running）。ok=false 表示任务不存在
+//（可能已被注册表清理）。
+func BackgroundTaskResult(id string) (cmdline, output, state string, ok bool) {
 	bgMu.Lock()
+	t, exist := bgTasks[id]
+	bgMu.Unlock()
+	if !exist {
+		return "", "", "", false
+	}
+	select {
+	case <-t.wait:
+		state = "completed"
+		if t.exitErr != nil {
+			state = "failed"
+		}
+	default:
+		return t.cmdline, "", "running", true
+	}
+	out := t.output()
+	if len(out) > 4096 {
+		out = out[len(out)-4096:]
+	}
+	return t.cmdline, out, state, true
+}
+
+// getBackgroundTask 查任务（不存在报错并列出当前任务）。
+func getBackgroundTask(id string) (*backgroundTask, error) {	bgMu.Lock()
 	defer bgMu.Unlock()
 	t, ok := bgTasks[id]
 	if !ok {
@@ -1652,7 +1730,8 @@ func execTaskOutput(ctx context.Context, env *Env, args json.RawMessage) (string
 	}
 	out := t.output()
 	if len(out) > maxOutBytes {
-		out = truncateBytes(out, maxOutBytes) + "\n…(输出已按 8KB 截断)"
+		// 保头尾砍中缝：启动信息在头部、最新进度/报错在尾部，只保头会丢报错
+		out = TruncateMiddle(out, maxOutBytes)
 	}
 	select {
 	case <-t.wait:

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import Icon from './Icon.vue'
+import type { CustomCommand } from '../types'
 
 const emit = defineEmits<{
   send: [content: string]
@@ -15,7 +16,14 @@ const ta = ref<HTMLTextAreaElement | null>(null)
 // 草稿按会话保存：切会话/误刷新不丢输入。上限 20 条草稿防 localStorage 膨胀。
 const DRAFT_PREFIX = 'xiaoke-draft:'
 const DRAFT_MAX = 20
-const props = defineProps<{ busy: boolean; reasoning: string; mode?: string; sessionId?: string }>()
+const props = defineProps<{
+  busy: boolean
+  reasoning: string
+  mode?: string
+  sessionId?: string
+  /** 自定义斜杠命令（设置 → 高级维护）；busy 时发送自动进入队列 */
+  commands?: CustomCommand[]
+}>()
 
 function loadDraft(sid?: string) {
   if (!sid) return ''
@@ -90,15 +98,80 @@ function resize() {
 }
 watch(text, resize)
 
+// ---------- 斜杠命令补全 ----------
+// 输入以 / 开头（单行）时展示命令菜单；发送时精确匹配命令名 → 模板展开后发送。
+const slashOpen = computed(() => text.value.startsWith('/') && !text.value.includes('\n'))
+const slashMatches = computed<CustomCommand[]>(() => {
+  if (!slashOpen.value) return []
+  const q = text.value.slice(1).split(/\s/)[0].toLowerCase()
+  return (props.commands || []).filter((c) => c.name.toLowerCase().startsWith(q)).slice(0, 6)
+})
+const slashActive = ref(0)
+watch(slashMatches, (m) => {
+  if (slashActive.value >= m.length) slashActive.value = 0
+})
+
+/** 模板展开：$ARGUMENTS=全部参数文本，$1..$9=按空白分词的位置参数 */
+function expandCommand(c: CustomCommand, input: string): string {
+  const rest = input.slice(1 + c.name.length).trim()
+  const parts = rest.split(/\s+/).filter(Boolean)
+  return c.template
+    .replace(/\$ARGUMENTS/g, rest)
+    .replace(/\$(\d)/g, (_m, d: string) => parts[Number(d) - 1] ?? '')
+}
+
+function pickSlash(c: CustomCommand) {
+  const expanded = expandCommand(c, text.value).trim()
+  text.value = ''
+  saveDraft(props.sessionId, '')
+  if (expanded) emit('send', expanded)
+}
+
+/** 悬停提示：展示完整模板（过长截断） */
+function expandHint(c: CustomCommand): string {
+  return c.template.length > 120 ? c.template.slice(0, 120) + '…' : c.template
+}
+
 function submit() {
   const content = text.value.trim()
-  if (!content || props.busy) return
+  if (!content) return
+  // 斜杠菜单打开时：Enter/点击=展开发送（精确匹配命令名）
+  if (content.startsWith('/') && slashMatches.value.length) {
+    const first = content.slice(1).split(/\s/)[0].toLowerCase()
+    const exact = slashMatches.value.find((c) => c.name.toLowerCase() === first)
+    if (exact) {
+      pickSlash(exact)
+      return
+    }
+    // 无精确匹配：把首个候选补全成 "/name " 继续编辑（Tab 语义并入 Enter）
+    if (slashMatches.value.length === 1 && !content.includes(' ')) {
+      text.value = '/' + slashMatches.value[0].name + ' '
+      return
+    }
+  }
   emit('send', content)
   text.value = ''
   saveDraft(props.sessionId, '')
 }
 
 function onKeydown(e: KeyboardEvent) {
+  if (slashOpen.value && slashMatches.value.length) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      slashActive.value = (slashActive.value + 1) % slashMatches.value.length
+      return
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      slashActive.value = (slashActive.value - 1 + slashMatches.value.length) % slashMatches.value.length
+      return
+    }
+    if (e.key === 'Tab') {
+      e.preventDefault()
+      text.value = '/' + slashMatches.value[slashActive.value].name + ' '
+      return
+    }
+  }
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault()
     submit()
@@ -152,6 +225,22 @@ function onLevelChange(e: Event) {
         </button>
       </div>
 
+      <!-- 斜杠命令补全（输入 / 时出现） -->
+      <div v-if="slashMatches.length" class="slash-menu">
+        <button
+          v-for="(c, i) in slashMatches"
+          :key="c.name"
+          class="slash-opt"
+          :class="{ active: i === slashActive }"
+          :title="expandHint(c)"
+          @mouseenter="slashActive = i"
+          @click="pickSlash(c)"
+        >
+          <b>/{{ c.name }}</b>
+          <i>{{ c.template.split('\n')[0].slice(0, 60) }}</i>
+        </button>
+      </div>
+
       <textarea
         ref="ta"
         v-model="text"
@@ -165,6 +254,16 @@ function onLevelChange(e: Event) {
       ></textarea>
       <button v-if="props.busy" class="btn stop" title="停止生成" @click="emit('stop')">
         <span class="stop-icon"></span>
+      </button>
+      <!-- busy 时发送按钮变为「排队」：当前轮结束后自动发出 -->
+      <button
+        v-if="props.busy"
+        class="btn send"
+        title="排队：当前回复结束后自动发送"
+        :disabled="!text.trim()"
+        @click="submit"
+      >
+        <Icon name="list" :size="16" :stroke="2.2" />
       </button>
       <button v-else class="btn send" title="发送" :disabled="!text.trim()" @click="submit">
         <Icon name="arrow-up" :size="17" :stroke="2.2" />
@@ -426,6 +525,57 @@ textarea::placeholder {
   height: 10px;
   background: var(--danger);
   border-radius: 2px;
+}
+
+/* ---------- 斜杠命令补全 ---------- */
+.slash-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  background: linear-gradient(180deg, #1c202a 0%, #14171f 100%);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 30;
+}
+
+.slash-opt {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 9px;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+
+.slash-opt.active,
+.slash-opt:hover {
+  background: rgba(255, 154, 61, 0.1);
+}
+
+.slash-opt b {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.slash-opt i {
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* 底部行：左侧免责提示，右侧思考程度选择器 */

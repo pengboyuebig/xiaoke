@@ -161,3 +161,43 @@ func TestPersistence(t *testing.T) {
 		t.Fatalf("重开应还原: %+v", got)
 	}
 }
+
+// 一次性延迟任务（once:N）：创建即定 NextRun、到期领取、跑完自动停用。
+func TestOnceDelayLifecycle(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "a.json"))
+	now := time.Now()
+	a, err := s.Create("延迟任务", "once:30", "做点事", "", 0, now)
+	if err != nil {
+		t.Fatalf("once: 创建应成功: %v", err)
+	}
+	if want := now.Add(30 * time.Minute); !a.NextRunAt.Equal(want) {
+		t.Fatalf("NextRun 应为 +30min: got %v want %v", a.NextRunAt, want)
+	}
+	if a.MaxRuns != 1 {
+		t.Fatalf("一次性任务应自动 MaxRuns=1: %d", a.MaxRuns)
+	}
+	// 未到期不触发
+	if got := s.Due(now.Add(time.Minute)); len(got) != 0 {
+		t.Fatalf("未到期不应触发: %d", len(got))
+	}
+	// 到期领取：RunCount=1、停用、NextRun 清零
+	got := s.Due(a.NextRunAt.Add(time.Minute))
+	if len(got) != 1 || got[0].RunCount != 1 {
+		t.Fatalf("到期应领取: %+v", got)
+	}
+	stored, _ := s.Get(a.ID)
+	if stored.Enabled || !stored.NextRunAt.IsZero() {
+		t.Fatalf("跑完应停用且清 NextRun: %+v", stored)
+	}
+	// 再也不触发
+	if got2 := s.Due(now.Add(24 * time.Hour)); len(got2) != 0 {
+		t.Fatal("停用后不应再触发")
+	}
+	// 非法延迟
+	if _, err := s.Create("坏", "once:0", "x", "", 0, now); err == nil {
+		t.Fatal("once:0 应拒绝")
+	}
+	if _, err := s.Create("坏2", "once:99999999", "x", "", 0, now); err == nil {
+		t.Fatal("超范围延迟应拒绝")
+	}
+}

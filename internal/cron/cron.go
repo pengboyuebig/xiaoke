@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,9 @@ import (
 
 // MaxAutomations 是全局任务数上限。
 const MaxAutomations = 20
+
+// oncePrefix 是一次性延迟任务的表达式前缀（execCronCreate 翻译 delay_minutes 产生）。
+const oncePrefix = "once:"
 
 var (
 	ErrNotFound  = errors.New("automation not found")
@@ -121,9 +125,23 @@ func (s *Store) Create(title, expr, prompt, projectID string, maxRuns int, now t
 	if title == "" || prompt == "" {
 		return Automation{}, fmt.Errorf("title 与 prompt 不能为空")
 	}
-	sched, err := Parse(expr)
-	if err != nil {
-		return Automation{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	// once:N = 一次性延迟任务（execCronCreate 把 delay_minutes 翻译成这种形态）：
+	// 不进 cron 求值器，直接定 NextRun = now + N 分钟，跑一次即停。
+	var onceDelay time.Duration
+	if strings.HasPrefix(expr, oncePrefix) {
+		mins, err := strconv.Atoi(strings.TrimPrefix(expr, oncePrefix))
+		if err != nil || mins < 1 || mins > 525600 {
+			return Automation{}, fmt.Errorf("%w: 一次性延迟 %q 不合法（1..525600 分钟）", ErrInvalid, expr)
+		}
+		onceDelay = time.Duration(mins) * time.Minute
+	} else {
+		sched, err := Parse(expr)
+		if err != nil {
+			return Automation{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+		}
+		if sched.Next(now).IsZero() {
+			return Automation{}, fmt.Errorf("%w: 表达式永远匹配不到时间", ErrInvalid)
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -138,8 +156,16 @@ func (s *Store) Create(title, expr, prompt, projectID string, maxRuns int, now t
 		ProjectID: projectID,
 		Enabled:   true,
 		MaxRuns:   maxRuns,
-		NextRunAt: sched.Next(now),
 		CreatedAt: now,
+	}
+	if onceDelay > 0 {
+		a.NextRunAt = now.Add(onceDelay)
+		if a.MaxRuns <= 0 {
+			a.MaxRuns = 1 // 一次性任务跑一次即停
+		}
+	} else {
+		sched, _ := Parse(expr)
+		a.NextRunAt = sched.Next(now)
 	}
 	if a.NextRunAt.IsZero() {
 		return Automation{}, fmt.Errorf("%w: 表达式永远匹配不到时间", ErrInvalid)
@@ -167,12 +193,20 @@ func (s *Store) Update(id, title, expr, prompt string, maxRuns int, enabled *boo
 			a.Prompt = strings.TrimSpace(prompt)
 		}
 		if strings.TrimSpace(expr) != "" && expr != a.Cron {
-			sched, err := Parse(expr)
-			if err != nil {
-				return Automation{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+			if strings.HasPrefix(expr, oncePrefix) {
+				mins, err := strconv.Atoi(strings.TrimPrefix(expr, oncePrefix))
+				if err != nil || mins < 1 || mins > 525600 {
+					return Automation{}, fmt.Errorf("%w: 一次性延迟 %q 不合法", ErrInvalid, expr)
+				}
+				a.NextRunAt = now.Add(time.Duration(mins) * time.Minute)
+			} else {
+				sched, err := Parse(expr)
+				if err != nil {
+					return Automation{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+				}
+				a.NextRunAt = sched.Next(now)
 			}
 			a.Cron = expr
-			a.NextRunAt = sched.Next(now)
 		}
 		if maxRuns >= 0 {
 			a.MaxRuns = maxRuns
@@ -221,6 +255,15 @@ func (s *Store) Due(now time.Time) []Automation {
 		}
 		if a.MaxRuns > 0 && a.RunCount >= a.MaxRuns {
 			a.Enabled = false
+			continue
+		}
+		if strings.HasPrefix(a.Cron, oncePrefix) {
+			// 一次性任务：跑完即停，无需推进下一次
+			a.LastRunAt = now
+			a.RunCount++
+			a.NextRunAt = time.Time{}
+			a.Enabled = false
+			due = append(due, *a)
 			continue
 		}
 		sched, err := Parse(a.Cron)

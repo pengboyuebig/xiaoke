@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -46,8 +45,7 @@ func (h *Handler) listAgents(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) createAgent(w http.ResponseWriter, r *http.Request) {
 	var in agents.Agent
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+	if !decodeJSON(w, r, &in) {
 		return
 	}
 	a, err := h.Res.Agents.Create(in)
@@ -60,8 +58,7 @@ func (h *Handler) createAgent(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) updateAgent(w http.ResponseWriter, r *http.Request) {
 	var in agents.Agent
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+	if !decodeJSON(w, r, &in) {
 		return
 	}
 	a, err := h.Res.Agents.Update(r.PathValue("id"), in)
@@ -138,8 +135,7 @@ func (h *Handler) listSkills(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) createSkill(w http.ResponseWriter, r *http.Request) {
 	var in skills.Skill
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+	if !decodeJSON(w, r, &in) {
 		return
 	}
 	s, err := h.Res.Skills.Create(in)
@@ -152,8 +148,7 @@ func (h *Handler) createSkill(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) updateSkill(w http.ResponseWriter, r *http.Request) {
 	var in skills.Skill
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+	if !decodeJSON(w, r, &in) {
 		return
 	}
 	s, err := h.Res.Skills.Update(r.PathValue("id"), in)

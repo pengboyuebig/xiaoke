@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -45,6 +46,14 @@ type Handler struct {
 	memory   *memory.Store
 	rules    *rules.Store
 	cron     *cron.Store
+
+	// grants 是 ask 模式的「本会话允许」登记表（内存态，重启即清——对标
+	// 主流 agent 的 session ruleset）。key = sessionID → toolName → granted。
+	grantsMu sync.Mutex
+	grants   map[string]map[string]bool
+
+	// revert 是会话回退的文件改动台账（data/revert/<sessionID>.json）。
+	revert *revertJournal
 }
 
 // maxHistoryBytes 是发给上游的历史消息总字节预算：
@@ -78,7 +87,11 @@ const maxToolResultBytes = 64 * 1024
 const maxToolArgBytes = 1 << 20
 
 func NewHandler(cfg *config.Config, st *store.Store, set *settings.Store, pm *projects.Manager, mm *mcp.Manager, ag *agents.Store, sk *skills.Store, mem *memory.Store, rs *rules.Store, cs *cron.Store) *Handler {
-	return &Handler{cfg: cfg, store: st, set: set, projects: pm, mcp: mm, agents: ag, skills: sk, memory: mem, rules: rs, cron: cs}
+	return &Handler{
+		cfg: cfg, store: st, set: set, projects: pm, mcp: mm, agents: ag, skills: sk,
+		memory: mem, rules: rs, cron: cs,
+		revert: newRevertJournal(filepath.Join(cfg.DataDir, "revert")),
+	}
 }
 
 // Register 把路由挂到 mux 上（Go 1.22+ 方法路由）。
@@ -89,6 +102,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/sessions/{id}/export", h.exportSession)
 	mux.HandleFunc("PUT /api/sessions/{id}/title", h.renameSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", h.deleteSession)
+	mux.HandleFunc("POST /api/sessions/{id}/revert", h.revertSessionHTTP)
+	mux.HandleFunc("POST /api/sessions/{id}/fork", h.forkSession)
+	mux.HandleFunc("GET /api/search", h.searchMessages)
 	mux.HandleFunc("GET /api/backup/sessions", h.backupSessions)
 	mux.HandleFunc("GET /api/trash", h.listTrash)
 	mux.HandleFunc("POST /api/trash/{dir}/restore", h.restoreTrash)
@@ -121,17 +137,35 @@ func (h *Handler) createAutomation(w http.ResponseWriter, r *http.Request) {
 	}
 	limitBody(w, r, 64*1024)
 	var in struct {
-		Title     string `json:"title"`
-		Cron      string `json:"cron"`
-		Prompt    string `json:"prompt"`
-		ProjectID string `json:"projectId"`
-		MaxRuns   int    `json:"maxRuns"`
+		Title    string `json:"title"`
+		Cron     string `json:"cron"`
+		DelayMin int    `json:"delayMinutes"`
+		// 兼容工具侧的 snake_case 写法（两处取值取大者）
+		DelayMinSnake int    `json:"delay_minutes"`
+		Prompt        string `json:"prompt"`
+		ProjectID     string `json:"projectId"`
+		MaxRuns       int    `json:"maxRuns"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
 		return
 	}
-	a, err := h.cron.Create(in.Title, in.Cron, in.Prompt, in.ProjectID, in.MaxRuns, time.Now())
+	// delay_minutes 与 cron 二选一（与工具同语义）：翻译成一次性表达式
+	if in.DelayMinSnake > in.DelayMin {
+		in.DelayMin = in.DelayMinSnake
+	}
+	expr := strings.TrimSpace(in.Cron)
+	if expr == "" && in.DelayMin > 0 {
+		if in.DelayMin < 1 || in.DelayMin > 525600 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "delayMinutes 取值 1..525600"})
+			return
+		}
+		expr = fmt.Sprintf("once:%d", in.DelayMin)
+		if in.MaxRuns <= 0 {
+			in.MaxRuns = 1
+		}
+	}
+	a, err := h.cron.Create(in.Title, expr, in.Prompt, in.ProjectID, in.MaxRuns, time.Now())
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -285,8 +319,13 @@ func (h *Handler) deleteSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "1"})
 }
 
-// exportSession 下载单个会话的完整 JSON（含未合并日志里的消息）。
+// exportSession 下载单个会话：默认完整 JSON（含未合并日志里的消息），
+// ?format=md 时导出 Markdown（给人读/归档）。
 func (h *Handler) exportSession(w http.ResponseWriter, r *http.Request) {
+	if strings.EqualFold(r.URL.Query().Get("format"), "md") {
+		h.exportSessionMarkdown(w, r)
+		return
+	}
 	id := r.PathValue("id")
 	data, err := h.store.Export(id)
 	if errors.Is(err, store.ErrNotFound) {
@@ -454,6 +493,29 @@ const maxContentBytes = 128 * 1024
 // 必须在 decode 之前用 MaxBytesReader 拦住——先读完 1GB 再检查就失去意义了。
 const maxChatBodyBytes = maxContentBytes + 64*1024
 
+// grantAllowed 查会话级 grant；grantSession 写入（惰性清理防泄漏）。
+func (h *Handler) grantAllowed(sessionID, toolName string) bool {
+	h.grantsMu.Lock()
+	defer h.grantsMu.Unlock()
+	return h.grants[sessionID][toolName]
+}
+
+func (h *Handler) grantSession(sessionID, toolName string) {
+	h.grantsMu.Lock()
+	defer h.grantsMu.Unlock()
+	if h.grants == nil {
+		h.grants = map[string]map[string]bool{}
+	}
+	if len(h.grants) > 256 {
+		// 粗粒度防泄漏：超阈值清空（grant 丢了最多再问一次，代价可接受）
+		h.grants = map[string]map[string]bool{}
+	}
+	if h.grants[sessionID] == nil {
+		h.grants[sessionID] = map[string]bool{}
+	}
+	h.grants[sessionID][toolName] = true
+}
+
 // limitBody 给请求体套 MaxBytesReader（在 decode 前生效的内存保护）。
 func limitBody(w http.ResponseWriter, r *http.Request, max int64) {
 	r.Body = http.MaxBytesReader(w, r.Body, max)
@@ -541,6 +603,7 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 
 // converseParams 是一次对话的全部入参（HTTP 请求与自动化共用）。
 // AutomationID 非空表示由定时任务触发：会话内禁建新定时任务（防递归）。
+// NoTaskWake 禁用后台任务完成唤醒（唤醒对话自身携带，防任务→唤醒→任务死循环）。
 type converseParams struct {
 	SessionID    string
 	Content      string
@@ -550,6 +613,7 @@ type converseParams struct {
 	Mode         string
 	Approve      bool
 	AutomationID string
+	NoTaskWake   bool
 }
 
 // httpStatusError 承载 converse 内需要返回给 HTTP 层的状态语义
@@ -648,6 +712,36 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 		Allowlist:         sset.CommandAllowlist,
 		CommandTimeoutSec: sset.CommandTimeoutSec,
 		Files:             tools.NewFileStateTracker(),
+		SessionID:         sess.ID,
+	}
+	// diff 捕获：写类工具串行执行，写前锁保护的单一暂存足够（并行批次里
+	// 只会有只读工具，它们不产 diff）。
+	var diffMu sync.Mutex
+	var pendingDiff string
+	env.OnDiff = func(d string) {
+		diffMu.Lock()
+		pendingDiff = d
+		diffMu.Unlock()
+	}
+	takeDiff := func() string {
+		diffMu.Lock()
+		defer diffMu.Unlock()
+		d := pendingDiff
+		pendingDiff = ""
+		return d
+	}
+	// 会话回退台账：写类工具落盘后记录写前快照（仅项目工作区内的写操作）。
+	if projPath != "" {
+		env.OnFileChange = func(abs, before string, existed bool) {
+			h.revertRecord(sess.ID, projPath, abs, before, existed)
+		}
+	}
+	// 后台任务完成唤醒：任务结束时若会话空闲，自动注入结果继续处理。
+	// 无人值守会话同样生效；但唤醒产生的对话本身不再注册唤醒（防任务→唤醒→任务死循环）。
+	if p.AutomationID == "" && !p.NoTaskWake {
+		env.OnTaskDone = func(taskID string) {
+			h.wakeSessionForTask(sess.ID, taskID)
+		}
 	}
 	// 会话级工具回调：待办写会话快照，记忆按项目分层（未选项目时落到全局层）
 	projID := ""
@@ -787,14 +881,21 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 	// 上下文控制（两层）：
 	//   1. 主动压缩——历史超预算时先把旧回合总结成摘要（持久化，可关闭）；
 	//   2. 被动裁剪——对「摘要之后的近期消息」按条数/字节硬裁，兜底。
+	// 配置了 smallModel 时压缩摘要走轻量模型（总结不需要强推理，省钱且更快）。
 	streamFn := Upstream(effAsConfig(eff))
+	compactFn, compactCfg := streamFn, effAsConfig(eff)
+	if sm := strings.TrimSpace(sset.LLM.SmallModel); sm != "" && !strings.EqualFold(eff.Mode, "mock") {
+		compactCfg = effAsConfig(eff)
+		compactCfg.Model = sm
+		compactFn = Upstream(compactCfg)
+	}
 	view := summaryView{Recent: full.Messages}
 	if sset.AutoCompact && !strings.EqualFold(eff.Mode, "mock") {
 		keep := eff.MaxHistory
 		if sset.CompactKeepCount > 0 {
 			keep = sset.CompactKeepCount
 		}
-		view = maybeCompact(ctx, h.store, full, keep, maxHistoryBytes, streamFn, effAsConfig(eff), eff.ContextWindow)
+		view = maybeCompact(ctx, h.store, full, keep, maxHistoryBytes, compactFn, compactCfg, eff.ContextWindow)
 	}
 	// 本次请求新生成的摘要（与请求开始时的快照对比）：用于向前端发 compact 事件
 	newSummary := ""
@@ -876,6 +977,13 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 			usageCompletion.Add(c)
 		},
 	}
+	// 上游重试透明化：有人值守时向前端发 retry 事件（横幅提示）；
+	// 无人值守静默重试。
+	if p.AutomationID == "" {
+		hooks.OnRetry = func(attempt, maxAttempts int, delayMs int64, reason string) {
+			send(map[string]any{"type": "retry", "attempt": attempt, "maxAttempts": maxAttempts, "delayMs": delayMs, "reason": reason})
+		}
+	}
 	// 待办广播钩子：todo_write 成功落库后立即推送（可能发生在子代理 goroutine）
 	todoBroadcast = func(todos []store.Todo) {
 		send(todoEvent(todos))
@@ -912,12 +1020,12 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 			return "用户回答：" + answer, nil
 		}
 	}
-	// ask 权限模式：写类工具执行前征求用户批准；「本会话允许」记入内存 grant 表。
+	// ask 权限模式：写类工具执行前征求用户批准；「本会话允许」记入 Handler 级
+	// grant 表（跨请求有效——同一会话批准过一次，后续请求不再打扰）。
 	// 无人值守时不挂审批门（build 语义，任务失败由调度器记录）。
 	if p.AutomationID == "" && askMode {
-		allowSession := map[string]bool{}
 		env.PermissionAsk = func(toolName, summary string) bool {
-			if allowSession[toolName] {
+			if h.grantAllowed(sess.ID, toolName) {
 				return true
 			}
 			q := questions.Register(&PendingQuestion{
@@ -933,7 +1041,7 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 				return false // 超时/取消：拒绝执行（fail-closed）
 			}
 			if answer == "session" {
-				allowSession[toolName] = true
+				h.grantSession(sess.ID, toolName)
 				return true
 			}
 			return answer == "once"
@@ -950,9 +1058,14 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 			"type":  "done",
 			"usage": map[string]any{"prompt": usagePrompt.Load(), "completion": usageCompletion.Load()},
 		})
+		// 首轮对话结束：尝试用 smallModel 生成本会话标题（失败静默，默认标题兜底）
+		go h.maybeAutoTitle(sess.ID, sess.Title, p.Content)
 	}
 
 	// ---------- agent loop：最多 maxSteps 轮工具调用 ----------
+	// doomLoop 检测：完全相同的一批工具调用连续重复 ≥3 轮时注入提醒，防模型死循环。
+	var lastSig string
+	sigRuns := 0
 	for step := 0; step < maxSteps; step++ {
 		content, calls, err := streamFn(ctx, effAsConfig(eff), convo, defs, hooks, reasoning)
 		if err != nil {
@@ -1003,13 +1116,13 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 				go func(i int) {
 					defer wg.Done()
 					defer func() { <-sem }()
-					results[i] = h.runOneTool(ctx, env, defs, calls[i], send)
+					results[i] = h.runOneTool(ctx, env, defs, calls[i], send, takeDiff)
 				}(i)
 			}
 			wg.Wait()
 		} else {
 			for i := range calls {
-				results[i] = h.runOneTool(ctx, env, defs, calls[i], send)
+				results[i] = h.runOneTool(ctx, env, defs, calls[i], send, takeDiff)
 			}
 		}
 		for i := range calls {
@@ -1019,7 +1132,7 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 				resultText = "工具执行出错: " + out.err.Error() + orText(out.text)
 			}
 			// 回灌上下文前统一封顶（MCP 工具结果没有自带上限）
-			resultText = truncateMiddle(resultText, maxToolResultBytes)
+			resultText = tools.TruncateMiddle(resultText, maxToolResultBytes)
 			if err := h.store.Append(sess.ID, store.Message{
 				Role: "tool", Content: resultText, ToolCallID: calls[i].ID,
 				Name: calls[i].Function.Name, CreatedAt: time.Now(),
@@ -1031,6 +1144,29 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 				Role: "tool", Content: resultText,
 				ToolCallID: calls[i].ID, Name: calls[i].Function.Name,
 			})
+		}
+		// doom loop：这一轮的全部调用与上一轮完全一致且已连续 3 轮 → 注入强提醒。
+		// 提醒后重新计数，避免每一轮都重复注入。
+		var sig strings.Builder
+		for _, c := range calls {
+			sig.WriteString(c.Function.Name)
+			sig.WriteByte(0)
+			sig.WriteString(c.Function.Arguments)
+			sig.WriteByte(1)
+		}
+		if sig.String() == lastSig {
+			sigRuns++
+		} else {
+			lastSig = sig.String()
+			sigRuns = 1
+		}
+		if sigRuns >= 3 {
+			convo = append(convo, ChatMessage{
+				Role: "user",
+				Content: "（系统提醒：完全相同的工具调用已连续重复 3 轮，继续重试只会得到同样结果。" +
+					"换一种方法、调整参数，或用 ask_user 向用户说明卡点。）",
+			})
+			sigRuns = 0
 		}
 		if ctx.Err() != nil {
 			return ctx.Err() // 客户端断开，停止循环
@@ -1119,7 +1255,7 @@ func (h *Handler) runSubagent(
 				result = "工具执行出错: " + execErr.Error() + orText(text)
 			}
 			convo = append(convo, ChatMessage{
-				Role: "tool", Content: truncateMiddle(result, maxToolResultBytes),
+				Role: "tool", Content: tools.TruncateMiddle(result, maxToolResultBytes),
 				ToolCallID: c.ID, Name: c.Function.Name,
 			})
 		}
@@ -1170,26 +1306,6 @@ func truncateBytesUTF8(s string, n int) string {
 		cut = cut[:len(cut)-1]
 	}
 	return cut
-}
-
-// truncateMiddle 中间截断：保留头尾，砍中缝——错误信息常在尾部、正文常在
-// 头部，一刀切掉尾部会丢掉最有价值的报错。UTF-8 边界安全。
-func truncateMiddle(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	const marker = "\n…(中间输出已截断)…\n"
-	head := max*2/3 - len(marker)/2
-	tail := max - head - len(marker)
-	if head < 1 || tail < 1 {
-		return truncateBytesUTF8(s, max)
-	}
-	// 尾部按 rune 起始边界对齐
-	start := len(s) - tail
-	for start > 0 && s[start]&0xC0 == 0x80 {
-		start--
-	}
-	return truncateBytesUTF8(s, head) + marker + s[start:]
 }
 
 // pendingTodos 过滤出未完成的待办（压缩注入只需要还在进行中的部分）。
@@ -1250,7 +1366,8 @@ type toolOutcome struct {
 
 // runOneTool 发出 tool 开始事件、执行、发出 tool_result 事件。
 // 并发与串行两种模式都用它，保证事件结构一致（都带 id，前端按 id 配对）。
-func (h *Handler) runOneTool(ctx context.Context, env *tools.Env, defs []tools.ToolDef, call ToolCall, send func(map[string]any)) toolOutcome {
+// takeDiff 取走本会话暂存的编辑 diff（有则附加到结果事件，仅前端展示）。
+func (h *Handler) runOneTool(ctx context.Context, env *tools.Env, defs []tools.ToolDef, call ToolCall, send func(map[string]any), takeDiff func() string) toolOutcome {
 	// args 不再按 400 字符截断：前端合并成工具区块后只展示摘要行
 	send(map[string]any{"type": "tool", "id": call.ID, "name": call.Function.Name, "args": call.Function.Arguments})
 	start := time.Now()
@@ -1263,6 +1380,11 @@ func (h *Handler) runOneTool(ctx context.Context, env *tools.Env, defs []tools.T
 	}
 	if execErr != nil {
 		evt["error"] = execErr.Error()
+	}
+	if takeDiff != nil {
+		if d := takeDiff(); d != "" {
+			evt["diff"] = d
+		}
 	}
 	send(evt)
 	return toolOutcome{text: text, err: execErr}
@@ -1326,9 +1448,19 @@ func (h *Handler) execTool(ctx context.Context, env *tools.Env, defs []tools.Too
 	if def.FromMCP != "" {
 		permName = def.MCPTool
 	}
-	if env.PermissionAsk != nil && tools.IsWriteCapable(permName) {
-		if !env.PermissionAsk(permName, toolArgsSummary(raw)) {
-			return "用户拒绝了这次操作。不要重试同类操作，改用只读方式继续或向用户说明方案。", nil
+	summary := toolArgsSummary(raw)
+	// 配置级权限规则（last-match-wins）：deny 直接拒绝；allow 免审批放行；
+	// 无命中或 ask 时走运行时审批门（ask 模式）。
+	switch h.permissionEffect(permName, summary) {
+	case "deny":
+		return "权限规则（设置 → 高级）拒绝了这次操作。不要重试同类操作，改用只读方式继续或向用户说明方案。", nil
+	case "allow":
+		// 显式放行：跳过审批门
+	default:
+		if env.PermissionAsk != nil && tools.IsWriteCapable(permName) {
+			if !env.PermissionAsk(permName, summary) {
+				return "用户拒绝了这次操作。不要重试同类操作，改用只读方式继续或向用户说明方案。", nil
+			}
 		}
 	}
 	if def.FromMCP != "" {
@@ -1349,6 +1481,113 @@ func toolArgsSummary(raw string) string {
 		}
 	}
 	return truncateRunes(raw, 160)
+}
+
+// wildcardMatch glob 风格匹配（* = 零或多字符，? = 单字符），大小写不敏感、
+// 路径分隔符统一为 /——与主流 agent 的权限规则同款语义。
+func wildcardMatch(pattern, input string) bool {
+	pattern = strings.ToLower(strings.ReplaceAll(pattern, "\\", "/"))
+	input = strings.ToLower(strings.ReplaceAll(input, "\\", "/"))
+	var rx strings.Builder
+	rx.WriteString("^")
+	for _, r := range pattern {
+		switch r {
+		case '*':
+			rx.WriteString(".*")
+		case '?':
+			rx.WriteString(".")
+		default:
+			rx.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	rx.WriteString("$")
+	ok, err := regexp.MatchString(rx.String(), input)
+	return err == nil && ok
+}
+
+// patternHit 判断资源模式是否命中：优先整体匹配摘要（如 command=git status），
+// 也允许匹配「=」后的值本身（让 "git *" 这类命令前缀规则自然书写）。
+func patternHit(pattern, resource string) bool {
+	if wildcardMatch(pattern, resource) {
+		return true
+	}
+	if i := strings.Index(resource, "="); i >= 0 {
+		return wildcardMatch(pattern, resource[i+1:])
+	}
+	return false
+}
+
+// permissionEffect 评估配置级权限规则（设置 → 高级）：按书写顺序取最后一条
+// 命中的规则（last-match-wins）。pattern 为空 = 只按工具名匹配；无命中返回 ""。
+// 资源摘要用 toolArgsSummary 的输出（path=xxx / command=xxx 等）。
+func (h *Handler) permissionEffect(tool, resource string) string {
+	if h == nil || h.set == nil {
+		return "" // 测试/极简构造的 Handler 可能没有设置仓库：无规则直接放行
+	}
+	rules := h.set.Get().Permissions
+	if len(rules) == 0 {
+		return ""
+	}
+	eff := ""
+	for _, r := range rules {
+		if !wildcardMatch(r.Tool, tool) {
+			continue
+		}
+		if r.Pattern != "" && !patternHit(r.Pattern, resource) {
+			continue
+		}
+		eff = r.Effect
+	}
+	return eff
+}
+
+// maybeAutoTitle 首轮对话结束后用 smallModel 生成会话标题（无 smallModel 用主模型）。
+// 触发条件：会话恰好只有「用户首条 + 一条回复」两条消息，且标题还是本地截断的默认值
+// （或为空）——用户改过标题绝不覆盖。失败静默：默认标题兜底，标题生成不值得打扰任何人。
+func (h *Handler) maybeAutoTitle(sessionID, currentTitle, firstContent string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("自动起标题 panic（已忽略）: %v", r)
+		}
+	}()
+	eff := h.set.Effective()
+	if strings.EqualFold(eff.Mode, "mock") {
+		return // mock 上游没有真实模型
+	}
+	if defaultTitle := deriveTitle(firstContent); currentTitle != "" && currentTitle != defaultTitle {
+		return // 用户已自定义标题（或非默认命名），不动
+	}
+	// 竞态防御：只处理「仍是两条消息的首轮」；期间用户继续对话则放弃
+	if h.store.MessageCount(sessionID) > 2 {
+		return
+	}
+	cfg := effAsConfig(eff)
+	if sm := strings.TrimSpace(eff.SmallModel); sm != "" {
+		cfg.Model = sm
+	}
+	prompt := "根据下面这段对话的开头，给这个会话起一个不超过 16 个字的简短中文标题。" +
+		"只输出标题本身，不要引号、句号或任何解释。\n\n用户消息：" + truncateRunes(firstContent, 300)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, _, err := Upstream(cfg)(ctx, cfg, []ChatMessage{{Role: "user", Content: prompt}}, nil, Hooks{}, "")
+	if err != nil {
+		return
+	}
+	title := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0])
+	title = strings.Trim(title, " \t\"'「」『』#*-")
+	if rs := []rune(title); len(rs) > 32 {
+		title = string(rs[:32])
+	}
+	if len([]rune(title)) < 2 {
+		return
+	}
+	// 再次确认标题没被用户改过（生成期间可能发生）
+	if h.store.MessageCount(sessionID) > 2 {
+		return
+	}
+	if err := h.store.ReplaceTitle(sessionID, title); err == nil {
+		log.Printf("会话 %s 自动命名：%s", sessionID, title)
+	}
 }
 
 // toWire 把落库消息转回 OpenAI 请求格式（含 tool_calls 与 tool 结果的配对回放）。

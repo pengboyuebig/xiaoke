@@ -55,7 +55,9 @@ export interface ChatOptions {
   /** 本次请求触发了上下文压缩：covered 是被摘要覆盖的消息数 */
   onCompact?: (covered: number) => void
   onToolStart?: (name: string, args: string, id: string) => void
-  onToolResult?: (info: { id: string; name: string; ok: boolean; preview: string; error?: string; ms: number }) => void
+  onToolResult?: (info: { id: string; name: string; ok: boolean; preview: string; error?: string; ms: number; diff?: string }) => void
+  /** 上游临时故障即将重试：attempt 从 1 开始，delayMs 为本次退避 */
+  onRetry?: (info: { attempt: number; maxAttempts: number; delayMs: number; reason: string }) => void
   /** 待办清单更新（todo_write 工具执行成功后推送） */
   onTodo?: (todos: Todo[]) => void
   /** ask_user 提问 / ask 模式审批：返回的 Promise 在用户作答后 resolve */
@@ -80,6 +82,22 @@ export const api = {
   },
   renameSession(id: string, title: string): Promise<{ ok: string; title: string }> {
     return jfetch(`/api/sessions/${id}/title`, jsonBody('PUT', { title }))
+  },
+  /** 回退会话到第 index 条用户消息（含）：之后的消息删除，期间被改写的文件恢复 */
+  revertSession(id: string, index: number): Promise<{ index: number; files: { path: string; action: string; reason?: string }[] }> {
+    return jfetch(`/api/sessions/${id}/revert`, jsonBody('POST', { index }))
+  },
+  /** 分叉会话：复制全部消息为新会话 */
+  forkSession(id: string): Promise<{ id: string; title: string; messages: number }> {
+    return jfetch(`/api/sessions/${id}/fork`, { method: 'POST' })
+  },
+  /** 跨会话全文搜索消息内容 */
+  search(q: string): Promise<{ q: string; hits: { sessionId: string; title: string; role: string; snippet: string }[] }> {
+    return jfetch(`/api/search?q=${encodeURIComponent(q)}`)
+  },
+  /** Markdown 导出直链（浏览器直接下载） */
+  exportSessionMdUrl(id: string): string {
+    return `/api/sessions/${id}/export?format=md`
   },
   // ---------- 回收站 ----------
   listTrash(): Promise<{ items: TrashItem[] }> {
@@ -274,6 +292,15 @@ export const api = {
                       preview: (evt.preview as string) || '',
                       error: evt.error as string | undefined,
                       ms: (evt.ms as number) || 0,
+                      diff: evt.diff as string | undefined,
+                    })
+                    break
+                  case 'retry':
+                    opts.onRetry?.({
+                      attempt: (evt.attempt as number) || 1,
+                      maxAttempts: (evt.maxAttempts as number) || 0,
+                      delayMs: (evt.delayMs as number) || 0,
+                      reason: (evt.reason as string) || '',
                     })
                     break
                   case 'todo':

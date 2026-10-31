@@ -151,6 +151,51 @@ func execWebFetch(ctx context.Context, env *Env, args json.RawMessage) (string, 
 	if err != nil {
 		return "", err
 	}
+	return fetchWithRedirects(ctx, u, 0)
+}
+
+// sameHost 判断两个 URL 的主机（含端口）是否一致。
+func sameHost(a, b string) bool {
+	hostOf := func(raw string) string {
+		h := raw
+		if i := strings.Index(h, "://"); i >= 0 {
+			h = h[i+3:]
+		}
+		if i := strings.IndexAny(h, "/?#"); i >= 0 {
+			h = h[:i]
+		}
+		return strings.ToLower(h)
+	}
+	return hostOf(a) == hostOf(b)
+}
+
+// resolveRedirect 把 Location 解析为绝对 URL（相对路径按当前 URL 补全）。
+func resolveRedirect(base, loc string) string {
+	if strings.HasPrefix(loc, "http://") || strings.HasPrefix(loc, "https://") {
+		return loc
+	}
+	i := strings.Index(base, "://")
+	if i < 0 {
+		return loc
+	}
+	schemeEnd := i + 3
+	root := base
+	if j := strings.Index(base[schemeEnd:], "/"); j >= 0 {
+		root = base[:schemeEnd+j]
+	}
+	if strings.HasPrefix(loc, "/") {
+		return root + loc
+	}
+	dir := base
+	if k := strings.LastIndex(base, "/"); k > schemeEnd {
+		dir = base[:k+1]
+	}
+	return dir + loc
+}
+
+// fetchWithRedirects 带深度的抓取主体：同主机重定向自动跟随（≤3 跳），
+// 跨主机返回 REDIRECT 让模型显式确认。
+func fetchWithRedirects(ctx context.Context, u string, depth int) (string, error) {
 	if hit, ok := urlFetchCache.get(u); ok {
 		return hit, nil
 	}
@@ -169,11 +214,19 @@ func execWebFetch(ctx context.Context, env *Env, args json.RawMessage) (string, 
 	}
 	defer resp.Body.Close()
 
-	// 重定向不跟随：把目标位置交给模型，由它显式决定是否继续
+	// 重定向：同主机安全跳转自动跟随（≤3 跳）；跨主机不自动跟随——
+	// 目标交给模型显式确认（审计友好，也防被 302 引去私网）。
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		loc := resp.Header.Get("Location")
+		if loc == "" {
+			return "", fmt.Errorf("%s 返回重定向但没有 Location 头", u)
+		}
+		next := resolveRedirect(u, loc)
+		if sameHost(u, next) && depth < 3 {
+			return fetchWithRedirects(ctx, next, depth+1)
+		}
 		return fmt.Sprintf("REDIRECT: %s 返回 %s，重定向到 %s。需要继续时用 web_fetch 抓取该地址（跨主机跳转必须显式确认）。",
-			u, resp.Status, loc), nil
+			u, resp.Status, next), nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("上游返回 %s", resp.Status)

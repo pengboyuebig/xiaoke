@@ -48,24 +48,28 @@ func (h *Handler) Register(mux *http.ServeMux) {
 // settingsView 是给前端的设置视图：apiKey 永不下发，只给「是否已配置 + 尾 4 位」。
 type settingsView struct {
 	LLM struct {
-		Mode        string  `json:"mode"`
-		BaseURL     string  `json:"baseURL"`
-		APIKeySet   bool    `json:"apiKeySet"`
-		APIKeyTail  string  `json:"apiKeyTail"`
-		Model       string  `json:"model"`
-		Temperature float64 `json:"temperature"`
-		MaxHistory  int     `json:"maxHistory"`
-		MaxTokens   int     `json:"maxTokens"`
+		Mode          string  `json:"mode"`
+		BaseURL       string  `json:"baseURL"`
+		APIKeySet     bool    `json:"apiKeySet"`
+		APIKeyTail    string  `json:"apiKeyTail"`
+		Model         string  `json:"model"`
+		SmallModel    string  `json:"smallModel"`
+		Temperature   float64 `json:"temperature"`
+		MaxHistory    int     `json:"maxHistory"`
+		MaxTokens     int     `json:"maxTokens"`
+		ContextWindow int     `json:"contextWindow"`
 	} `json:"llm"`
-	MCPServers            []settings.MCPServer `json:"mcpServers"`
-	ReadDirs              []string             `json:"readDirs"`
-	ProjectsRoot          string               `json:"projectsRoot"`
-	ProjectsRootEffective string               `json:"projectsRootEffective"`
-	MaxToolSteps          int                  `json:"maxToolSteps"`
-	CommandAllowlist      []string             `json:"commandAllowlist"`
-	AutoCompact           bool                 `json:"autoCompact"`
-	CompactKeepCount      int                  `json:"compactKeepCount"`
-	CommandTimeoutSec     int                  `json:"commandTimeoutSec"`
+	MCPServers            []settings.MCPServer      `json:"mcpServers"`
+	ReadDirs              []string                  `json:"readDirs"`
+	ProjectsRoot          string                    `json:"projectsRoot"`
+	ProjectsRootEffective string                    `json:"projectsRootEffective"`
+	MaxToolSteps          int                       `json:"maxToolSteps"`
+	CommandAllowlist      []string                  `json:"commandAllowlist"`
+	AutoCompact           bool                      `json:"autoCompact"`
+	CompactKeepCount      int                       `json:"compactKeepCount"`
+	CommandTimeoutSec     int                       `json:"commandTimeoutSec"`
+	Permissions           []settings.PermissionRule `json:"permissions"`
+	Commands              []settings.CustomCommand  `json:"commands"`
 }
 
 func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
@@ -77,14 +81,18 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 		ProjectsRootEffective: h.projects.Root(),
 		MaxToolSteps:          s.MaxToolSteps,
 		CommandAllowlist:      s.CommandAllowlist,
+		Permissions:           s.Permissions,
+		Commands:              s.Commands,
 	}
 	v.LLM.Mode = s.LLM.Mode
 	v.LLM.BaseURL = s.LLM.BaseURL
 	v.LLM.APIKeySet, v.LLM.APIKeyTail = settings.MaskKey(s.LLM.APIKey)
 	v.LLM.Model = s.LLM.Model
+	v.LLM.SmallModel = s.LLM.SmallModel
 	v.LLM.Temperature = s.LLM.Temperature
 	v.LLM.MaxHistory = s.LLM.MaxHistory
 	v.LLM.MaxTokens = s.LLM.MaxTokens
+	v.LLM.ContextWindow = s.LLM.ContextWindow
 	v.AutoCompact = s.AutoCompact
 	v.CompactKeepCount = s.CompactKeepCount
 	v.CommandTimeoutSec = s.CommandTimeoutSec
@@ -144,7 +152,7 @@ type testReq struct {
 // testLLM 用给定配置请求上游 /models，验证 baseURL+key 是否可用。
 func (h *Handler) testLLM(w http.ResponseWriter, r *http.Request) {
 	var in testReq
-	_ = json.NewDecoder(r.Body).Decode(&in)
+	_ = decodeJSON(w, r, &in)
 	eff := h.set.Effective()
 	if in.BaseURL != "" {
 		eff.BaseURL = in.BaseURL
@@ -307,6 +315,22 @@ func genID() string {
 		out[i*2+1] = hex[v&0x0f]
 	}
 	return string(out)
+}
+
+// decodeJSON 统一的请求体解码：1MB 上限（decode 前生效的内存保护），
+// 超限 413、坏 JSON 400；返回 false 表示已写响应，调用方直接 return。
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "请求体过大（上限 1MB）"})
+			return false
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -39,14 +39,16 @@ const SystemPrompt = `你是小柯，一个由用户亲手打造的专属智能�
 const ToolGuide = `
 
 工具纪律：
-可用工具：list_files（浏览目录）、read_file（读文件）、search_files（全文/正则搜索）、find_files（按名字模糊找文件）、edit_file（精确替换编辑）、write_file（覆盖写文件）、todo_write（待办清单）、memory_append/memory_read（长期记忆）、skill_read（技能正文）、task（子代理）、run_command（白名单命令，is_background=true 可后台运行）、task_output/task_kill（后台任务读取/终止），以及已连接的 MCP 工具。
+可用工具：list_files（浏览目录）、read_file（读文件）、search_files（全文/正则搜索）、find_files（按名字模糊找文件）、edit_file（精确替换编辑）、write_file（覆盖写文件）、todo_write（待办清单）、memory_append/memory_read（长期记忆）、skill_read（技能正文）、web_fetch（抓公网网页）、task（子代理）、ask_user（向用户提问）、cron_create/cron_list/cron_update/cron_delete（定时任务）、run_command（白名单命令，is_background=true 可后台运行）、task_output/task_kill（后台任务读取/终止），以及已连接的 MCP 工具。
 1. 写代码或文章前，先用 list_files / read_file 了解项目现状；不要凭空猜测文件结构。找文件名用 find_files（记不清确切名字时），找内容用 search_files。
 2. 修改已有文件优先用 edit_file：old_string 必须与文件内容逐字符一致且唯一匹配，只传改动片段，不要整文件重写；多处修改用 edits 数组一次完成；edit_file 报错时先重新 read_file 核对，不要原样盲试。write_file 是覆盖式写入，必须给完整内容，仅用于新建文件或整文件重写。
 3. 交付物写进项目文件，不要只贴在回复里；临时验证脚本也要落到文件再执行。
 4. 调用工具前用一句话说明你要做什么、为什么；连续调用同一工具多次仍无结果时，停下来换思路而不是重复尝试。
 5. 构建、安装、测试等可能超过 30 秒的命令用 run_command 的 is_background=true 后台跑，用 task_output 读取进度，失控时用 task_kill 终止；不要前台干等超时。破坏性命令（删目录、force push、reset --hard）永远单独执行，且先跟用户确认。
 6. 工具报错不是失败信号，是信息：把报错读完整，它通常已经写明了原因。
-7. task 子代理适合「可以独立完成的调研/子任务」：派出去时把背景写全（prompt 自包含）；不是所有事都需要子代理，简单的事自己做更快。`
+7. task 子代理适合「可以独立完成的调研/子任务」：派出去时把背景写全（prompt 自包含）；不是所有事都需要子代理，简单的事自己做更快。
+8. ask_user 只用于真正需要用户拍板的选择（方案二选一、需求关键分歧），不要用它请求许可——那类事自己做或说明即可。
+9. 定时任务（cron_*）：适合周期性/延迟触发的无人值守事项；在定时任务触发的会话里不能再创建定时任务（机制限制）。`
 
 // SystemPromptFor 组装带运行时上下文的系统提示词。
 func SystemPromptFor(projectName, projectPath string, readDirs []string) string {

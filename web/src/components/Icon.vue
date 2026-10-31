@@ -58,6 +58,7 @@ const paths: Record<string, string[]> = {
   'arrow-left': ['M19 12H5', 'M12 19l-7-7 7-7'],
   'arrow-up': ['M12 19V5', 'M5 12l7-7 7 7'],
   'arrow-down': ['M12 5v14', 'M5 12l7 7 7-7'],
+  queue: ['M4 6h16', 'M4 12h16', 'M4 18h10'],
   message: ['M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'],
   user: ['M20 21a8 8 0 0 0-16 0', 'M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z'],
   file: ['M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z', 'M14 3v6h6'],

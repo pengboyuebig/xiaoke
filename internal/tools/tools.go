@@ -47,6 +47,17 @@ type Env struct {
 	// PermissionAsk 是 ask 模式的执行前审批回调（仅对写类工具调用）：
 	// 返回 false = 用户拒绝，工具不执行。nil = 不拦截（非 ask 模式）。
 	PermissionAsk func(toolName, summary string) bool
+	// OnDiff 是 edit_file/write_file 修改已有文件成功后的回调（统一 diff 文本），
+	// 仅供前端展示，不进模型上下文。写类工具永远串行执行，回调无需并发保护。
+	OnDiff func(diff string)
+	// OnFileChange 是写类工具成功落盘后的回调（会话回退台账记录写前快照）：
+	// abs 绝对路径、before 写前内容（新建文件时 existed=false 且 before 为空）。
+	OnFileChange func(abs, before string, existed bool)
+	// SessionID 是当前会话 ID（后台任务完成唤醒时定位回写会话用；空 = 未知）。
+	SessionID string
+	// OnTaskDone 由 chat 层注入：后台命令任务结束时回调（会话唤醒）。
+	// 任务 goroutine 中调用，实现方需自行保证并发安全。
+	OnTaskDone func(taskID string)
 	// Cron 族回调：定时任务管理。CronCreate 为 nil 表示当前会话禁建
 	//（自动化触发的会话，防递归）；其余 nil = 功能不可用。
 	CronCreate func(title, expr, prompt, projectID string, maxRuns int) (string, error)
@@ -63,6 +74,13 @@ func (e *Env) clone() *Env {
 	cp.ReadDirs = append([]string(nil), e.ReadDirs...)
 	cp.Allowlist = append([]string(nil), e.Allowlist...)
 	return &cp
+}
+
+// emitDiff nil 安全的 diff 回调（空 diff 不发）。
+func (e *Env) emitDiff(d string) {
+	if e != nil && e.OnDiff != nil && d != "" {
+		e.OnDiff(d)
+	}
 }
 
 // Tool 是一个可被模型调用的工具（OpenAI function 形态）。

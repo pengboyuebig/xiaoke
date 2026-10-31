@@ -26,7 +26,14 @@ const props = defineProps<{
   lastUsage?: UsageInfo | null
 }>()
 
-const emit = defineEmits<{ approve: []; approveCustom: [text: string]; adjustPlan: []; quick: [text: string] }>()
+const emit = defineEmits<{
+  approve: []
+  approveCustom: [text: string]
+  adjustPlan: []
+  quick: [text: string]
+  /** 回退：回到该回合的 user 消息重来（之后的消息删除，文件恢复） */
+  revert: [index: number]
+}>()
 
 // 空状态快捷提问：让欢迎页不只是一个大头像
 const quickPrompts = ['帮我分析一下这个项目', '写一个网页小游戏', '帮我写一篇文章']
@@ -189,7 +196,18 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
         <!-- 我的问题（与 questionList 同条件：trim 后非空才渲染，保证索引一一对应） -->
         <div v-if="(t.question || '').trim()" class="msg user">
           <div class="body">
-            <div class="meta"><span class="name">我</span></div>
+            <div class="meta">
+              <span class="name">我</span>
+              <button
+                v-if="t.msgIndex !== undefined"
+                class="bubble-revert"
+                title="回到这条消息重来：之后对话删除，期间改动的文件恢复原状"
+                @click="emit('revert', t.msgIndex!)"
+              >
+                <Icon name="refresh" :size="11" />
+                重来
+              </button>
+            </div>
             <div class="content user-bubble">{{ t.question }}</div>
           </div>
         </div>
@@ -628,6 +646,32 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
   text-transform: uppercase;
   color: var(--accent);
   opacity: 0.85;
+}
+
+.bubble-revert {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 10px;
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: none;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.msg.user:hover .bubble-revert {
+  opacity: 1;
+}
+
+.bubble-revert:hover {
+  color: var(--accent);
+  border-color: rgba(255, 154, 61, 0.35);
+  background: rgba(255, 154, 61, 0.08);
 }
 
 .user-bubble {

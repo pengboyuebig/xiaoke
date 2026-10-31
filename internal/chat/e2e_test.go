@@ -10,9 +10,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"xiaoke/internal/agents"
 	"xiaoke/internal/config"
+	"xiaoke/internal/cron"
 	"xiaoke/internal/mcp"
 	"xiaoke/internal/memory"
 	"xiaoke/internal/persona"
@@ -234,7 +236,7 @@ func TestE2EChatConcurrentConflict(t *testing.T) {
 // truncateMiddle：保头尾砍中缝，UTF-8 边界安全。
 func TestTruncateMiddle(t *testing.T) {
 	long := strings.Repeat("头", 40000) + strings.Repeat("中", 40000) + strings.Repeat("尾", 40000)
-	out := truncateMiddle(long, maxToolResultBytes)
+	out := tools.TruncateMiddle(long, maxToolResultBytes)
 	if len(out) > maxToolResultBytes {
 		t.Fatalf("应封顶到 %d，got %d", maxToolResultBytes, len(out))
 	}
@@ -248,7 +250,7 @@ func TestTruncateMiddle(t *testing.T) {
 		t.Fatal("应保留头部")
 	}
 	// 短文本原样
-	if got := truncateMiddle("短内容", 1024); got != "短内容" {
+	if got := tools.TruncateMiddle("短内容", 1024); got != "短内容" {
 		t.Fatalf("短文本不应变: %q", got)
 	}
 	// 纯中文（3 字节/rune）截断后仍是合法 UTF-8
@@ -390,5 +392,156 @@ func TestExecToolPermissionGate(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("写工具应各走一次审批: %d", calls)
+	}
+}
+
+// 会话级 grant：本会话允许后跨请求有效；其他会话不受影响。
+func TestGrantPersistence(t *testing.T) {
+	h := &Handler{}
+	if h.grantAllowed("s1", "write_file") {
+		t.Fatal("初始不应有 grant")
+	}
+	h.grantSession("s1", "write_file")
+	if !h.grantAllowed("s1", "write_file") {
+		t.Fatal("grant 后应放行")
+	}
+	if h.grantAllowed("s2", "write_file") {
+		t.Fatal("其他会话不应被连带放行")
+	}
+	if h.grantAllowed("s1", "run_command") {
+		t.Fatal("其他工具不应被连带放行")
+	}
+}
+
+// E2E：定时任务无人值守执行——到期任务经 runDueAutomations 生成会话并落库。
+func TestE2EAutomationRun(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	st, err := store.New(filepath.Join(dataDir, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := settings.Open(filepath.Join(dataDir, "settings.json"), config.LLMConfig{Mode: "mock"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootDir := filepath.Join(dir, "workspace")
+	pm, err := projects.New(filepath.Join(dataDir, "projects.json"), func() string { return rootDir })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ag, _ := agents.Open(filepath.Join(dataDir, "agents.json"))
+	_ = ag.EnsureDefault(agents.Agent{Name: persona.Name, Description: "d", SystemPrompt: persona.SystemPrompt, Tools: true})
+	sk, _ := skills.Open(filepath.Join(dataDir, "skills.json"))
+	mem, _ := memory.Open(filepath.Join(dataDir, "memory"))
+	cs, err := cron.Open(filepath.Join(dataDir, "automations.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(&config.Config{DataDir: dataDir}, st, set, pm, mcp.NewManager(context.Background()), ag, sk, mem, rules.New(), cs)
+
+	// 创建一个「已到期」的一次性任务（NextRun 在过去）
+	a, err := cs.Create("冒烟自动化", "* * * * *", "随便说一句", "", 0, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionsBefore, err := st.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := len(sessionsBefore)
+
+	h.runDueAutomations()
+
+	// 会话生成（⏰ 标题）且消息落库
+	got, _ := cs.Get(a.ID)
+	if got.RunCount != 1 {
+		t.Fatalf("RunCount 应为 1: %d", got.RunCount)
+	}
+	sessions, _ := st.List()
+	if len(sessions) != before+1 {
+		t.Fatalf("应新增 1 个会话: before=%d after=%d", before, len(sessions))
+	}
+	full, err := st.Get(sessions[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(full.Title, "⏰") {
+		t.Fatalf("会话标题应带 ⏰ 前缀: %q", full.Title)
+	}
+	if len(full.Messages) < 2 {
+		t.Fatalf("mock 对话应落库 user+assistant 消息: %d", len(full.Messages))
+	}
+	last := full.Messages[len(full.Messages)-1]
+	if last.Role != "assistant" || !strings.Contains(last.Content, "小柯") {
+		t.Fatalf("应有 assistant 最终答复: %+v", last)
+	}
+	// 一次性未设 MaxRuns 的循环任务：仍启用、NextRun 推进
+	if !got.Enabled {
+		t.Fatal("循环任务跑完一次不应停用")
+	}
+	if !got.NextRunAt.After(a.NextRunAt) && !a.NextRunAt.IsZero() {
+		// * * * * * 每分钟：NextRun 应推进到下一分钟
+		t.Fatalf("NextRun 应推进: %v -> %v", a.NextRunAt, got.NextRunAt)
+	}
+}
+
+// E2E：ask 模式审批流——写工具执行前弹 permission ask，回答 once 后真正执行。
+func TestE2EAskModePermissionFlow(t *testing.T) {
+	f := newE2E(t)
+	body, _ := json.Marshal(map[string]string{
+		"content": "帮我写个文件", "projectId": f.project.ID, "mode": "ask",
+	})
+	resp, err := http.Post(f.srv.URL+"/api/chat", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var events []map[string]any
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	answered := false
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		var evt map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data:")), &evt); err != nil {
+			continue
+		}
+		events = append(events, evt)
+		if evt["type"] == "ask" && evt["kind"] == "permission" && !answered {
+			answered = true
+			qid, _ := evt["id"].(string)
+			if evt["tool"] != "write_file" {
+				t.Fatalf("审批对象应为 write_file: %v", evt["tool"])
+			}
+			go func() {
+				ansBody, _ := json.Marshal(map[string]string{"answer": "once"})
+				ar, aerr := http.Post(f.srv.URL+"/api/questions/"+qid, "application/json", strings.NewReader(string(ansBody)))
+				if aerr == nil {
+					ar.Body.Close()
+				}
+			}()
+		}
+	}
+	if !answered {
+		t.Fatal("ask 模式下写工具应触发审批事件")
+	}
+	dones := eventsOf(events, "done")
+	if len(dones) != 1 {
+		t.Fatalf("批准后应跑完到 done: %v", eventTypes(events))
+	}
+	// 文件真的写出来了（批准后执行）
+	okResults := 0
+	for _, e := range eventsOf(events, "tool_result") {
+		if ok, _ := e["ok"].(bool); ok {
+			okResults++
+		}
+	}
+	if okResults == 0 {
+		t.Fatal("批准后工具应成功执行")
 	}
 }

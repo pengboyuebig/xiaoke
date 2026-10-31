@@ -31,6 +31,27 @@ type Settings struct {
 	CompactKeepCount int `json:"compactKeepCount"`
 	// CommandTimeoutSec run_command 超时（秒；<=0 = 默认 30，上限 600）。
 	CommandTimeoutSec int `json:"commandTimeoutSec"`
+
+	// Permissions 运行时权限规则：按书写顺序评估，取最后一条命中的规则
+	//（last-match-wins）。effect: allow（直接放行）/ ask（弹窗审批）/ deny（直接拒绝）。
+	Permissions []PermissionRule `json:"permissions"`
+	// Commands 用户自定义斜杠命令：前端输入 /name 时展开模板后发送（纯前端展开）。
+	Commands []CustomCommand `json:"commands"`
+}
+
+// PermissionRule 一条工具权限规则。Tool 是工具名（内置精确名或 MCP 原始名），
+// Pattern 是资源摘要的模式（* ? 通配；空 = 只按工具名匹配任意参数）。
+type PermissionRule struct {
+	Tool    string `json:"tool"`
+	Pattern string `json:"pattern,omitempty"`
+	Effect  string `json:"effect"` // allow | ask | deny
+}
+
+// CustomCommand 斜杠命令模板：$ARGUMENTS 展开为全部参数文本，
+// $1..$9 展开为按空白分词的位置参数。
+type CustomCommand struct {
+	Name     string `json:"name"`
+	Template string `json:"template"`
 }
 
 type LLMSettings struct {
@@ -40,6 +61,9 @@ type LLMSettings struct {
 	Model       string  `json:"model"`
 	Temperature float64 `json:"temperature"`
 	MaxHistory  int     `json:"maxHistory"`
+	// SmallModel 轻量任务模型（可空 = 用主模型）：上下文压缩摘要、会话自动起标题
+	// 等不需要强推理的辅助调用走它，省钱且更快。
+	SmallModel string `json:"smallModel,omitempty"`
 	// MaxTokens 单次回复的最大 token（<=0 = 不注入，由上游默认）。
 	MaxTokens int `json:"maxTokens,omitempty"`
 	// ContextWindow 上游模型的上下文窗口（token）。>0 时压缩触发按 token 水位
@@ -164,6 +188,34 @@ func (s *Store) normalize() {
 	if s.data.CommandTimeoutSec > 600 {
 		s.data.CommandTimeoutSec = 600
 	}
+	// 权限规则：effect 必须是三态之一，非法整条丢弃；条数封顶防配置膨胀。
+	validEffects := map[string]bool{"allow": true, "ask": true, "deny": true}
+	rules := make([]PermissionRule, 0, len(s.data.Permissions))
+	for _, r := range s.data.Permissions {
+		r.Tool = strings.TrimSpace(r.Tool)
+		if r.Tool == "" || !validEffects[r.Effect] {
+			continue
+		}
+		rules = append(rules, r)
+		if len(rules) >= 64 {
+			break
+		}
+	}
+	s.data.Permissions = rules
+	// 斜杠命令：名字限字母数字-_，模板非空；条数封顶。
+	cmds := make([]CustomCommand, 0, len(s.data.Commands))
+	for _, c := range s.data.Commands {
+		c.Name = strings.Trim(strings.TrimSpace(c.Name), "/")
+		c.Template = strings.TrimSpace(c.Template)
+		if c.Name == "" || len(c.Name) > 32 || c.Template == "" || len(c.Template) > 32*1024 {
+			continue
+		}
+		cmds = append(cmds, c)
+		if len(cmds) >= 64 {
+			break
+		}
+	}
+	s.data.Commands = cmds
 	if s.data.MCPServers == nil {
 		s.data.MCPServers = []MCPServer{}
 	}
@@ -172,6 +224,12 @@ func (s *Store) normalize() {
 	}
 	if s.data.CommandAllowlist == nil {
 		s.data.CommandAllowlist = []string{"git", "npm", "npx", "node", "python", "pip"}
+	}
+	if s.data.Permissions == nil {
+		s.data.Permissions = []PermissionRule{}
+	}
+	if s.data.Commands == nil {
+		s.data.Commands = []CustomCommand{}
 	}
 }
 
@@ -191,6 +249,10 @@ func (s *Store) snapshot() Settings {
 	copy(cp.ReadDirs, s.data.ReadDirs)
 	cp.CommandAllowlist = make([]string, len(s.data.CommandAllowlist))
 	copy(cp.CommandAllowlist, s.data.CommandAllowlist)
+	cp.Permissions = make([]PermissionRule, len(s.data.Permissions))
+	copy(cp.Permissions, s.data.Permissions)
+	cp.Commands = make([]CustomCommand, len(s.data.Commands))
+	copy(cp.Commands, s.data.Commands)
 	return cp
 }
 
