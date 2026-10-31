@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import Icon from './Icon.vue'
-import type { CustomCommand } from '../types'
+import type { CustomCommand, LLMProfileView } from '../types'
 
 const emit = defineEmits<{
   send: [content: string]
   stop: []
   'update:reasoning': [v: string]
   setMode: [m: 'plan' | 'build' | 'ask']
+  activateModel: [id: string]
 }>()
 
 const text = ref('')
@@ -23,6 +24,10 @@ const props = defineProps<{
   sessionId?: string
   /** 自定义斜杠命令（设置 → 高级维护）；busy 时发送自动进入队列 */
   commands?: CustomCommand[]
+  /** 模型配置档案：输入框左下角快捷切换 */
+  profiles?: LLMProfileView[]
+  activeProfile?: string
+  modelName?: string
 }>()
 
 function loadDraft(sid?: string) {
@@ -65,6 +70,13 @@ watch(text, (v) => saveDraft(props.sessionId, v))
 // 输入框左侧的工作模式切换
 const modeMenuOpen = ref(false)
 const modeWrap = ref<HTMLElement | null>(null)
+// 模型档案快捷切换（模式按钮旁）
+const modelMenuOpen = ref(false)
+const modelWrap = ref<HTMLElement | null>(null)
+const activeModelLabel = computed(() => {
+  const p = (props.profiles || []).find((x) => x.id === props.activeProfile)
+  return p?.name || props.modelName || '模型'
+})
 const isPlan = () => props.mode === 'plan'
 const isAsk = () => props.mode === 'ask'
 function pickMode(m: 'plan' | 'build' | 'ask') {
@@ -72,10 +84,15 @@ function pickMode(m: 'plan' | 'build' | 'ask') {
   modeMenuOpen.value = false
 }
 
+function pickModel(id: string) {
+  modelMenuOpen.value = false
+  if (id !== props.activeProfile) emit('activateModel', id)
+}
+
 // 点击面板外部关闭
 function onDocClick(e: MouseEvent) {
-  if (!modeMenuOpen.value) return
-  if (modeWrap.value && !modeWrap.value.contains(e.target as Node)) modeMenuOpen.value = false
+  if (modeMenuOpen.value && modeWrap.value && !modeWrap.value.contains(e.target as Node)) modeMenuOpen.value = false
+  if (modelMenuOpen.value && modelWrap.value && !modelWrap.value.contains(e.target as Node)) modelMenuOpen.value = false
 }
 onMounted(() => document.addEventListener('mousedown', onDocClick))
 onUnmounted(() => document.removeEventListener('mousedown', onDocClick))
@@ -238,6 +255,33 @@ function onLevelChange(e: Event) {
         >
           <b>/{{ c.name }}</b>
           <i>{{ c.template.split('\n')[0].slice(0, 60) }}</i>
+        </button>
+      </div>
+
+      <!-- 模型档案快捷切换（模式按钮旁） -->
+      <div ref="modelWrap" class="mode-wrap">
+        <div v-if="modelMenuOpen" class="mode-menu model-menu">
+          <button
+            v-for="p in props.profiles || []"
+            :key="p.id"
+            class="mode-opt slim"
+            :class="{ active: p.id === props.activeProfile }"
+            @click="pickModel(p.id)"
+          >
+            <span class="mo-text">
+              <b>{{ p.name }}</b>
+              <i>{{ p.model || '（未设模型）' }}</i>
+            </span>
+            <span v-if="p.id === props.activeProfile" class="mo-check"><Icon name="check" :size="13" /></span>
+          </button>
+        </div>
+        <button
+          class="mode-btn model-btn"
+          :title="'当前模型：' + activeModelLabel + '（点击切换）'"
+          @click="modelMenuOpen = !modelMenuOpen"
+        >
+          <span class="mb-icon"><Icon name="bot" :size="15" /></span>
+          <span class="mb-label">{{ activeModelLabel }}</span>
         </button>
       </div>
 
@@ -528,6 +572,27 @@ textarea::placeholder {
 }
 
 /* ---------- 斜杠命令补全 ---------- */
+.model-menu {
+  width: 250px;
+  left: 0;
+  right: auto;
+}
+
+.mode-opt.slim {
+  padding: 8px 11px;
+}
+
+.model-btn {
+  max-width: 120px;
+}
+
+.model-btn .mb-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 74px;
+}
+
 .slash-menu {
   position: absolute;
   bottom: calc(100% + 8px);

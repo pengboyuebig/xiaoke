@@ -35,6 +35,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/settings", h.putSettings)
 	mux.HandleFunc("POST /api/settings/test", h.testLLM)
 	mux.HandleFunc("GET /api/models", h.listModels)
+	mux.HandleFunc("POST /api/models/activate", h.activateProfile)
 	mux.HandleFunc("GET /api/mcp/status", h.mcpStatus)
 	mux.HandleFunc("POST /api/mcp/retry", h.retryMCP)
 	mux.HandleFunc("GET /api/projects", h.listProjects)
@@ -70,6 +71,33 @@ type settingsView struct {
 	CommandTimeoutSec     int                       `json:"commandTimeoutSec"`
 	Permissions           []settings.PermissionRule `json:"permissions"`
 	Commands              []settings.CustomCommand  `json:"commands"`
+	Profiles              []llmProfileView          `json:"profiles"`
+	ActiveProfile         string                    `json:"activeProfile"`
+}
+
+// llmProfileView 是档案的前端视图：apiKey 永不明文下发，只给「是否已配置 + 尾 4 位」。
+type llmProfileView struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Mode       string `json:"mode"`
+	BaseURL    string `json:"baseURL"`
+	APIKeySet  bool   `json:"apiKeySet"`
+	APIKeyTail string `json:"apiKeyTail,omitempty"`
+	Model      string `json:"model"`
+	SmallModel string `json:"smallModel,omitempty"`
+}
+
+// profileViews 把档案列表转成脱敏视图。
+func profileViews(profiles []settings.LLMProfile) []llmProfileView {
+	out := make([]llmProfileView, 0, len(profiles))
+	for _, p := range profiles {
+		has, tail := settings.MaskKey(p.APIKey)
+		out = append(out, llmProfileView{
+			ID: p.ID, Name: p.Name, Mode: p.Mode, BaseURL: p.BaseURL,
+			APIKeySet: has, APIKeyTail: tail, Model: p.Model, SmallModel: p.SmallModel,
+		})
+	}
+	return out
 }
 
 func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
@@ -83,6 +111,8 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 		CommandAllowlist:      s.CommandAllowlist,
 		Permissions:           s.Permissions,
 		Commands:              s.Commands,
+		Profiles:              profileViews(s.LLMProfiles),
+		ActiveProfile:         s.ActiveProfile,
 	}
 	v.LLM.Mode = s.LLM.Mode
 	v.LLM.BaseURL = s.LLM.BaseURL
@@ -124,6 +154,19 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		empty := ""
 		newKey = &empty
 	}
+	// 档案 apiKey 合并：前端永远不回传明文 key，空串 = 保持该档案原有 key
+	//（按 ID 匹配）；新档案 key 非空才存。
+	if len(in.LLMProfiles) > 0 {
+		oldKeys := map[string]string{}
+		for _, p := range h.set.Get().LLMProfiles {
+			oldKeys[p.ID] = p.APIKey
+		}
+		for i := range in.LLMProfiles {
+			if in.LLMProfiles[i].APIKey == "" {
+				in.LLMProfiles[i].APIKey = oldKeys[in.LLMProfiles[i].ID]
+			}
+		}
+	}
 	if err := h.set.Update(in, newKey); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -140,6 +183,26 @@ func lookClearKey(r *http.Request) (bool, bool) {
 		return false, false
 	}
 	return v == "true" || v == "1", true
+}
+
+// activateProfile 处理 POST /api/models/activate {id}：把指定档案的值拷入
+// 当前生效配置（LLM 字段）并记为激活，热生效即时。返回最新设置视图。
+func (h *Handler) activateProfile(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ID string `json:"id"`
+	}
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if strings.TrimSpace(in.ID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "需要档案 id"})
+		return
+	}
+	if _, err := h.set.ActivateProfile(strings.TrimSpace(in.ID)); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	h.getSettings(w, r)
 }
 
 // testReq 是「测试连接」的请求体；空字段沿用当前已保存配置。

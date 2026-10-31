@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api } from './lib/api'
-import type { Agent, CustomCommand, Message, MsgGroup, Project, SessionMeta, Skill, Todo, ToolActivity, ToolPair, Turn } from './types'
+import type { Agent, CustomCommand, LLMProfileView, Message, MsgGroup, Project, SessionMeta, Skill, Todo, ToolActivity, ToolPair, Turn } from './types'
 import type { UsageInfo } from './lib/api'
 import SideBar from './components/SideBar.vue'
 import ChatView from './components/ChatView.vue'
@@ -96,12 +96,31 @@ function flashNotice(text: string) {
 
 // 自定义斜杠命令（设置 → 高级维护）：Composer 补全与模板展开
 const slashCommands = ref<CustomCommand[]>([])
+// 模型配置档案：侧栏底部 / Composer 快捷切换菜单共用
+const modelProfiles = ref<LLMProfileView[]>([])
+const activeProfile = ref('')
 async function refreshCommands() {
   try {
     const s = await api.getSettings()
     slashCommands.value = s.commands || []
+    modelProfiles.value = s.profiles || []
+    activeProfile.value = s.activeProfile || ''
   } catch {
     /* 忽略 */
+  }
+}
+
+/** 一键切换模型档案：值拷入生效配置热生效，刷新健康状态与档案高亮 */
+async function activateModel(id: string) {
+  try {
+    const s = await api.activateModel(id)
+    modelProfiles.value = s.profiles || []
+    activeProfile.value = s.activeProfile || ''
+    await refreshHealth()
+    const name = modelProfiles.value.find((p) => p.id === id)?.name || id
+    flashNotice(`已切换到「${name}」，下一条消息生效`)
+  } catch (e) {
+    error.value = (e as Error).message
   }
 }
 
@@ -742,6 +761,9 @@ function onSettingsClosed() {
       :current-agent-id="currentAgentId"
       :mode="mode"
       :model="model"
+      :profiles="modelProfiles"
+      :active-profile="activeProfile"
+      @activate-model="activateModel"
       @select="handleSelect"
       @new-chat="handleNewChat"
       @rename="handleRename"
@@ -804,6 +826,10 @@ function onSettingsClosed() {
         :mode="workMode"
         :session-id="currentId"
         :commands="slashCommands"
+        :profiles="modelProfiles"
+        :active-profile="activeProfile"
+        :model-name="model"
+        @activate-model="activateModel"
         @send="handleSend"
         @stop="handleStop"
         @update:reasoning="setReasoning"

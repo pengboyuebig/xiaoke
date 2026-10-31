@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
-import type { Agent, Project, SessionMeta } from '../types'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import type { Agent, LLMProfileView, Project, SessionMeta } from '../types'
 import { api } from '../lib/api'
 import AvatarBadge from './AvatarBadge.vue'
 import Icon from './Icon.vue'
@@ -14,7 +14,24 @@ const props = defineProps<{
   currentAgentId: string
   mode: string
   model: string
+  /** 模型配置档案：底部快速切换菜单用 */
+  profiles?: LLMProfileView[]
+  activeProfile?: string
 }>()
+
+// 模型快速切换菜单（foot 区弹出）
+const modelMenuOpen = ref(false)
+const modelMenuWrap = ref<HTMLElement | null>(null)
+function onDocClick(e: MouseEvent) {
+  if (!modelMenuOpen.value) return
+  if (modelMenuWrap.value && !modelMenuWrap.value.contains(e.target as Node)) modelMenuOpen.value = false
+}
+onMounted(() => document.addEventListener('mousedown', onDocClick))
+onUnmounted(() => document.removeEventListener('mousedown', onDocClick))
+function pickModel(id: string) {
+  modelMenuOpen.value = false
+  if (id !== props.activeProfile) emit('activateModel', id)
+}
 
 const emit = defineEmits<{
   select: [id: string]
@@ -28,6 +45,8 @@ const emit = defineEmits<{
   openSettings: []
   /** 分叉会话：复制全部消息为新会话 */
   fork: [id: string]
+  /** 一键切换模型配置档案 */
+  activateModel: [id: string]
 }>()
 
 
@@ -255,9 +274,34 @@ function projectName(projects: Project[], id?: string): string {
       <div v-else-if="!sessions.length" class="empty">还没有会话。</div>
     </div>
 
-    <div class="foot">
-      <span class="mode-dot" :class="mode === 'mock' ? 'amber' : 'green'"></span>
-      <span class="foot-text">{{ mode === 'mock' ? '演示模式' : '在线模型' }} · {{ model || '—' }}</span>
+    <div ref="modelMenuWrap" class="foot">
+      <button
+        class="foot-btn"
+        :title="(props.profiles?.length || 0) > 1 ? '点击切换模型' : '当前模型'"
+        @click="modelMenuOpen = !modelMenuOpen"
+      >
+        <span class="mode-dot" :class="mode === 'mock' ? 'amber' : 'green'"></span>
+        <span class="foot-text">{{ mode === 'mock' ? '演示模式' : '在线模型' }} · {{ model || '—' }}</span>
+      </button>
+      <!-- 模型档案快速切换 -->
+      <div v-if="modelMenuOpen" class="model-menu">
+        <button
+          v-for="p in props.profiles || []"
+          :key="p.id"
+          class="mm-opt"
+          :class="{ active: p.id === props.activeProfile }"
+          @click="pickModel(p.id)"
+        >
+          <span class="mm-main">
+            <b>{{ p.name }}</b>
+            <i>{{ p.model || '（未设模型）' }}</i>
+          </span>
+          <span v-if="p.id === props.activeProfile" class="mm-check"><Icon name="check" :size="13" /></span>
+        </button>
+        <button class="mm-manage" @click="modelMenuOpen = false; emit('openSettings')">
+          <Icon name="settings" :size="12" /> 管理配置…
+        </button>
+      </div>
       <button class="gear" title="设置" @click="emit('openSettings')">
         <Icon name="settings" :size="16" />
       </button>
@@ -714,7 +758,116 @@ function projectName(projects: Project[], id?: string): string {
   line-height: 1.6;
 }
 
+/* ---------- 底部模型快速切换 ---------- */
+.foot-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: none;
+  border-radius: 9px;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s ease;
+}
+
+.foot-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.model-menu {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 10px;
+  right: 10px;
+  background: linear-gradient(180deg, #1c202a 0%, #14171f 100%);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 40;
+}
+
+.mm-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 9px;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+
+.mm-opt:hover {
+  background: rgba(255, 154, 61, 0.09);
+}
+
+.mm-opt.active {
+  background: linear-gradient(135deg, rgba(255, 154, 61, 0.14), rgba(255, 154, 61, 0.05));
+}
+
+.mm-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.mm-main b {
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mm-main i {
+  font-style: normal;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mm-check {
+  display: flex;
+  color: var(--accent);
+}
+
+.mm-manage {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 3px;
+  padding: 7px 10px;
+  border: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 10px 10px;
+  background: none;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+
+.mm-manage:hover {
+  color: var(--accent);
+  background: rgba(255, 255, 255, 0.04);
+}
+
 .foot {
+  position: relative; /* 模型切换菜单的定位锚点 */
   display: flex;
   align-items: center;
   gap: 7px;

@@ -183,6 +183,10 @@ export const api = {
   listModels(): Promise<{ models: string[]; error?: string }> {
     return jfetch('/api/models')
   },
+  /** 激活一个模型配置档案：值拷入当前生效配置，热生效即时，返回最新设置视图 */
+  activateModel(id: string): Promise<SettingsView> {
+    return jfetch('/api/models/activate', jsonBody('POST', { id }))
+  },
   mcpStatus(): Promise<{ servers: MCPStatus[] }> {
     return jfetch('/api/mcp/status')
   },

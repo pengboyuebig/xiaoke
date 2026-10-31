@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"xiaoke/internal/agents"
+	"xiaoke/internal/api"
 	"xiaoke/internal/config"
 	"xiaoke/internal/cron"
 	"xiaoke/internal/mcp"
@@ -83,8 +84,17 @@ func newE2E(t *testing.T) *e2eFixture {
 		t.Fatal(err)
 	}
 	h := NewHandler(&config.Config{DataDir: dataDir}, st, set, pm, mcp.NewManager(context.Background()), ag, sk, mem, rules.New(), nil)
+	// api 路由（settings/models/activate）：模型档案切换的 E2E 需要
+	apiH := api.New(&config.Config{DataDir: dataDir}, set, pm, mcp.NewManager(context.Background()), nil)
 	mux := http.NewServeMux()
 	h.Register(mux)
+	apiH.Register(mux)
+	// healthz（main.go 内联注册，fixture 复刻一份供档案切换断言用）
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		eff := set.Effective()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		fmt.Fprintf(w, `{"ok":1,"agent":"小柯","mode":%q,"model":%q}`, eff.Mode, eff.Model)
+	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return &e2eFixture{srv: srv, st: st, set: set, pm: pm, project: proj, rootDir: rootDir, dataDir: dataDir}

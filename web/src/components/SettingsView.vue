@@ -1,7 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../lib/api'
-import type { Agent, Automation, CustomCommand, MCPServerCfg, MCPStatus, PermissionRule, SettingsView, Skill, TrashItem } from '../types'
+import type { Agent, Automation, CustomCommand, LLMProfilePayload, MCPServerCfg, MCPStatus, PermissionRule, SettingsView, Skill, TrashItem } from '../types'
+
+/** 档案的本地编辑态：apiKey 输入框值（空=保持）+ 脱敏信息 + 每档案的拉取/测试状态 */
+interface ProfileEdit extends LLMProfilePayload {
+  apiKeySet: boolean
+  apiKeyTail: string
+}
 import AgentSection from './AgentSection.vue'
 import SkillSection from './SkillSection.vue'
 import Icon from './Icon.vue'
@@ -57,9 +63,104 @@ const form = reactive({
   memoryDirty: false,
   permissions: [] as PermissionRule[],
   commands: [] as CustomCommand[],
+  profiles: [] as ProfileEdit[],
   mcpServers: [] as (MCPServerCfg & { argLines: string })[],
 })
 const newMcp = reactive({ name: '', command: '', argsText: '', dir: '' })
+// 档案编辑态
+const expandedProfile = ref('')
+const activeProfile = ref('')
+const profileTest = ref<Record<string, { ok: boolean; text: string }>>({})
+const profileModels = ref<Record<string, string[]>>({})
+const profileBusy = ref('')
+const customLLM = ref(false) // 当前生效值与激活档案不一致（手动自定义过）
+
+function newProfileID(): string {
+  return 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+}
+function addProfile() {
+  if (form.profiles.length >= 20) return
+  const p: ProfileEdit = { id: newProfileID(), name: '', mode: 'openai', baseURL: '', apiKey: '', apiKeySet: false, apiKeyTail: '', model: '', smallModel: '' }
+  form.profiles.push(p)
+  expandedProfile.value = p.id
+}
+async function removeProfile(i: number) {
+  const p = form.profiles[i]
+  const ok = await askConfirm({
+    title: `删除模型配置「${p?.name || '未命名'}」`,
+    message: p?.apiKeySet ? '该档案保存的 API Key 将一并删除，无法恢复。确定继续？' : '确定删除这个配置档案？',
+    confirmText: '删除',
+  })
+  if (!ok) return
+  if (expandedProfile.value === p?.id) expandedProfile.value = ''
+  form.profiles.splice(i, 1)
+  saveProfiles()
+}
+async function activateNow(id: string) {
+  profileBusy.value = id
+  try {
+    const s = await api.activateModel(id)
+    await loadSettings()
+    const name = (s.profiles || []).find((p) => p.id === id)?.name || id
+    showToast(`已切换到「${name}」✓`)
+  } catch (e) {
+    saveErr.value = (e as Error).message
+  } finally {
+    profileBusy.value = ''
+  }
+}
+async function toggleProfileEdit(p: ProfileEdit) {
+  if (expandedProfile.value === p.id) {
+    expandedProfile.value = ''
+    await saveProfiles() // 收起即保存：档案编辑不依赖顶部的「保存并应用」
+  } else {
+    expandedProfile.value = p.id
+  }
+}
+/** 只保存档案（连同当前表单其余字段一起全量 PUT），随后重载视图 */
+async function saveProfiles() {
+  try {
+    await api.saveSettings(buildPayload())
+    await loadSettings()
+  } catch (e) {
+    saveErr.value = (e as Error).message
+  }
+}
+/** 对单个档案拉模型列表 / 测试连通（testLLM 接受任意组合） */
+async function pullProfileModels(p: ProfileEdit) {
+  profileBusy.value = p.id + ':pull'
+  profileTest.value[p.id] = { ok: true, text: '拉取中…' }
+  try {
+    const r = await api.testLLM({ baseURL: p.baseURL, apiKey: p.apiKey || undefined, model: p.model })
+    profileModels.value[p.id] = r.models || []
+    profileTest.value[p.id] = r.error
+      ? { ok: false, text: r.error }
+      : { ok: true, text: `可用模型 ${r.models?.length ?? 0} 个，已填入下拉` }
+  } finally {
+    profileBusy.value = ''
+  }
+}
+async function testProfile(p: ProfileEdit) {
+  profileBusy.value = p.id + ':test'
+  try {
+    const r = await api.testLLM({ baseURL: p.baseURL, apiKey: p.apiKey || undefined, model: p.model })
+    profileTest.value[p.id] = r.ok ? { ok: true, text: '连接成功 ✓' } : { ok: false, text: r.error || '连接失败' }
+  } finally {
+    profileBusy.value = ''
+  }
+}
+const PRESETS: Record<string, { name: string; baseURL: string }> = {
+  deepseek: { name: 'DeepSeek 官方', baseURL: 'https://api.deepseek.com' },
+  gateway: { name: '本地 opencode 网关', baseURL: 'http://localhost:3000/api/v1' },
+  zen: { name: 'OpenCode Zen', baseURL: 'https://opencode.ai/zen/v1' },
+}
+function applyPresetTo(p: ProfileEdit, key: string) {
+  const pre = PRESETS[key]
+  if (!pre) return
+  p.name = p.name && p.name !== p.model ? p.name : pre.name
+  p.mode = 'openai'
+  p.baseURL = pre.baseURL
+}
 const keyInfo = reactive({ set: false, tail: '' })
 const testResult = ref<{ ok: boolean; text: string } | null>(null)
 const modelList = ref<string[]>([])
@@ -184,6 +285,10 @@ async function loadSettings() {
     form.commandTimeoutSec = s.commandTimeoutSec || 0
     form.permissions = (s.permissions || []).map((r) => ({ ...r }))
     form.commands = (s.commands || []).map((c) => ({ ...c }))
+    form.profiles = (s.profiles || []).map((p) => ({ ...p, apiKey: '', apiKeyTail: p.apiKeyTail || '' }))
+    activeProfile.value = s.activeProfile || ''
+    const ap = (s.profiles || []).find((p) => p.id === s.activeProfile)
+    customLLM.value = !!ap && (ap.model !== s.llm.model || ap.baseURL !== s.llm.baseURL || ap.mode !== s.llm.mode)
     form.mcpServers = s.mcpServers.map((m) => ({
       ...m,
       args: [...m.args],
@@ -382,12 +487,8 @@ function addReadDir() {
 }
 
 // ---------- 保存 ----------
-async function save() {
-  saving.value = true
-  saveErr.value = ''
-  try {
-    await api.saveSettings(
-      {
+function buildPayload() {
+  return {
         llm: {
           mode: form.mode,
           baseURL: form.baseURL.trim(),
@@ -423,7 +524,21 @@ async function save() {
           name: c.name.trim().replace(/^\/+/, ''),
           template: c.template.trim(),
         })),
-      },
+        llmProfiles: form.profiles
+          .filter((p) => p.name.trim() || p.model.trim() || p.baseURL.trim())
+          .map((p) => ({
+            id: p.id, name: p.name.trim(), mode: p.mode, baseURL: p.baseURL.trim(),
+            apiKey: p.apiKey, model: p.model.trim(), smallModel: p.smallModel?.trim() || '',
+          })),
+      }
+}
+
+async function save() {
+  saving.value = true
+  saveErr.value = ''
+  try {
+    await api.saveSettings(
+      buildPayload(),
       form.clearApiKey,
     )
     showToast('已保存并应用 ✓')
@@ -508,6 +623,70 @@ async function save() {
               </div>
             </div>
           </div>
+
+            <div class="card profile-card">
+              <div class="card-title">
+                模型配置档案（{{ form.profiles.length }}/20）
+                <span v-if="customLLM" class="custom-flag" title="当前生效值被手动改过，与激活档案不同">已手动自定义</span>
+              </div>
+              <div class="hint">
+                每个档案是完整的一套配置（名称/模式/地址/Key/主模型/轻量模型），点「使用」即时切换（连运行模式一起切，下一条消息生效）。
+                编辑收起即自动保存。
+              </div>
+              <div v-for="(p, pi) in form.profiles" :key="p.id" class="profile-item" :class="{ active: p.id === activeProfile, open: expandedProfile === p.id }">
+                <!-- 摘要行 -->
+                <div class="profile-row" @click="toggleProfileEdit(p)">
+                  <span class="pr-badge" :class="p.mode">{{ p.mode === 'mock' ? '演示' : '在线' }}</span>
+                  <span class="pr-main">
+                    <b>{{ p.name || '（未命名）' }}</b>
+                    <i>{{ p.model || '未设模型' }}<template v-if="p.baseURL"> · {{ p.baseURL }}</template><template v-if="p.apiKeySet"> · key 尾号 {{ p.apiKeyTail }}</template></i>
+                  </span>
+                  <span v-if="p.id === activeProfile" class="pr-active">使用中</span>
+                  <button class="ab-btn primary" :disabled="profileBusy === p.id" @click.stop="activateNow(p.id)">
+                    {{ p.id === activeProfile ? '使用中' : (profileBusy === p.id ? '切换中…' : '使用') }}
+                  </button>
+                  <button class="ab-btn danger" title="删除档案" @click.stop="removeProfile(pi)">
+                    <Icon name="trash" :size="13" />
+                  </button>
+                </div>
+                <!-- 展开编辑 -->
+                <div v-if="expandedProfile === p.id" class="profile-edit" @click.stop>
+                  <div class="pe-row">
+                    <input v-model="p.name" class="inp pe-name" placeholder="配置名，如 DeepSeek 官方" />
+                    <select v-model="p.mode" class="inp pe-mode">
+                      <option value="openai">OpenAI 兼容上游</option>
+                      <option value="mock">mock 演示（免 Key）</option>
+                    </select>
+                  </div>
+                  <div v-if="p.mode === 'openai'" class="pe-presets">
+                    <button v-for="(pre, key) in { deepseek: 'DeepSeek 官方', gateway: '本地网关', zen: 'OpenCode Zen' }" :key="key" class="chip" @click="applyPresetTo(p, key)">{{ pre }}</button>
+                  </div>
+                  <template v-if="p.mode === 'openai'">
+                    <input v-model="p.baseURL" class="inp" placeholder="Base URL，如 https://api.deepseek.com" />
+                    <input v-model="p.apiKey" class="inp" type="password" autocomplete="off"
+                      :placeholder="p.apiKeySet ? `已配置（尾号 ${p.apiKeyTail}），留空保持不变` : 'sk-… / oc-…'" />
+                    <div class="model-line">
+                      <input v-model="p.model" class="inp" :list="'pm-' + p.id" placeholder="主模型名" />
+                      <datalist :id="'pm-' + p.id">
+                        <option v-for="m in profileModels[p.id] || []" :key="m" :value="m" />
+                      </datalist>
+                      <button class="btn ghost" :disabled="profileBusy === p.id + ':pull'" @click="pullProfileModels(p)">
+                        {{ profileBusy === p.id + ':pull' ? '拉取中…' : '拉取列表' }}
+                      </button>
+                      <button class="btn ghost" :disabled="profileBusy === p.id + ':test'" @click="testProfile(p)">
+                        {{ profileBusy === p.id + ':test' ? '测试中…' : '测试连接' }}
+                      </button>
+                    </div>
+                    <input v-model="p.smallModel" class="inp" :list="'pm-' + p.id" placeholder="轻量模型（可选，留空 = 主模型）" />
+                    <div v-if="profileTest[p.id]" class="test" :class="profileTest[p.id].ok ? 'ok' : 'bad'">{{ profileTest[p.id].text }}</div>
+                  </template>
+                  <div class="pe-foot hint">收起本档案（再点一次摘要行）即自动保存。</div>
+                </div>
+              </div>
+              <button class="btn ghost tiny" :disabled="form.profiles.length >= 20" @click="addProfile">
+                <Icon name="plus" :size="13" /> 添加配置
+              </button>
+            </div>
 
           <template v-if="form.mode === 'openai'">
             <div class="card">
@@ -1252,6 +1431,124 @@ textarea.inp {
 }
 
 /* 定时任务管理 */
+/* ---------- 模型配置档案 ---------- */
+.custom-flag {
+  margin-left: 10px;
+  font-size: 10.5px;
+  font-weight: 400;
+  color: #facc15;
+  border: 1px solid rgba(250, 204, 21, 0.35);
+  border-radius: 999px;
+  padding: 1px 8px;
+  vertical-align: middle;
+}
+
+.profile-item {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  margin-top: 8px;
+  overflow: hidden;
+  transition: border-color 0.15s ease;
+}
+
+.profile-item.active {
+  border-color: rgba(255, 154, 61, 0.4);
+  background: linear-gradient(135deg, rgba(255, 154, 61, 0.05), transparent);
+}
+
+.profile-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 12px;
+  cursor: pointer;
+}
+
+.profile-item.open .profile-row {
+  border-bottom: 1px solid var(--border);
+}
+
+.pr-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+}
+
+.pr-badge.mock {
+  border-color: rgba(250, 204, 21, 0.4);
+  color: #facc15;
+}
+
+.pr-badge.openai {
+  border-color: rgba(74, 222, 128, 0.35);
+  color: #4ade80;
+}
+
+.pr-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.pr-main b {
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pr-main i {
+  font-style: normal;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pr-active {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--accent);
+}
+
+.profile-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px 12px 12px;
+}
+
+.pe-row {
+  display: flex;
+  gap: 7px;
+}
+
+.pe-name {
+  flex: 1;
+}
+
+.pe-mode {
+  width: 170px;
+  flex-shrink: 0;
+}
+
+.pe-presets {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pe-foot {
+  margin-top: 2px;
+}
+
 /* ---------- 权限规则 & 斜杠命令 ---------- */
 .rule-row,
 .cmd-row {

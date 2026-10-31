@@ -231,6 +231,32 @@ export interface SettingsView {
   commandTimeoutSec: number
   permissions: PermissionRule[]
   commands: CustomCommand[]
+  /** 模型配置档案（apiKey 脱敏：只给 apiKeySet + 尾4位） */
+  profiles: LLMProfileView[]
+  activeProfile: string
+}
+
+/** 模型配置档案视图（key 脱敏） */
+export interface LLMProfileView {
+  id: string
+  name: string
+  mode: string // mock | openai
+  baseURL: string
+  apiKeySet: boolean
+  apiKeyTail?: string
+  model: string
+  smallModel?: string
+}
+
+/** 保存/编辑档案时的提交形态（apiKey 空 = 保持原值） */
+export interface LLMProfilePayload {
+  id: string
+  name: string
+  mode: string
+  baseURL: string
+  apiKey: string
+  model: string
+  smallModel?: string
 }
 
 /** 一条权限规则：工具名与资源模式支持 * ? 通配，按书写顺序取最后命中 */
@@ -282,4 +308,5 @@ export interface SettingsPayload {
   commandTimeoutSec: number
   permissions: PermissionRule[]
   commands: CustomCommand[]
+  llmProfiles: LLMProfilePayload[]
 }

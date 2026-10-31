@@ -5,12 +5,16 @@
 package settings
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"xiaoke/internal/config"
 )
@@ -37,6 +41,25 @@ type Settings struct {
 	Permissions []PermissionRule `json:"permissions"`
 	// Commands 用户自定义斜杠命令：前端输入 /name 时展开模板后发送（纯前端展开）。
 	Commands []CustomCommand `json:"commands"`
+
+	// LLMProfiles 模型配置档案：每个档案是完整的一套可切换配置（名称/模式/
+	// baseURL/key/主模型/轻量模型）。激活 = 把档案值拷入上面的 LLM 字段，
+	// LLM 字段永远代表「当前实际生效值」。温度/历史条数/maxTokens/contextWindow
+	// 属于全局共享，不进档案。
+	LLMProfiles []LLMProfile `json:"llmProfiles"`
+	// ActiveProfile 当前激活的档案 ID（空 = 未绑定档案，LLM 字段为手动自定义值）。
+	ActiveProfile string `json:"activeProfile,omitempty"`
+}
+
+// LLMProfile 是一份可一键切换的模型配置档案。
+type LLMProfile struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`       // 显示名，如「DeepSeek 官方」
+	Mode       string `json:"mode"`       // mock | openai（激活时连同运行模式一起切）
+	BaseURL    string `json:"baseURL"`
+	APIKey     string `json:"apiKey,omitempty"` // 脱敏下发：前端只见 尾4位，空串=保持
+	Model      string `json:"model"`
+	SmallModel string `json:"smallModel,omitempty"`
 }
 
 // PermissionRule 一条工具权限规则。Tool 是工具名（内置精确名或 MCP 原始名），
@@ -103,18 +126,34 @@ func Open(path string, base config.LLMConfig) (*Store, error) {
 			Model: base.Model, Temperature: base.Temperature, MaxHistory: base.MaxHistory,
 		}
 		s.normalize()
+	} else if err != nil {
+		return nil, err
+	} else {
+		if err := json.Unmarshal(data, &s.data); err != nil {
+			return nil, err
+		}
+		s.normalize()
+	}
+	// 迁移：没有任何档案但已配置过模型 → 把当前生效配置生成第一个档案并激活。
+	// 零感升级：打开设置页即见自己的配置已成档案，可继续添加更多。
+	if len(s.data.LLMProfiles) == 0 && strings.TrimSpace(s.data.LLM.Model) != "" {
+		p := LLMProfile{
+			ID:         newProfileID(),
+			Name:       "默认配置",
+			Mode:       s.data.LLM.Mode,
+			BaseURL:    s.data.LLM.BaseURL,
+			APIKey:     s.data.LLM.APIKey,
+			Model:      s.data.LLM.Model,
+			SmallModel: s.data.LLM.SmallModel,
+		}
+		s.data.LLMProfiles = []LLMProfile{p}
+		s.data.ActiveProfile = p.ID
+	}
+	if s.data.LLMProfiles != nil || s.data.ActiveProfile != "" {
 		if err := s.save(); err != nil {
 			return nil, err
 		}
-		return s, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal(data, &s.data); err != nil {
-		return nil, err
-	}
-	s.normalize()
 	return s, nil
 }
 
@@ -231,6 +270,89 @@ func (s *Store) normalize() {
 	if s.data.Commands == nil {
 		s.data.Commands = []CustomCommand{}
 	}
+	s.normalizeProfiles()
+}
+
+// maxProfiles 档案数量上限（防配置膨胀；个人使用远用不到 20 套）。
+const maxProfiles = 20
+
+// normalizeProfiles 校验档案列表：清理无效项、补 ID、去重、维护 ActiveProfile 指向。
+// 调用方需已持锁（normalize 由 Update/Open 在锁内调用）。
+func (s *Store) normalizeProfiles() {
+	profiles := make([]LLMProfile, 0, len(s.data.LLMProfiles))
+	seen := map[string]bool{}
+	for _, p := range s.data.LLMProfiles {
+		p.Name = strings.TrimSpace(p.Name)
+		p.Model = strings.TrimSpace(p.Model)
+		p.BaseURL = strings.TrimSpace(p.BaseURL)
+		p.Mode = strings.ToLower(strings.TrimSpace(p.Mode))
+		// 模式合法值；未填按 openai（绝大多数档案是真实上游）
+		if p.Mode != "mock" {
+			p.Mode = "openai"
+		}
+		// 既没模型又没 baseURL 的空壳丢弃；没起名用模型名兜底
+		if p.Model == "" && p.BaseURL == "" {
+			continue
+		}
+		if p.Name == "" {
+			p.Name = p.Model
+			if p.Name == "" {
+				p.Name = "未命名配置"
+			}
+		}
+		if p.ID == "" || seen[p.ID] {
+			if p.ID != "" {
+				continue // 重复 ID：丢弃后续项（真正的去重，而不是换编号保留）
+			}
+			p.ID = newProfileID()
+		}
+		seen[p.ID] = true
+		profiles = append(profiles, p)
+		if len(profiles) >= maxProfiles {
+			break
+		}
+	}
+	s.data.LLMProfiles = profiles
+	if s.data.ActiveProfile != "" && !seen[s.data.ActiveProfile] {
+		s.data.ActiveProfile = "" // 指向已删除的档案：回到「手动自定义」
+	}
+}
+
+// newProfileID 生成档案 ID（8 字节 hex，与 store 会话 ID 同风格）。
+func newProfileID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("p%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+// ActivateProfile 把指定档案的值拷入当前生效配置（LLM 字段），并记为激活。
+// LLM 字段永远是「实际生效值」：下游 Effective() 零改动。档案不存在返回错误。
+func (s *Store) ActivateProfile(id string) (Settings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx := -1
+	for i, p := range s.data.LLMProfiles {
+		if p.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return s.snapshot(), fmt.Errorf("配置档案 %q 不存在", id)
+	}
+	p := s.data.LLMProfiles[idx]
+	s.data.LLM.Mode = p.Mode
+	s.data.LLM.BaseURL = p.BaseURL
+	s.data.LLM.APIKey = p.APIKey
+	s.data.LLM.Model = p.Model
+	s.data.LLM.SmallModel = p.SmallModel
+	s.data.ActiveProfile = id
+	if err := s.save(); err != nil {
+		return s.snapshot(), err
+	}
+	return s.snapshot(), nil
 }
 
 // Get 返回设置的深拷贝快照。
@@ -253,6 +375,8 @@ func (s *Store) snapshot() Settings {
 	copy(cp.Permissions, s.data.Permissions)
 	cp.Commands = make([]CustomCommand, len(s.data.Commands))
 	copy(cp.Commands, s.data.Commands)
+	cp.LLMProfiles = make([]LLMProfile, len(s.data.LLMProfiles))
+	copy(cp.LLMProfiles, s.data.LLMProfiles)
 	return cp
 }
 

@@ -3,9 +3,11 @@
 package chat
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -509,5 +511,135 @@ func TestDoomLoopSignature(t *testing.T) {
 	}
 	if fired != 2 {
 		t.Fatalf("两个 3 连应各触发一次: %d", fired)
+	}
+}
+
+// TestActivateProfileE2E：模型档案「添加→激活→对话走新上游→切回 mock→删除激活档案」全链路。
+func TestActivateProfileE2E(t *testing.T) {
+	f := newE2E(t)
+	attempts := 0
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"来自测试上游\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+
+	getSettings := func() map[string]any {
+		resp, err := http.Get(f.srv.URL + "/api/settings")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var v map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	putSettings := func(v map[string]any) map[string]any {
+		body, _ := json.Marshal(v)
+		req, _ := http.NewRequest(http.MethodPut, f.srv.URL+"/api/settings", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("PUT settings 应 200，got %d: %s", resp.StatusCode, b)
+		}
+		var out map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	fetchRaw := func(url string) string {
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return string(b)
+	}
+	activate := func(id string) int {
+		body, _ := json.Marshal(map[string]string{"id": id})
+		resp, err := http.Post(f.srv.URL+"/api/models/activate", "application/json", strings.NewReader(string(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// 组装两个档案（mock + 测试上游）。请求体键必须是 llmProfiles（解码目标），
+	// 响应体键是 profiles（脱敏视图）。新档案 key 传空 = 不保存。
+	mockP := map[string]any{"id": "mock-p", "name": "演示", "mode": "mock", "model": "deepseek-chat"}
+	upP := map[string]any{"id": "up-p", "name": "测试上游", "mode": "openai", "baseURL": up.URL, "apiKey": "", "model": "up-model"}
+	sv := getSettings()
+	sv["llmProfiles"] = []any{mockP, upP}
+	sv = putSettings(sv)
+	if n := len(sv["profiles"].([]any)); n != 2 {
+		t.Fatalf("第一次 PUT 后应有 2 个档案: %d", n)
+	}
+
+	// 给 up-p 设 key；再传一次空 key → 应保持（合并约定）
+	upP["apiKey"] = "test-key"
+	sv["llmProfiles"] = []any{mockP, upP}
+	sv = putSettings(sv)
+	upP["apiKey"] = ""
+	sv["llmProfiles"] = []any{mockP, upP}
+	sv = putSettings(sv)
+
+	// 激活上游档案
+	if code := activate("up-p"); code != http.StatusOK {
+		t.Fatalf("activate 应 200，got %d", code)
+	}
+	sv = getSettings()
+	if sv["activeProfile"] != "up-p" {
+		t.Fatalf("激活 ID 应记录: %v", sv["activeProfile"])
+	}
+	llm := sv["llm"].(map[string]any)
+	if llm["mode"] != "openai" || llm["baseURL"] != up.URL || llm["model"] != "up-model" {
+		t.Fatalf("LLM 字段应为档案值: %v", llm)
+	}
+	// 视图脱敏：明文 key 永不回传
+	raw := fetchRaw(f.srv.URL + "/api/settings")
+	if !strings.Contains(raw, `"apiKeySet":true`) || strings.Contains(raw, "test-key") {
+		t.Fatalf("档案 key 应脱敏且明文不回传: %.400s", raw)
+	}
+	// healthz 反映
+	if hz := fetchRaw(f.srv.URL + "/healthz"); !strings.Contains(hz, `"mode":"openai"`) || !strings.Contains(hz, "up-model") {
+		t.Fatalf("healthz 应反映新档案: %s", hz)
+	}
+
+	// 对话走新上游
+	events := f.postChat(t, "你好")
+	if attempts == 0 {
+		t.Fatalf("激活上游档案后对话应请求测试上游: %v", eventTypes(events))
+	}
+	if len(eventsOf(events, "done")) != 1 {
+		t.Fatalf("对话应正常完成: %v", eventTypes(events))
+	}
+
+	// 切回 mock 档案（key 为空的 mock 档案也能激活）
+	if code := activate("mock-p"); code != http.StatusOK {
+		t.Fatalf("切回 mock 应 200，got %d", code)
+	}
+	if hz := fetchRaw(f.srv.URL + "/healthz"); !strings.Contains(hz, `"mode":"mock"`) {
+		t.Fatalf("切回后 healthz 应为 mock: %s", hz)
+	}
+
+	// 删除激活中的档案 → activeProfile 清空（normalize 悬空清理）
+	sv = getSettings()
+	sv["llmProfiles"] = []any{}
+	sv = putSettings(sv)
+	if sv["activeProfile"] != "" {
+		t.Fatalf("删除激活档案后 activeProfile 应清空: %v", sv["activeProfile"])
 	}
 }
