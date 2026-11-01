@@ -27,6 +27,11 @@ const (
 	maxSearchFiles = 2000       // 搜索扫描文件数上限
 	maxOutBytes    = 8 * 1024   // 命令输出截断
 	cmdTimeout     = 30 * time.Second
+	// taskOutputMaxWait 是 task_output 单次等待上限。等待中任务完成会立即返回，
+	// 所以调大不增加延迟，只减少「反复轮询」带来的多余模型往返。
+	taskOutputMaxWait = 180 * time.Second
+	// maxCommandTimeoutSec 是 run_command 单次 timeout_sec 的硬上限。
+	maxCommandTimeoutSec = 600
 )
 
 var toolListFiles = Tool{
@@ -296,7 +301,7 @@ var toolCronDelete = Tool{
 }
 
 var toolRunCommand = Tool{
-	Description: "在工作区内执行白名单命令（git/npm/npx/node/python/pip）。argv 直传不经 shell，30 秒超时，输出截断 8KB。例：command=\"git\", args=[\"status\"]。is_background=true 时立即返回 task_id（适合构建/安装等长命令），用 task_output 读输出、task_kill 终止。",
+	Description: "在工作区内执行白名单命令（git/npm/npx/node/python/pip）。argv 直传不经 shell，输出截断 8KB。默认 30 秒超时，可用 timeout_sec 显式给足（上限 600）：预计 2 分钟内跑完的命令请直接前台 + timeout_sec（例 npm install 给 180），一次拿到结果。预计更久的用 is_background=true，再用 task_output 的 wait_ms 一次等到完成（建议 120000），不要 30 秒一探。同一轮可以并行发多个工具调用，不要一条一条串着试。",
 	Name:        "run_command",
 	Parameters: json.RawMessage(`{
   "type": "object",
@@ -304,7 +309,8 @@ var toolRunCommand = Tool{
     "command": {"type": "string", "description": "命令名，如 git、npm、python"},
     "args": {"type": "array", "items": {"type": "string"}, "description": "参数列表"},
     "cwd": {"type": "string", "description": "工作目录（相对项目根，默认项目根）"},
-    "is_background": {"type": "boolean", "description": "true = 后台运行，立即返回 task_id（默认 false）"}
+    "is_background": {"type": "boolean", "description": "true = 后台运行，立即返回 task_id（默认 false）"},
+    "timeout_sec": {"type": "integer", "description": "前台超时秒数覆盖（0 = 默认 30，上限 600）。构建/安装类命令建议显式给 180"}
   },
   "required": ["command"]
 }`),
@@ -313,7 +319,7 @@ var toolRunCommand = Tool{
 
 var toolTaskOutput = Tool{
 	Name:        "task_output",
-	Description: "读取后台命令任务的输出与状态（running/completed/failed）。wait_ms>0 时最多等这么久让它完成（上限 30000）。",
+	Description: "读取后台命令任务的输出与状态（running/completed/failed）。wait_ms>0 时最多等这么久让它完成（上限 180000，任务提前完成会立即返回，所以直接给 120000 更省往返）。",
 	Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -1450,6 +1456,10 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 		Args         []string `json:"args"`
 		Cwd          string   `json:"cwd"`
 		IsBackground bool     `json:"is_background"`
+		// TimeoutSec 单次前台超时覆盖（秒）：0 = 用设置默认值。
+		// 给 npm install / next build 这类命令显式给足时间，一次前台跑完，
+		// 避免「超时转后台 + 反复轮询」的多余往返。
+		TimeoutSec int `json:"timeout_sec"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil || in.Command == "" {
 		return "", fmt.Errorf("需要 command 参数")
@@ -1488,7 +1498,8 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 	if in.IsBackground {
 		return startBackgroundCommand(in.Command, in.Args, cwd, env.OnTaskDone)
 	}
-	cctx, cancel := context.WithTimeout(ctx, commandTimeout(env))
+	timeout := commandTimeoutFor(env, in.TimeoutSec)
+	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, in.Command, in.Args...)
 	cmd.Dir = cwd
@@ -1507,7 +1518,7 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 		if bgErr == nil {
 			head := fmt.Sprintf("$ %s %s\n", in.Command, strings.Join(in.Args, " "))
 			timed := fmt.Sprintf("%s\n（前台等待 %s 超时，已自动转为后台继续运行：%s\n用 task_output 读取进度与结果）",
-				head, commandTimeout(env), bgID)
+				head, timeout, bgID)
 			return timed, nil
 		}
 		// 转后台失败：按普通超时失败处理
@@ -1716,11 +1727,11 @@ func execTaskOutput(ctx context.Context, env *Env, args json.RawMessage) (string
 	if err != nil {
 		return "", err
 	}
-	// 可选等待：最多 30 秒
+	// 可选等待（上限见 taskOutputMaxWait）
 	if in.WaitMs > 0 {
 		wait := time.Duration(in.WaitMs) * time.Millisecond
-		if wait > 30*time.Second {
-			wait = 30 * time.Second
+		if wait > taskOutputMaxWait {
+			wait = taskOutputMaxWait
 		}
 		select {
 		case <-t.wait:
@@ -1783,4 +1794,16 @@ func commandTimeout(env *Env) time.Duration {
 		return time.Duration(env.CommandTimeoutSec) * time.Second
 	}
 	return cmdTimeout
+}
+
+// commandTimeoutFor 在 settings 默认值之上支持单次调用覆盖（秒）。
+// override <= 0 用默认；超过上限按上限钳制（防误传巨大值挂死回合）。
+func commandTimeoutFor(env *Env, overrideSec int) time.Duration {
+	if overrideSec <= 0 {
+		return commandTimeout(env)
+	}
+	if overrideSec > maxCommandTimeoutSec {
+		overrideSec = maxCommandTimeoutSec
+	}
+	return time.Duration(overrideSec) * time.Second
 }
