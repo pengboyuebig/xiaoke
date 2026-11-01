@@ -209,7 +209,7 @@ var toolSkillRead = Tool{
 
 var toolWebFetch = Tool{
 	Name:        "web_fetch",
-	Description: "抓取公网网页并转为纯文本（HTML 自动剥标签，JSON/纯文本原样返回；30 秒超时，正文上限 16KB）。跨主机重定向不会自动跟随，会返回目标地址让你显式确认。仅支持 http/https 公网地址；本地地址或内网服务不可用。适合：查文档、读在线文章、验证 API 返回。",
+	Description: "抓取公网网页并转为纯文本（HTML 自动剥标签与实体，优先提取正文容器；30 秒超时，正文上限 16KB）。以浏览器 UA 访问，命中反爬验证页时会自动换移动端 UA 重试一次；仍被拦则明确告知「这是验证页不是正文」，不要再重试，改为请用户粘贴内容。跨主机重定向不会自动跟随，会返回目标地址让你显式确认。仅支持 http/https 公网地址；本地地址或内网服务不可用。适合：查文档、读在线文章（含微信公众号）、验证 API 返回。",
 	Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
