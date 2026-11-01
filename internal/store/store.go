@@ -615,6 +615,19 @@ func (s *Store) PurgeTrash(dirName string) error {
 	return os.RemoveAll(src)
 }
 
+// PurgeTrashBatch 批量彻底删除。单条失败不中断其余删除，
+// 返回成功条数与逐条错误（供界面汇总提示）。
+func (s *Store) PurgeTrashBatch(dirNames []string) (ok int, errs []error) {
+	for _, dir := range dirNames {
+		if err := s.PurgeTrash(dir); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", dir, err))
+			continue
+		}
+		ok++
+	}
+	return ok, errs
+}
+
 // PurgeTrashOlderThan 清理超过 d 的回收站记录，返回清理条数。
 // d<=0 表示不清理（避免误把保留期写成 0 导致全删）。
 func (s *Store) PurgeTrashOlderThan(d time.Duration) (int, error) {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch, watchEffect } from 'vue'
 import { api } from '../lib/api'
 import type { Agent, Automation, CustomCommand, LLMProfilePayload, MCPServerCfg, MCPStatus, PermissionRule, SettingsView, Skill, TrashItem } from '../types'
 
@@ -386,11 +386,87 @@ async function refreshMcpStatus() {
 const statusOf = (name: string): MCPStatus | undefined => mcpStatuses.value.find((s) => s.name === name)
 
 // ---------- 回收站 ----------
+// 多选：选中的回收站目录名集合（声明在 refreshTrash 之前，避免依赖声明顺序）
+const trashSelected = ref<string[]>([])
+
 async function refreshTrash() {
   try {
     trashItems.value = (await api.listTrash()).items
   } catch {
     trashItems.value = []
+  }
+  // 刷新后清空选中（列表可能变了，旧选中没有意义）
+  trashSelected.value = []
+}
+
+const trashAllSelected = computed(
+  () => trashItems.value.length > 0 && trashSelected.value.length === trashItems.value.length,
+)
+const trashSomeSelected = computed(
+  () => trashSelected.value.length > 0 && trashSelected.value.length < trashItems.value.length,
+)
+
+function isTrashSelected(dir: string): boolean {
+  return trashSelected.value.includes(dir)
+}
+
+function toggleTrashSelect(dir: string) {
+  const i = trashSelected.value.indexOf(dir)
+  if (i >= 0) trashSelected.value.splice(i, 1)
+  else trashSelected.value.push(dir)
+}
+
+function toggleTrashSelectAll() {
+  trashSelected.value = trashAllSelected.value ? [] : trashItems.value.map((it) => it.dir)
+}
+
+// 全选复选框的 indeterminate 态（部分选中）
+const trashAllRef = ref<HTMLInputElement | null>(null)
+watchEffect(() => {
+  if (trashAllRef.value) trashAllRef.value.indeterminate = trashSomeSelected.value
+})
+
+async function purgeTrashSelected() {
+  if (trashBusy.value || !trashSelected.value.length) return
+  const n = trashSelected.value.length
+  const ok = await askConfirm({
+    title: `彻底删除选中的 ${n} 条记录`,
+    message: `这 ${n} 条会话将从回收站永久移除，无法再恢复。`,
+    confirmText: `彻底删除 ${n} 条`,
+  })
+  if (!ok) return
+  trashBusy.value = 'batch'
+  try {
+    const r = await api.purgeTrashBatch([...trashSelected.value])
+    await refreshTrash()
+    if (r.failed) {
+      showToast(`已删除 ${r.ok} 条，${r.failed} 条失败`)
+    } else {
+      showToast(`已彻底删除 ${r.ok} 条`)
+    }
+  } catch (e) {
+    saveErr.value = (e as Error).message
+  } finally {
+    trashBusy.value = ''
+  }
+}
+
+async function restoreTrashSelected() {
+  if (trashBusy.value || !trashSelected.value.length) return
+  const n = trashSelected.value.length
+  trashBusy.value = 'batch'
+  try {
+    const r = await api.restoreTrashBatch([...trashSelected.value])
+    await refreshTrash()
+    if (r.failed) {
+      showToast(`已恢复 ${r.ok} 条，${r.failed} 条跳过（可能会话仍存在）`)
+    } else {
+      showToast(`已恢复 ${r.ok} 条，可在侧栏会话列表看到`)
+    }
+  } catch (e) {
+    saveErr.value = (e as Error).message
+  } finally {
+    trashBusy.value = ''
   }
 }
 
@@ -1010,35 +1086,87 @@ async function save() {
             <div v-if="!trashItems.length" class="trash-empty">
               回收站是空的。删除会话后会在这里留一份副本。
             </div>
-            <div v-else class="trash-list">
-              <div v-for="it in trashItems" :key="it.dir" class="trash-item">
-                <div class="ti-main">
-                  <div class="ti-title">{{ it.title || '（无标题会话）' }}</div>
-                  <div class="ti-meta">
-                    {{ fmtDeletedAt(it.deletedAt) }} 删除 · {{ it.messageCount }} 条消息 · {{ fmtSize(it.sizeBytes) }}
-                  </div>
-                </div>
-                <div class="ti-actions">
+            <template v-else>
+              <!-- 批量操作栏：全选 + 选中计数 + 批量按钮 -->
+              <div class="trash-batch">
+                <label class="tb-all">
+                  <input
+                    ref="trashAllRef"
+                    type="checkbox"
+                    :checked="trashAllSelected"
+                    :disabled="!!trashBusy"
+                    @change="toggleTrashSelectAll"
+                  />
+                  <span>全选</span>
+                </label>
+                <span class="tb-count">
+                  {{ trashSelected.length ? `已选 ${trashSelected.length} / ${trashItems.length}` : `共 ${trashItems.length} 条` }}
+                </span>
+                <div class="tb-actions">
                   <button
                     class="btn ghost tiny"
-                    :disabled="!!trashBusy"
-                    title="恢复到会话列表"
-                    @click="restoreTrashItem(it)"
+                    :disabled="!!trashBusy || !trashSelected.length"
+                    title="批量恢复到会话列表"
+                    @click="restoreTrashSelected"
                   >
                     <Icon name="refresh" :size="12" />
-                    {{ trashBusy === it.dir ? '恢复中…' : '恢复' }}
+                    恢复选中
                   </button>
                   <button
                     class="btn danger tiny"
-                    :disabled="!!trashBusy"
-                    title="彻底删除，不可恢复"
-                    @click="purgeTrashItem(it)"
+                    :disabled="!!trashBusy || !trashSelected.length"
+                    title="批量彻底删除，不可恢复"
+                    @click="purgeTrashSelected"
                   >
-                    <Icon name="trash" :size="12" /> 彻底删除
+                    <Icon name="trash" :size="12" />
+                    删除选中
                   </button>
                 </div>
               </div>
-            </div>
+
+              <div class="trash-list">
+                <div
+                  v-for="it in trashItems"
+                  :key="it.dir"
+                  class="trash-item"
+                  :class="{ selected: isTrashSelected(it.dir) }"
+                >
+                  <label class="ti-check" @click.stop>
+                    <input
+                      type="checkbox"
+                      :checked="isTrashSelected(it.dir)"
+                      :disabled="!!trashBusy"
+                      @change="toggleTrashSelect(it.dir)"
+                    />
+                  </label>
+                  <div class="ti-main">
+                    <div class="ti-title">{{ it.title || '（无标题会话）' }}</div>
+                    <div class="ti-meta">
+                      {{ fmtDeletedAt(it.deletedAt) }} 删除 · {{ it.messageCount }} 条消息 · {{ fmtSize(it.sizeBytes) }}
+                    </div>
+                  </div>
+                  <div class="ti-actions">
+                    <button
+                      class="btn ghost tiny"
+                      :disabled="!!trashBusy"
+                      title="恢复到会话列表"
+                      @click="restoreTrashItem(it)"
+                    >
+                      <Icon name="refresh" :size="12" />
+                      {{ trashBusy === it.dir ? '恢复中…' : '恢复' }}
+                    </button>
+                    <button
+                      class="btn danger tiny"
+                      :disabled="!!trashBusy"
+                      title="彻底删除，不可恢复"
+                      @click="purgeTrashItem(it)"
+                    >
+                      <Icon name="trash" :size="12" /> 彻底删除
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </template>
           </div>
         </section>
 
@@ -1949,6 +2077,57 @@ textarea.inp {
   gap: 8px;
 }
 
+/* 批量操作栏 */
+.trash-batch {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.tb-all {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.tb-count {
+  flex: 1;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.tb-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.trash-batch input[type='checkbox'],
+.ti-check input[type='checkbox'] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.ti-check {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
 .trash-item {
   display: flex;
   align-items: center;
@@ -1957,6 +2136,12 @@ textarea.inp {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg-inset);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.trash-item.selected {
+  border-color: rgba(255, 154, 61, 0.35);
+  background: var(--accent-soft);
 }
 
 .ti-main {
