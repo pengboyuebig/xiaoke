@@ -86,18 +86,42 @@ function pickMode(m: 'plan' | 'build' | 'ask') {
   modeMenuOpen.value = false
 }
 
+/** 三个弹出菜单互斥：同一时刻只允许一个打开（否则层叠遮挡、点击外部的判断也会打架） */
+function closeMenus(except?: 'mode' | 'model' | 'level') {
+  if (except !== 'mode') modeMenuOpen.value = false
+  if (except !== 'model') modelMenuOpen.value = false
+  if (except !== 'level') levelMenuOpen.value = false
+}
+function toggleMenu(which: 'mode' | 'model' | 'level') {
+  const open = { mode: modeMenuOpen, model: modelMenuOpen, level: levelMenuOpen }[which]
+  const next = !open.value
+  closeMenus(which)
+  open.value = next
+}
 function pickModel(id: string) {
   modelMenuOpen.value = false
   if (id !== props.activeProfile) emit('activateModel', id)
+}
+
+/** Esc 关闭所有弹出菜单（键盘可达性） */
+function onKeydownEsc(e: KeyboardEvent) {
+  if (e.key === 'Escape') closeMenus()
 }
 
 // 点击面板外部关闭
 function onDocClick(e: MouseEvent) {
   if (modeMenuOpen.value && modeWrap.value && !modeWrap.value.contains(e.target as Node)) modeMenuOpen.value = false
   if (modelMenuOpen.value && modelWrap.value && !modelWrap.value.contains(e.target as Node)) modelMenuOpen.value = false
+  if (levelMenuOpen.value && levelWrap.value && !levelWrap.value.contains(e.target as Node)) levelMenuOpen.value = false
 }
-onMounted(() => document.addEventListener('mousedown', onDocClick))
-onUnmounted(() => document.removeEventListener('mousedown', onDocClick))
+onMounted(() => {
+  document.addEventListener('mousedown', onDocClick)
+  document.addEventListener('keydown', onKeydownEsc)
+})
+onUnmounted(() => {
+  document.removeEventListener('mousedown', onDocClick)
+  document.removeEventListener('keydown', onKeydownEsc)
+})
 
 /** 大数字紧凑显示：1.2 万 / 12 万 / 1.2 亿 */
 function fmtTokens(n: number): string {
@@ -212,8 +236,13 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
-function onLevelChange(e: Event) {
-  emit('update:reasoning', (e.target as HTMLSelectElement).value)
+// 思考程度：自定义弹出菜单（原生 select 的弹出层在 Windows 上强制浅色，与暗色主题冲突）
+const levelMenuOpen = ref(false)
+const levelWrap = ref<HTMLElement | null>(null)
+const levelLabel = computed(() => LEVELS.find((l) => l.value === props.reasoning)?.label || '关')
+function pickLevel(v: string) {
+  levelMenuOpen.value = false
+  if (v !== props.reasoning) emit('update:reasoning', v)
 }
 </script>
 
@@ -252,7 +281,7 @@ function onLevelChange(e: Event) {
           class="mode-btn"
           :class="isPlan() ? 'plan' : isAsk() ? 'plan' : 'build'"
           :title="isPlan() ? '计划模式：先调研再开发（点击切换）' : isAsk() ? '询问模式：每步写操作先征批（点击切换）' : '开发模式：完整能力（点击切换）'"
-          @click="modeMenuOpen = !modeMenuOpen"
+          @click="toggleMenu('mode')"
         >
           <span class="mb-icon"><Icon :name="isPlan() ? 'plan' : isAsk() ? 'lock' : 'build'" :size="15" /></span>
           <span class="mb-label">{{ isPlan() ? '计划' : isAsk() ? '询问' : '开发' }}</span>
@@ -296,7 +325,7 @@ function onLevelChange(e: Event) {
         <button
           class="mode-btn model-btn"
           :title="'当前模型：' + activeModelLabel + '（点击切换）'"
-          @click="modelMenuOpen = !modelMenuOpen"
+          @click="toggleMenu('model')"
         >
           <span class="mb-icon"><Icon name="bot" :size="15" /></span>
           <span class="mb-label">{{ activeModelLabel }}</span>
@@ -345,12 +374,25 @@ function onLevelChange(e: Event) {
         </span>
       </div>
       <!-- 右下角：思考程度（当前会话的下一条消息生效，浏览器本地记住） -->
-      <label class="level" title="模型思考程度（reasoning_effort），下一条消息生效">
-        <span class="level-icon"><Icon name="brain" :size="14" /></span>
-        <select :value="props.reasoning" @change="onLevelChange">
-          <option v-for="l in LEVELS" :key="l.value" :value="l.value">{{ l.label }}</option>
-        </select>
-      </label>
+      <div ref="levelWrap" class="level" title="模型思考程度（reasoning_effort），下一条消息生效">
+        <div v-if="levelMenuOpen" class="level-menu">
+          <button
+            v-for="l in LEVELS"
+            :key="l.value"
+            class="lv-opt"
+            :class="{ active: l.value === props.reasoning }"
+            @click="pickLevel(l.value)"
+          >
+            <span class="lv-label">{{ l.label }}</span>
+            <span v-if="l.value === props.reasoning" class="lv-check"><Icon name="check" :size="12" /></span>
+          </button>
+        </div>
+        <button class="level-btn" @click="toggleMenu('level')">
+          <span class="level-icon"><Icon name="brain" :size="14" /></span>
+          <span class="lv-current">{{ levelLabel }}</span>
+          <span class="lv-caret"><Icon name="arrow-down" :size="11" :stroke="2" /></span>
+        </button>
+      </div>
     </div>
   </div>
 </template>
@@ -717,14 +759,30 @@ textarea::placeholder {
   cursor: default;
 }
 
+/* 思考程度：自定义下拉（原生 select 弹出层在 Windows 上强制浅色，与暗色主题冲突） */
 .level {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.level-btn {
   display: flex;
   align-items: center;
   gap: 6px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
   font-size: 11px;
-  color: var(--text-muted);
-  flex-shrink: 0;
   cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.level-btn:hover {
+  border-color: var(--border-strong);
+  background: rgba(255, 255, 255, 0.07);
 }
 
 .level-icon {
@@ -732,35 +790,66 @@ textarea::placeholder {
   color: var(--text-faint);
 }
 
-.level select {
-  appearance: none;
-  -webkit-appearance: none;
-  background-color: rgba(255, 255, 255, 0.04);
-  background-image:
-    linear-gradient(45deg, transparent 50%, var(--text-faint) 50%),
-    linear-gradient(135deg, var(--text-faint) 50%, transparent 50%);
-  background-position:
-    calc(100% - 12px) 50%,
-    calc(100% - 8px) 50%;
-  background-size: 4px 4px, 4px 4px;
-  background-repeat: no-repeat;
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 4px 24px 4px 10px;
-  font-size: 11px;
+.lv-current {
+  color: var(--text-muted);
+  min-width: 1.5em;
+  text-align: center;
+}
+
+.lv-caret {
+  display: flex;
+  color: var(--text-faint);
+}
+
+.level-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  min-width: 110px;
+  background: linear-gradient(180deg, #1c202a 0%, #14171f 100%);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 40;
+}
+
+.lv-opt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--text-muted);
+  font-size: 11.5px;
   cursor: pointer;
-  outline: none;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  text-align: left;
+  transition: background 0.12s ease, color 0.12s ease;
 }
 
-.level select:hover {
-  border-color: var(--border-strong);
+.lv-opt:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
 }
 
-.level select:focus {
-  border-color: var(--border-accent);
-  box-shadow: var(--focus-ring);
+.lv-opt.active {
+  background: rgba(255, 154, 61, 0.12);
+  color: var(--accent);
+}
+
+.lv-label {
+  flex: 1;
+}
+
+.lv-check {
+  display: flex;
+  color: var(--accent);
 }
 
 @media (max-width: 760px) {
