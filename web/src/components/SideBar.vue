@@ -41,6 +41,8 @@ const emit = defineEmits<{
   remove: [id: string]
   selectProject: [id: string]
   newProject: []
+  /** 在指定项目下新建一个会话（同一窗口内） */
+  newSession: [projectId: string]
   removeProject: [id: string]
   selectAgent: [id: string]
   openSettings: []
@@ -208,6 +210,14 @@ const currentAgent = computed<Agent | null>(
           >
             <span class="proj-count">{{ countSessionsOfProject(p.id) }}</span>
             <Icon :name="isCollapsed(p.id) ? 'chevron-down' : 'chevron-up'" :size="11" :stroke="2" />
+          </button>
+          <!-- 在这个项目下新增一个会话（就在当前窗口，立刻出现在下方列表） -->
+          <button
+            class="proj-new-session"
+            title="在这个项目下新建一个会话"
+            @click.stop="emit('newSession', p.id)"
+          >
+            <Icon name="plus" :size="12" :stroke="2.2" />
           </button>
           <button class="item-del" title="删除项目（含目录内全部文件）" @click.stop="emit('removeProject', p.id)">
             <Icon name="x" :size="12" :stroke="2" />
@@ -719,6 +729,34 @@ const currentAgent = computed<Agent | null>(
 .proj-count {
   font-size: 9.5px;
   font-variant-numeric: tabular-nums;
+}
+
+/* 项目行：新建会话（hover 才出现，避免平时太挤） */
+.proj-new-session {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  border-radius: 5px;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, visibility 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.item:hover .proj-new-session {
+  opacity: 1;
+  visibility: visible;
+}
+
+.proj-new-session:hover {
+  color: var(--accent);
+  background: rgba(255, 154, 61, 0.12);
 }
 
 .item-title {

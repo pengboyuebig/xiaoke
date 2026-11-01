@@ -20,7 +20,27 @@ const messages = ref<Message[]>([])
 const greeting = ref('**小柯** 你好，我是小柯。有什么想问的，尽管说。')
 const emptyProjectHint = ref('')
 const streaming = ref(false)
+/** 正在生成的那个会话 id：切到别的会话时，后台继续跑，但内容不渲染到当前视图 */
+const streamSessionId = ref('')
 const streamingText = ref('')
+/** 当前查看的会话是否就是正在生成的那个（决定进度/指示器是否显示） */
+const streamingHere = computed(() => streaming.value && currentId.value === streamSessionId.value)
+
+/** 流式文本的切点：每次开始调工具就记一个位置，把「每轮叙述」拆成独立段落，
+ *  否则整轮的说明会糊成一大段——用户反馈读起来毫无层次。 */
+const liveSplits = ref<number[]>([])
+/** 流式文本按切点切成多段（每段渲染成独立的 markdown 块） */
+const liveSections = computed(() => {
+  const text = streamingText.value
+  if (!text) return [] as string[]
+  const bounds = [0, ...liveSplits.value.filter((n) => n > 0 && n < text.length), text.length]
+  const out: string[] = []
+  for (let i = 1; i < bounds.length; i++) {
+    const seg = text.slice(bounds[i - 1], bounds[i]).trim()
+    if (seg) out.push(seg)
+  }
+  return out
+})
 const liveTools = ref<ToolActivity[]>([])
 // 上下文压缩提示：压缩发生后短暂显示，让「模型为什么记得概括版历史」有解释
 const compactNotice = ref('')
@@ -220,12 +240,39 @@ function handleAdjustPlan() {
 }
 // 当前会话 ID（刷新后恢复到上次的会话）
 const CURRENT_SESSION_KEY = 'xiaoke.currentSession'
+
+// ---------- 多窗口 ----------
+// 一个项目可以同时开多个窗口各聊各的：URL 带 ?session=<id> 或 ?project=<id>
+// 的窗口视为「独立窗口」，不回写「上次会话」——否则两个窗口会互相覆盖，
+// 刷新后都跳到同一个会话。
+const urlParams = new URLSearchParams(window.location.search)
+const pinnedSession = (urlParams.get('session') || '').trim()
+const pinnedProject = (urlParams.get('project') || '').trim()
+const isDetachedWindow = !!(pinnedSession || pinnedProject)
+
 function rememberSession(id: string) {
+  // 独立窗口不碰共享的「上次会话」，避免多窗口互相抢
+  if (isDetachedWindow) return
   try {
     if (id) localStorage.setItem(CURRENT_SESSION_KEY, id)
     else localStorage.removeItem(CURRENT_SESSION_KEY)
   } catch {
     /* 隐私模式下可能禁用，忽略 */
+  }
+}
+
+/** 独立窗口内切换会话/项目时同步 URL，刷新后仍停在同一处 */
+function syncDetachedUrl(sessionId?: string, projectId?: string) {
+  if (!isDetachedWindow) return
+  const qs = sessionId
+    ? `?session=${encodeURIComponent(sessionId)}`
+    : projectId
+      ? `?project=${encodeURIComponent(projectId)}`
+      : ''
+  try {
+    window.history.replaceState(null, '', window.location.pathname + qs)
+  } catch {
+    /* 忽略：URL 同步失败不影响使用 */
   }
 }
 function setReasoning(v: string) {
@@ -296,6 +343,28 @@ onMounted(async () => {
   refreshHealth()
   refreshCommands()
   await refreshSessions()
+
+  // 多窗口：URL 指定的会话/项目优先于「上次会话」
+  if (pinnedSession) {
+    try {
+      const s = await api.getSession(pinnedSession)
+      currentId.value = s.id
+      currentProjectId.value = s.projectId || ''
+      if (s.agentId) currentAgentId.value = s.agentId
+      messages.value = s.messages
+      sessionTodos.value = s.todos || []
+      setSessionUsage(s)
+      return
+    } catch {
+      /* 会话不存在（可能已删除）：退回下面的常规恢复 */
+    }
+  }
+  if (pinnedProject) {
+    // 在该项目下开一个新对话（首个消息发出时才真正建会话）
+    currentProjectId.value = pinnedProject
+    return
+  }
+
   // 恢复上次的会话（刷新后不丢）
   try {
     const last = localStorage.getItem(CURRENT_SESSION_KEY)
@@ -318,7 +387,7 @@ onMounted(async () => {
 // 切换智能体 = 开新对话（当前会话已绑定旧智能体，不混用）
 function handleSelectAgent(id: string) {
   if (currentAgentId.value === id && !currentId.value) return
-  if (streaming.value) handleStop()
+  // 不中断正在生成的回复：它会在后台跑完并落库，切回来就能看到完整结果
   clearApproval()
   clearSendQueue()
   currentAgentId.value = id
@@ -424,13 +493,15 @@ const turns = computed<Turn[]>(() => {
   }
   flushRound()
 
-  // 流式：实时进度并入最后一个回合（无回合则自建），结束时间留空 → TurnView 实时走秒
-  if (streaming.value || error.value) {
+  // 流式：实时进度并入最后一个回合（无回合则自建），结束时间留空 → TurnView 实时走秒。
+  // 只有「当前查看的会话就是正在生成的那个」才注入，否则切走的会话不该显示别人的进度。
+  const liveHere = streaming.value && currentId.value === streamSessionId.value
+  if (liveHere || error.value) {
     if (!cur) {
       cur = { question: '', groups: [] }
       out.push(cur)
     }
-    cur.streaming = streaming.value
+    cur.streaming = liveHere
     if (!cur.startTime) cur.startTime = new Date().toISOString()
     cur.endTime = undefined
     const tools: ToolPair[] = liveTools.value.map((t, i) => ({
@@ -443,11 +514,11 @@ const turns = computed<Turn[]>(() => {
     }))
     cur.groups.push({
       kind: 'live',
-      sections: streamingText.value ? [streamingText.value] : [],
+      sections: liveSections.value,
       tools,
       round: roundNo,
-      streaming: true,
-      error: streaming.value ? undefined : error.value || undefined,
+      streaming: liveHere,
+      error: liveHere ? undefined : error.value || undefined,
     })
   }
   return out
@@ -474,6 +545,7 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
   messages.value.push({ role: 'user', content, hidden: opts?.hidden === true })
   streaming.value = true
   streamingText.value = ''
+  liveSplits.value = []
   liveTools.value = []
   controller = new AbortController()
   abortedByUser = false
@@ -482,8 +554,18 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
     if (!sessionId) {
       const s = await api.createSession(sentProjectId, sentAgentId)
       sessionId = s.id
+      // 立即置为当前会话：否则流式内容的「属于哪个会话」判断会落空
+      currentId.value = s.id
       rememberSession(s.id)
+      // 独立窗口：会话建成后把 URL 从 ?project= 换成 ?session=，
+      // 否则刷新会回到「新对话」，刚建的会话就找不着了
+      syncDetachedUrl(s.id)
     }
+    streamSessionId.value = sessionId
+    // 本地先标记「这个会话已经有消息了」：会话列表刷新是异步的，
+    // 马上点「＋」时不能把它当成空会话复用
+    const localMeta = sessions.value.find((x) => x.id === sessionId)
+    if (localMeta) localMeta.messageCount = Math.max(localMeta.messageCount || 0, 1)
     const r = await api.chat({
       sessionId,
       content,
@@ -502,6 +584,10 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
         compactTimer = window.setTimeout(() => (compactNotice.value = ''), 8000)
       },
       onToolStart: (name, args, id) => {
+        // 工具调用标志「上一段说明结束」：记下切点，让每轮叙述独立成块
+        const len = streamingText.value.length
+        const prev = liveSplits.value[liveSplits.value.length - 1] ?? 0
+        if (len > prev && streamingText.value.slice(prev).trim()) liveSplits.value.push(len)
         liveTools.value.push({ id, name, args, done: false })
       },
       onToolResult: (info) => {
@@ -536,7 +622,8 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
         retryTimer = window.setTimeout(() => (retryNotice.value = ''), Math.min(info.delayMs + 2500, 15000))
       },
       onTodo: (todos) => {
-        sessionTodos.value = todos
+        // 待办属于这个会话：用户切走了就别覆盖另一个会话的清单
+        if (currentId.value === streamSessionId.value) sessionTodos.value = todos
       },
       onAsk: (req) => {
         // SSE ask 事件：挂起等待用户操作（返回的 promise 由按钮点击 resolve）。
@@ -552,14 +639,15 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
         })
       },
       onDone: (usage) => {
-        lastUsage.value = usage || null
+        if (currentId.value === streamSessionId.value) lastUsage.value = usage || null
       },
     })
     clearAskQueue()
     // 无论正常结束还是中途停止，都以服务端落库为准刷新一次
     let serverHadThis = false
-    if (r.sessionId === currentId.value || !currentId.value) {
-      currentId.value = r.sessionId
+    // 只在用户仍停留在这个会话时才用服务端数据覆盖视图；
+    // 切走了就只管刷新列表，不能把用户拽回来。
+    if (r.sessionId === currentId.value) {
       rememberSession(r.sessionId)
       try {
         const s = await api.getSession(r.sessionId)
@@ -585,7 +673,7 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
     }
     // 计划模式下，只有回答看起来是结构化计划时才出现批准条；
     // 模型反问/闲聊时不误判（用户仍可手动切开发模式）。
-    if (sentMode === 'plan' && !abortedByUser && !error.value) {
+    if (sentMode === 'plan' && !abortedByUser && !error.value && r.sessionId === currentId.value) {
       const lastAssistant = [...messages.value]
         .reverse()
         .find((m) => m.role === 'assistant' && (m.content || '').trim())
@@ -596,11 +684,16 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
     streamingText.value = ''
     liveTools.value = []
   } catch (e) {
-    error.value = (e as Error).message || '出错了，请稍后再试'
+    // 只在用户仍停留在这个会话时显示错误——切走了就不该在别的会话里报错
+    if (currentId.value === streamSessionId.value) {
+      error.value = (e as Error).message || '出错了，请稍后再试'
+    }
   } finally {
     clearAskQueue() // 流已结束/出错：未决的提问弹窗全部结清，不残留
     streaming.value = false
+    streamSessionId.value = ''
     streamingText.value = ''
+    liveSplits.value = []
     liveTools.value = []
     controller = null
     // 无论成功/停止/出错都刷新会话列表：会话已落库，必须出现在侧栏（持久化可见）
@@ -664,10 +757,38 @@ async function handleFork(id: string) {
   }
 }
 
-function handleNewChat() {
-  if (streaming.value) handleStop()
+/** 找某个项目下「还没发过任何消息」的空会话（用于复用，避免堆一串「新对话」）。
+ *  项目为空串表示通用对话（不属于任何项目）。 */
+function findEmptySession(projectId: string): SessionMeta | undefined {
+  return sessions.value
+    .filter((s) => (s.projectId || '') === projectId && (s.messageCount || 0) === 0)
+    .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''))[0]
+}
+
+/** 复用一个已有空会话：切过去并把视图清空（它本来就没消息） */
+function reuseEmptySession(sess: SessionMeta) {
+  currentId.value = sess.id
+  rememberSession(sess.id)
+  messages.value = []
+  sessionTodos.value = []
+  lastUsage.value = null
+  sessionUsage.value = null
+  liveTools.value = []
+  error.value = ''
+  syncDetachedUrl(sess.id)
+}
+
+async function handleNewChat() {
+  await refreshSessions() // 用最新列表判断有没有空会话
+  // 不中断正在生成的回复：它会在后台跑完并落库，切回来就能看到完整结果
   clearApproval()
   clearSendQueue()
+  // 该项目下已有空会话就复用它，避免「新对话」+「＋」堆出一串空会话
+  const reuse = findEmptySession(currentProjectId.value)
+  if (reuse) {
+    reuseEmptySession(reuse)
+    return
+  }
   currentId.value = ''
   rememberSession('')
   messages.value = []
@@ -676,11 +797,12 @@ function handleNewChat() {
   sessionUsage.value = null
   liveTools.value = []
   error.value = ''
+  syncDetachedUrl('', currentProjectId.value)
 }
 
 async function handleSelect(id: string) {
   if (id === currentId.value) return
-  if (streaming.value) handleStop()
+  // 不中断正在生成的回复：它会在后台跑完并落库，切回来就能看到完整结果
   clearApproval()
   clearSendQueue()
   try {
@@ -694,6 +816,7 @@ async function handleSelect(id: string) {
     setSessionUsage(s)
     lastUsage.value = null
     error.value = ''
+    syncDetachedUrl(s.id)
   } catch (e) {
     error.value = (e as Error).message
   }
@@ -739,7 +862,7 @@ async function handleRemove(id: string) {
 // 选择项目 = 在该项目下开一个空白对话
 function handleSelectProject(id: string) {
   if (currentProjectId.value === id && !currentId.value) return
-  if (streaming.value) handleStop()
+  // 不中断正在生成的回复：它会在后台跑完并落库，切回来就能看到完整结果
   clearSendQueue()
   currentProjectId.value = id
   currentId.value = ''
@@ -748,11 +871,44 @@ function handleSelectProject(id: string) {
   lastUsage.value = null
   sessionUsage.value = null
   error.value = ''
+  syncDetachedUrl('', id)
+}
+
+// 在指定项目下「新增一个会话」：直接建好并切过去（不等发第一条消息）
+// 与「新对话」的区别：新对话是懒创建（发消息时才建），这里立刻出现在侧栏
+async function handleNewSessionInProject(projectId: string) {
+  // 先拉最新列表，避免本地数据陈旧导致误判
+  await refreshSessions()
+  // 该项目下已有空会话（还没发过任何消息）：直接切过去，不重复新建
+  const reuse = findEmptySession(projectId)
+  if (reuse) {
+    currentProjectId.value = projectId
+    reuseEmptySession(reuse)
+    return
+  }
+  try {
+    const agentId = currentAgent.value?.id || ''
+    const s = await api.createSession(projectId, agentId)
+    await refreshSessions()
+    // 切到新会话
+    currentProjectId.value = projectId
+    if (agentId) currentAgentId.value = agentId
+    currentId.value = s.id
+    messages.value = []
+    sessionTodos.value = []
+    lastUsage.value = null
+    sessionUsage.value = null
+    error.value = ''
+    rememberSession(s.id)
+    syncDetachedUrl(s.id)
+  } catch (e) {
+    flashNotice((e as Error).message || '新建会话失败')
+  }
 }
 
 // 解绑项目，回到通用对话
 function unbindProject() {
-  if (streaming.value) handleStop()
+  // 不中断正在生成的回复：它会在后台跑完并落库，切回来就能看到完整结果
   clearSendQueue()
   currentProjectId.value = ''
   currentId.value = ''
@@ -809,6 +965,7 @@ function onSettingsClosed() {
       @remove="handleRemove"
       @select-project="handleSelectProject"
       @new-project="projectModalOpen = true"
+      @new-session="handleNewSessionInProject"
       @remove-project="handleDeleteProject"
       @select-agent="handleSelectAgent"
       @open-settings="settingsOpen = true"
@@ -843,9 +1000,9 @@ function onSettingsClosed() {
         <div class="main-col">
           <ChatView
             :turns="turns"
-            :streaming="streaming"
-            :streaming-text="streamingText"
-            :live-tools="liveTools"
+            :streaming="streamingHere"
+            :streaming-text="streamingHere ? streamingText : ''"
+            :live-tools="streamingHere ? liveTools : []"
             :error="error"
             :greeting="greeting"
             :empty-project-hint="emptyProjectHint"
@@ -862,6 +1019,7 @@ function onSettingsClosed() {
           />
           <Composer
             :busy="streaming"
+            :typing="streamingHere"
             :reasoning="reasoning"
             :mode="workMode"
             :session-id="currentId"

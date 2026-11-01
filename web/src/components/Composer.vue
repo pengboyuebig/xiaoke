@@ -32,6 +32,8 @@ const props = defineProps<{
   modelName?: string
   /** 当前智能体名（「正在输入」指示器里显示，空 = 小柯） */
   agentName?: string
+  /** 是否在当前查看的会话里正在生成（决定指示器显不显示；与 busy 分开） */
+  typing?: boolean
 }>()
 
 function loadDraft(sid?: string) {
@@ -252,7 +254,7 @@ function pickLevel(v: string) {
   <div class="composer-wrap">
     <!-- 正在输入指示器：贴底常驻，长会话滚到别处也能知道 AI 还在干活 -->
     <transition name="typing-fade">
-      <div v-if="props.busy" class="typing-bar" role="status" aria-live="polite">
+      <div v-if="props.typing" class="typing-bar" role="status" aria-live="polite">
         <span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>
         <span class="typing-text">{{ props.agentName || '小柯' }}正在输入…</span>
       </div>

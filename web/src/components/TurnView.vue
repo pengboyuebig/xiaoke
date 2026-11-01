@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, onUpdated, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, onUpdated, ref, watch } from 'vue'
 import hljs from 'highlight.js/lib/common'
 import type { MsgGroup, ToolPair } from '../types'
 import Icon from './Icon.vue'
@@ -70,6 +70,95 @@ const hasWork = computed(() => toolCount.value > 0 || !!turnError.value)
 // 工具调用（跨分组合并）
 const allTools = computed<ToolPair[]>(() => allGroups.value.flatMap((g) => g.tools || []))
 const toolCount = computed(() => allTools.value.length)
+
+// ---------- 「工作中」明细的内部自动滚动 ----------
+// 明细区自己有滚动条（max-height 460px）：工具行不断追加时必须跟着滚到底，
+// 否则用户只能看到最早那几条、以为卡住了。规则与主聊天区一致：
+// 用户手动上翻就停；停手 10 秒后自动恢复跟随（仅生成中）。
+const RESUME_DETAIL_MS = 10_000
+const detailEl = ref<HTMLElement | null>(null)
+const detailPinned = ref(true)
+let detailResumeTimer: number | undefined
+let detailAutoScrolling = false
+
+function clearDetailResume() {
+  if (detailResumeTimer !== undefined) {
+    window.clearTimeout(detailResumeTimer)
+    detailResumeTimer = undefined
+  }
+}
+
+function stickDetail() {
+  const el = detailEl.value
+  if (!el || !detailPinned.value) return
+  detailAutoScrolling = true
+  el.scrollTop = el.scrollHeight
+  requestAnimationFrame(() => {
+    detailAutoScrolling = false
+  })
+}
+
+function onDetailScroll() {
+  if (detailAutoScrolling) return // 程序滚动，不算用户操作
+  const el = detailEl.value
+  if (!el) return
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  if (atBottom) {
+    clearDetailResume()
+  } else if (props.streaming) {
+    // 还在生成：每次滚动重置 10 秒计时，用户在看就别抢滚动条
+    clearDetailResume()
+    detailResumeTimer = window.setTimeout(() => {
+      detailResumeTimer = undefined
+      if (props.streaming) {
+        detailPinned.value = true
+        stickDetail()
+      }
+    }, RESUME_DETAIL_MS)
+  }
+  detailPinned.value = atBottom
+}
+
+// 工具条数 / 结果长度 / 流式状态任一变化都尝试贴底（结果晚于调用到达，需覆盖两次增长）
+const detailSig = computed(() => {
+  const ts = allTools.value
+  let n = 0
+  for (const t of ts) n += (t.result?.length || 0) + (t.diff?.length || 0)
+  return `${ts.length}:${n}:${props.streaming ? 1 : 0}`
+})
+
+watch(
+  detailSig,
+  async () => {
+    await nextTick()
+    stickDetail()
+  },
+  { flush: 'post' },
+)
+
+// 展开明细时的初始位置：生成中贴底（看最新进度），已完成则回到顶部（从头读）
+watch(expanded, async (v) => {
+  if (!v) return
+  await nextTick()
+  const el = detailEl.value
+  if (!el) return
+  if (props.streaming) {
+    detailPinned.value = true
+    stickDetail()
+  } else {
+    detailPinned.value = false
+    el.scrollTop = 0
+  }
+})
+
+// 生成开始时重置跟随状态
+watch(
+  () => props.streaming,
+  (st) => {
+    if (st) detailPinned.value = true
+    else clearDetailResume()
+  },
+)
 const toolRounds = computed(() => {
   const rounds = new Set<number>()
   for (const g of allGroups.value) {
@@ -132,6 +221,7 @@ onUnmounted(() => {
     window.clearInterval(timer)
     timer = undefined
   }
+  clearDetailResume()
 })
 
 function durMs(): number {
@@ -261,7 +351,12 @@ onUpdated(highlight)
     </div>
 
     <!-- 工作过程（可折叠）：工具时间线 + 完整参数结果 + 错误；没有内容时不渲染空框 -->
-    <div v-if="expanded && (toolCount || turnError)" class="turn-detail">
+    <div
+      v-if="expanded && (toolCount || turnError)"
+      ref="detailEl"
+      class="turn-detail"
+      @scroll="onDetailScroll"
+    >
       <!-- 工具时间线 -->
       <div v-if="toolCount" class="tl">
         <div v-for="(t, i) in allTools" :key="'t' + i" class="tl-row">
