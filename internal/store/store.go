@@ -48,6 +48,15 @@ type Message struct {
 	// role=tool 时：这条结果对应的调用 ID 与工具名
 	ToolCallID string `json:"toolCallId,omitempty"`
 	Name       string `json:"name,omitempty"`
+	// Usage 这条 assistant 回复消耗的 token（来自上游 usage，随消息持久化）。
+	// 只写在每轮最后一条答复上，供前端在每个回合下方显示用量。
+	Usage *MessageUsage `json:"usage,omitempty"`
+}
+
+// MessageUsage 是一次回复的 token 用量。
+type MessageUsage struct {
+	Prompt     int `json:"prompt"`
+	Completion int `json:"completion"`
 }
 
 // ToolCallRecord 落库的助手侧工具调用（与 OpenAI tool_calls 同构）。

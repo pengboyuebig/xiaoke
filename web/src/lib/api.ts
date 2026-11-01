@@ -13,6 +13,7 @@ import type {
   SettingsView,
   Skill,
   Todo,
+  TaskInfo,
   TrashItem,
   TrashBatchResult,
   TreeItem,
@@ -130,6 +131,18 @@ export const api = {
   /** 当前版本与本次更新说明（设置页「关于」用） */
   getVersion(): Promise<VersionInfo> {
     return jfetch('/api/version')
+  },
+
+  // ---------- 后台任务 ----------
+  listTasks(): Promise<{ tasks: TaskInfo[] }> {
+    return jfetch('/api/tasks')
+  },
+  taskDetail(id: string): Promise<{ task: TaskInfo; output: string }> {
+    return jfetch(`/api/tasks/${encodeURIComponent(id)}`)
+  },
+  /** 关闭任务：按进程树终止（Windows 上 npm 拉起的 node 子进程一起杀，端口随之释放） */
+  killTask(id: string): Promise<{ ok: string }> {
+    return jfetch(`/api/tasks/${encodeURIComponent(id)}/kill`, { method: 'POST' })
   },
 
   // ---------- 项目 ----------

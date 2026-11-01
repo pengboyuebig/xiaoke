@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { Agent, Message, Project, Turn } from '../types'
-import type { UsageInfo } from '../lib/api'
 import TurnView from './TurnView.vue'
 import Icon from './Icon.vue'
 import { renderMarkdown } from '../lib/markdown'
@@ -19,8 +18,6 @@ const props = defineProps<{
   agent?: Agent | null
   /** 计划模式下计划已生成，等待用户批准 */
   awaitingApproval?: boolean
-  /** 最近一次对话的 token 用量（done 事件上报） */
-  lastUsage?: UsageInfo | null
 }>()
 
 const emit = defineEmits<{
@@ -276,15 +273,15 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
           :agent-name="agentName()"
           :avatar="agentAvatar()"
         />
-      </div>
-      <!-- 最近一次对话的 token 用量（done 事件上报；估算值仅作参考） -->
-      <div
-        v-if="props.lastUsage && (props.lastUsage.prompt || props.lastUsage.completion)"
-        class="usage-line"
-        title="本轮请求用量（上游返回真实 usage 优先，缺失时按字节估算）；本会话累计见输入框下方"
-      >
-        <Icon name="clock" :size="12" />
-        本次用量 ↑{{ props.lastUsage.prompt }} ↓{{ props.lastUsage.completion }} tokens
+        <!-- 本回合用量：跟在该回合下方，而不是固定在整条会话底部 -->
+        <div
+          v-if="t.usage && (t.usage.prompt || t.usage.completion)"
+          class="usage-line"
+          title="本回合请求用量（上游返回真实 usage 优先，缺失时按字节估算）；本会话累计见输入框下方"
+        >
+          <Icon name="clock" :size="12" />
+          本回合 ↑{{ t.usage.prompt }} ↓{{ t.usage.completion }} tokens
+        </div>
       </div>
       <!-- 计划已生成：批准后切开发模式并立即按计划开工；也可用自己的方式实现 -->
       <div v-if="props.awaitingApproval" class="approve-bar">

@@ -2,11 +2,11 @@
 import { computed, onMounted, ref } from 'vue'
 import { api } from './lib/api'
 import type { Agent, CustomCommand, LLMProfileView, Message, MsgGroup, Project, SessionMeta, Skill, Todo, ToolActivity, ToolPair, Turn } from './types'
-import type { UsageInfo } from './lib/api'
 import SideBar from './components/SideBar.vue'
 import ChatView from './components/ChatView.vue'
 import Composer from './components/Composer.vue'
 import TodoPanel from './components/TodoPanel.vue'
+import TaskPanel from './components/TaskPanel.vue'
 import SettingsView from './components/SettingsView.vue'
 import ProjectModal from './components/ProjectModal.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
@@ -49,9 +49,9 @@ const error = ref('')
 const mode = ref('')
 const model = ref('')
 
-// 当前会话的待办清单与最近一次用量（todo/usage SSE 事件维护，切会话随会话还原）
+// 当前会话的待办清单（todo SSE 事件维护，切会话随会话还原）；
+// 单次请求用量改为随消息持久化（见 message.usage），不再用全局状态。
 const sessionTodos = ref<Todo[]>([])
-const lastUsage = ref<UsageInfo | null>(null)
 // 本会话累计用量（服务端会话快照累计；切会话/每次请求结束后刷新）
 const sessionUsage = ref<{ prompt: number; completion: number; requests: number } | null>(null)
 
@@ -395,7 +395,6 @@ function handleSelectAgent(id: string) {
   rememberSession('')
   messages.value = []
   sessionTodos.value = []
-  lastUsage.value = null
   sessionUsage.value = null
   error.value = ''
 }
@@ -481,6 +480,8 @@ const turns = computed<Turn[]>(() => {
       }
       // 用户停止的回合：标记到回合上，让 TurnView 区分「已停止」与「空回复」
       if (m.stopped && cur) cur.stopped = true
+      // 用量跟着回合走：取该回合最后一条带 usage 的 assistant 消息
+      if (m.usage && cur) cur.usage = m.usage
     } else if (m.role === 'tool') {
       const pair = round.tools.find((t) => t.id === m.toolCallId)
       if (pair) {
@@ -638,9 +639,6 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
           handleAsk({ ...req, resolve, timer })
         })
       },
-      onDone: (usage) => {
-        if (currentId.value === streamSessionId.value) lastUsage.value = usage || null
-      },
     })
     clearAskQueue()
     // 无论正常结束还是中途停止，都以服务端落库为准刷新一次
@@ -771,7 +769,6 @@ function reuseEmptySession(sess: SessionMeta) {
   rememberSession(sess.id)
   messages.value = []
   sessionTodos.value = []
-  lastUsage.value = null
   sessionUsage.value = null
   liveTools.value = []
   error.value = ''
@@ -793,7 +790,6 @@ async function handleNewChat() {
   rememberSession('')
   messages.value = []
   sessionTodos.value = []
-  lastUsage.value = null
   sessionUsage.value = null
   liveTools.value = []
   error.value = ''
@@ -814,7 +810,6 @@ async function handleSelect(id: string) {
     messages.value = s.messages
     sessionTodos.value = s.todos || []
     setSessionUsage(s)
-    lastUsage.value = null
     error.value = ''
     syncDetachedUrl(s.id)
   } catch (e) {
@@ -848,7 +843,6 @@ async function handleRemove(id: string) {
     currentId.value = ''
     messages.value = []
     sessionTodos.value = []
-    lastUsage.value = null
     sessionUsage.value = null
     try {
       localStorage.removeItem(CURRENT_SESSION_KEY)
@@ -868,7 +862,6 @@ function handleSelectProject(id: string) {
   currentId.value = ''
   messages.value = []
   sessionTodos.value = []
-  lastUsage.value = null
   sessionUsage.value = null
   error.value = ''
   syncDetachedUrl('', id)
@@ -896,7 +889,6 @@ async function handleNewSessionInProject(projectId: string) {
     currentId.value = s.id
     messages.value = []
     sessionTodos.value = []
-    lastUsage.value = null
     sessionUsage.value = null
     error.value = ''
     rememberSession(s.id)
@@ -914,7 +906,6 @@ function unbindProject() {
   currentId.value = ''
   messages.value = []
   sessionTodos.value = []
-  lastUsage.value = null
   sessionUsage.value = null
   error.value = ''
 }
@@ -1010,7 +1001,6 @@ function onSettingsClosed() {
             :agent="currentAgent"
             :messages="messages"
             :awaiting-approval="planAwaitingApproval"
-            :last-usage="lastUsage"
             @approve="handleApprove"
             @approve-custom="handleApproveCustom"
             @adjust-plan="handleAdjustPlan"
@@ -1039,6 +1029,8 @@ function onSettingsClosed() {
         <!-- 右侧待办面板：可收起为竖条，用户自行决定是否展开 -->
         <TodoPanel :todos="sessionTodos" />
       </div>
+      <!-- 后台任务：运行中标记 + 日志/关闭面板 -->
+      <TaskPanel />
     </main>
 
     <SettingsView v-if="settingsOpen" @close="settingsOpen = false; onSettingsClosed()" />

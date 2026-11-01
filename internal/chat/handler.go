@@ -1238,6 +1238,7 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 			}
 			if err := h.store.Append(sess.ID, store.Message{
 				Role: "assistant", Content: content, CreatedAt: time.Now(),
+				Usage: turnUsage(int(usagePrompt.Load()), int(usageCompletion.Load())),
 			}); err != nil {
 				send(map[string]any{"type": "error", "error": "保存回复失败: " + err.Error()})
 				return nil
@@ -1285,6 +1286,7 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 				}
 				if err := h.store.Append(sess.ID, store.Message{
 					Role: "assistant", Content: content, CreatedAt: time.Now(),
+					Usage: turnUsage(int(usagePrompt.Load()), int(usageCompletion.Load())),
 				}); err != nil {
 					send(map[string]any{"type": "error", "error": "保存回复失败: " + err.Error()})
 					return nil
@@ -1313,6 +1315,7 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 	if content != "" {
 		if err := h.store.Append(sess.ID, store.Message{
 			Role: "assistant", Content: content, CreatedAt: time.Now(),
+			Usage: turnUsage(int(usagePrompt.Load()), int(usageCompletion.Load())),
 		}); err == nil {
 			finish()
 			return nil
@@ -1320,6 +1323,14 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 	}
 	send(map[string]any{"type": "error", "error": fmt.Sprintf("已达到最大工具轮数（%d），本轮结束", maxSteps)})
 	return nil
+}
+
+// turnUsage 组装随消息持久化的 token 用量；两者都为 0 时不写（省存储、前端也不显示）。
+func turnUsage(prompt, completion int) *store.MessageUsage {
+	if prompt <= 0 && completion <= 0 {
+		return nil
+	}
+	return &store.MessageUsage{Prompt: prompt, Completion: completion}
 }
 
 // todoEvent 组装 SSE 待办事件（content/status 只传前端需要的字段）。

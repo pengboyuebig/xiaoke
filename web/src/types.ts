@@ -21,6 +21,8 @@ export interface Message {
   /** role=tool 时：对应调用的 ID 与工具名 */
   toolCallId?: string
   name?: string
+  /** 本条回复的 token 用量（仅每轮最后一条 assistant 有） */
+  usage?: { prompt: number; completion: number }
 }
 
 /** 流式过程中的工具活动（live 状态，落库后由服务端消息接管） */
@@ -80,6 +82,20 @@ export interface Turn {
   stopped?: boolean
   /** 回合起始 user 消息在 messages 里的下标（回退「重来」定位用） */
   msgIndex?: number
+  /** 本回合消耗的 token（来自该回合最后一条 assistant 消息） */
+  usage?: { prompt: number; completion: number }
+}
+
+/** 后台任务（run_command is_background 起的真实进程） */
+export interface TaskInfo {
+  id: string
+  cmdline: string
+  state: 'running' | 'completed' | 'failed'
+  sessionId?: string
+  startedAt: string
+  durationMs: number
+  /** 最近输出（列表页够用；完整日志走详情接口） */
+  outputTail?: string
 }
 
 export interface SessionMeta {

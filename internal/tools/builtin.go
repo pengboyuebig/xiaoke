@@ -1496,7 +1496,11 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 		return "", fmt.Errorf("工作目录不存在：%s（请先在侧栏选择或重建项目）", cwd)
 	}
 	if in.IsBackground {
-		return startBackgroundCommand(in.Command, in.Args, cwd, env.OnTaskDone)
+		id, err := startBackgroundCommand(in.Command, in.Args, cwd, env.SessionID, env.OnTaskDone)
+		if err != nil {
+			return "", err
+		}
+		return backgroundStartedMsg(id, fmt.Sprintf("%s %s", in.Command, strings.Join(in.Args, " "))), nil
 	}
 	timeout := commandTimeoutFor(env, in.TimeoutSec)
 	cctx, cancel := context.WithTimeout(ctx, timeout)
@@ -1514,7 +1518,7 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 	// 判定失败，而是把同一条命令转为后台任务继续跑，返回 task_id 让模型
 	// 用 task_output 追进度——长构建/长测试不再被超时腰斩。
 	if runErr != nil && cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-		bgID, bgErr := startBackgroundCommand(in.Command, in.Args, cwd, env.OnTaskDone)
+		bgID, bgErr := startBackgroundCommand(in.Command, in.Args, cwd, env.SessionID, env.OnTaskDone)
 		if bgErr == nil {
 			head := fmt.Sprintf("$ %s %s\n", in.Command, strings.Join(in.Args, " "))
 			timed := fmt.Sprintf("%s\n（前台等待 %s 超时，已自动转为后台继续运行：%s\n用 task_output 读取进度与结果）",
@@ -1552,14 +1556,29 @@ const backgroundTaskMaxDuration = 10 * time.Minute
 const maxBackgroundTasks = 32
 
 type backgroundTask struct {
-	id      string
-	cmdline string
-	cmd     *exec.Cmd
-	wait    chan struct{} // cmd.Wait 返回后关闭
-	exitErr error
-	bufMu   sync.Mutex
-	buf     []byte // 输出累计（超 64KB 丢头部，保留尾部——错误信息常在尾部）
-	started time.Time
+	id        string
+	cmdline   string
+	sessionID string
+	cmd       *exec.Cmd
+	wait      chan struct{} // cmd.Wait 返回后关闭
+	exitErr   error
+	bufMu     sync.Mutex
+	buf       []byte // 输出累计（超 64KB 丢头部，保留尾部——错误信息常在尾部）
+	started   time.Time
+	// ended 任务结束时间（零值表示仍在运行）。受 bufMu 保护。
+	// 已结束的任务如果还用 time.Since(started)，时长会一直增长，很误导。
+	ended time.Time
+}
+
+// durationMs 返回任务运行时长：运行中用「现在-开始」，已结束用「结束-开始」。
+func (t *backgroundTask) durationMs() int64 {
+	t.bufMu.Lock()
+	end := t.ended
+	t.bufMu.Unlock()
+	if end.IsZero() {
+		end = time.Now()
+	}
+	return end.Sub(t.started).Milliseconds()
 }
 
 func (t *backgroundTask) appendOutput(p []byte) {
@@ -1589,7 +1608,7 @@ var (
 // 用独立的超时 context（10 分钟硬顶），请求结束/断开不影响任务运行。
 // onDone 在任务进程结束（含失败/被杀）时以 task_id 回调（nil = 不回调），
 // 供会话层做「任务完成自动唤醒」。
-func startBackgroundCommand(command string, args []string, cwd string, onDone func(taskID string)) (string, error) {
+func startBackgroundCommand(command string, args []string, cwd, sessionID string, onDone func(taskID string)) (string, error) {
 	cctx, cancel := context.WithTimeout(context.Background(), backgroundTaskMaxDuration)
 	cmd := exec.CommandContext(cctx, command, args...)
 	cmd.Dir = cwd
@@ -1618,11 +1637,12 @@ func startBackgroundCommand(command string, args []string, cwd string, onDone fu
 	bgSeq++
 	id := fmt.Sprintf("bg_%d_%d", time.Now().UnixMilli(), bgSeq)
 	t := &backgroundTask{
-		id:      id,
-		cmdline: strings.TrimSpace(command + " " + strings.Join(args, " ")),
-		cmd:     cmd,
-		wait:    make(chan struct{}),
-		started: time.Now(),
+		id:        id,
+		sessionID: sessionID,
+		cmdline:   strings.TrimSpace(command + " " + strings.Join(args, " ")),
+		cmd:       cmd,
+		wait:      make(chan struct{}),
+		started:   time.Now(),
 	}
 	bgTasks[id] = t
 	bgMu.Unlock()
@@ -1659,11 +1679,24 @@ func startBackgroundCommand(command string, args []string, cwd string, onDone fu
 			}
 		}
 		t.exitErr = cmd.Wait()
+		// 先记结束时间再关闭 wait（defer 最后执行 close），
+		// 读到 wait 已关闭的一方一定能看到 ended
+		t.bufMu.Lock()
+		t.ended = time.Now()
+		t.bufMu.Unlock()
 		if onDone != nil {
 			onDone(t.id)
 		}
 	}()
-	return fmt.Sprintf("后台任务已启动 task_id=%s\n$ %s\n用 task_output 读取输出与状态；长命令（构建/安装）不要用前台模式干等。", id, t.cmdline), nil
+	return id, nil
+}
+
+// backgroundStartedMsg 是启动后台任务后回给模型的说明文案。
+// 用原始字符串：反斜杠在新版工具链里容易被误处理，直接写真实换行更稳。
+func backgroundStartedMsg(id, cmdline string) string {
+	return fmt.Sprintf(`后台任务已启动 task_id=%s
+$ %s
+用 task_output 读取输出与状态；长命令（构建/安装）不要用前台模式干等。`, id, cmdline)
 }
 
 // BackgroundTaskResult 供 chat 层实现「后台任务完成唤醒」：返回命令行、
@@ -1690,6 +1723,128 @@ func BackgroundTaskResult(id string) (cmdline, output, state string, ok bool) {
 		out = out[len(out)-4096:]
 	}
 	return t.cmdline, out, state, true
+}
+
+// TaskInfo 是后台任务的对外摘要（设置页/页面上的「运行中任务」面板用）。
+type TaskInfo struct {
+	ID         string    `json:"id"`
+	Cmdline    string    `json:"cmdline"`
+	State      string    `json:"state"` // running | completed | failed
+	SessionID  string    `json:"sessionId,omitempty"`
+	StartedAt  time.Time `json:"startedAt"`
+	DurationMs int64     `json:"durationMs"`
+	// OutputTail 最近的输出（列表用，截断到 2KB）
+	OutputTail string `json:"outputTail,omitempty"`
+}
+
+// taskState 返回任务状态。
+func (t *backgroundTask) state() string {
+	select {
+	case <-t.wait:
+		if t.exitErr != nil {
+			return "failed"
+		}
+		return "completed"
+	default:
+		return "running"
+	}
+}
+
+// ListBackgroundTasks 返回注册表里的全部任务，运行中的排在前面。
+func ListBackgroundTasks() []TaskInfo {
+	bgMu.Lock()
+	list := make([]*backgroundTask, 0, len(bgTasks))
+	for _, t := range bgTasks {
+		list = append(list, t)
+	}
+	bgMu.Unlock()
+
+	out := make([]TaskInfo, 0, len(list))
+	for _, t := range list {
+		info := TaskInfo{
+			ID: t.id, Cmdline: t.cmdline, State: t.state(),
+			SessionID: t.sessionID, StartedAt: t.started,
+			DurationMs: t.durationMs(),
+		}
+		if tail := t.output(); len(tail) > 2048 {
+			info.OutputTail = tail[len(tail)-2048:]
+		} else {
+			info.OutputTail = tail
+		}
+		out = append(out, info)
+	}
+	// 运行中优先，其次按开始时间倒序
+	sort.Slice(out, func(i, j int) bool {
+		ri, rj := out[i].State == "running", out[j].State == "running"
+		if ri != rj {
+			return ri
+		}
+		return out[i].StartedAt.After(out[j].StartedAt)
+	})
+	return out
+}
+
+// TaskDetail 返回单个任务的摘要与完整输出（上限 64KB，由缓冲区自身限制）。
+func TaskDetail(id string) (TaskInfo, string, bool) {
+	bgMu.Lock()
+	t, ok := bgTasks[id]
+	bgMu.Unlock()
+	if !ok {
+		return TaskInfo{}, "", false
+	}
+	info := TaskInfo{
+		ID: t.id, Cmdline: t.cmdline, State: t.state(),
+		SessionID: t.sessionID, StartedAt: t.started,
+		DurationMs: t.durationMs(),
+	}
+	return info, t.output(), true
+}
+
+// killTaskTree 结束任务进程。Windows 上必须杀掉整棵进程树：
+// npm.cmd 会派生出 node 子进程，只杀父进程时端口仍被占用。
+func killTaskTree(t *backgroundTask) error {
+	if t.cmd == nil || t.cmd.Process == nil {
+		return fmt.Errorf("任务进程不存在")
+	}
+	if runtime.GOOS == "windows" {
+		pid := fmt.Sprintf("%d", t.cmd.Process.Pid)
+		// /T 连同子进程，/F 强制
+		out, err := exec.Command("taskkill", "/T", "/F", "/PID", pid).CombinedOutput()
+		if err != nil {
+			// 进程可能已自行退出：当作成功
+			if strings.Contains(string(out), "not found") || strings.Contains(string(out), "没有找到") {
+				return nil
+			}
+			return fmt.Errorf("终止失败: %v（%s）", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	if err := t.cmd.Process.Kill(); err != nil && !strings.Contains(err.Error(), "process already finished") {
+		return err
+	}
+	return nil
+}
+
+// KillBackgroundTask 终止后台任务并等进程回收（页面上的「关闭」按钮用）。
+func KillBackgroundTask(id string) error {
+	t, err := getBackgroundTask(id)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-t.wait:
+		return fmt.Errorf("任务已经结束，无需关闭")
+	default:
+	}
+	if err := killTaskTree(t); err != nil {
+		return err
+	}
+	select {
+	case <-t.wait:
+	case <-time.After(5 * time.Second):
+		// 等不到回收也不阻塞页面，任务状态最终会由 Wait goroutine 更新
+	}
+	return nil
 }
 
 // getBackgroundTask 查任务（不存在报错并列出当前任务）。
@@ -1773,10 +1928,13 @@ func execTaskKill(ctx context.Context, env *Env, args json.RawMessage) (string, 
 		return fmt.Sprintf("任务 %s 已经结束，无需终止", t.id), nil
 	default:
 	}
-	if err := t.cmd.Process.Kill(); err != nil {
-		return "", fmt.Errorf("终止失败: %w", err)
+	if err := killTaskTree(t); err != nil {
+		return "", err
 	}
-	<-t.wait // 等 Wait 回收，避免僵尸进程
+	select {
+	case <-t.wait: // 等 Wait 回收，避免僵尸进程
+	case <-time.After(5 * time.Second):
+	}
 	return fmt.Sprintf("已终止任务 %s（$ %s）", t.id, t.cmdline), nil
 }
 

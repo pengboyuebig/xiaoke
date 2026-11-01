@@ -50,6 +50,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/fs/dirs", h.listDirs)
 	// 按文件夹名查找：拖拽文件夹进窗口时用（浏览器不给绝对路径）
 	mux.HandleFunc("GET /api/fs/find-dir", h.findDir)
+	// 后台任务：页面「运行中任务」面板（查看日志 / 关闭进程树）
+	mux.HandleFunc("GET /api/tasks", h.listTasks)
+	mux.HandleFunc("GET /api/tasks/{id}", h.taskDetail)
+	mux.HandleFunc("POST /api/tasks/{id}/kill", h.killTask)
 }
 
 // ---------- 版本 ----------
