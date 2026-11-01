@@ -51,7 +51,8 @@ const form = reactive({
   readDirs: [] as string[],
   newReadDir: '',
   projectsRoot: '',
-  maxToolSteps: 8,
+  maxToolSteps: 20,
+  maxTotalSteps: 120,
   allowlistText: 'git, npm, node, python, pip',
   maxTokens: 0,
   contextWindow: 0,
@@ -333,6 +334,7 @@ async function loadSettings() {
     form.readDirs = [...s.readDirs]
     form.projectsRoot = s.projectsRoot
     form.maxToolSteps = s.maxToolSteps
+    form.maxTotalSteps = s.maxTotalSteps
     form.allowlistText = s.commandAllowlist.join(', ')
     form.maxTokens = s.llm.maxTokens || 0
     form.contextWindow = s.llm.contextWindow || 0
@@ -599,7 +601,8 @@ function buildPayload() {
         })),
         readDirs: form.readDirs.map((d) => d.trim()).filter(Boolean),
         projectsRoot: form.projectsRoot.trim(),
-        maxToolSteps: Number(form.maxToolSteps) || 8,
+        maxToolSteps: Number(form.maxToolSteps) || 20,
+        maxTotalSteps: Number(form.maxTotalSteps) || 0,
         commandAllowlist: form.allowlistText.split(/[,,\n]/).map((s) => s.trim()).filter(Boolean),
         autoCompact: form.autoCompact !== false,
         compactKeepCount: 0,
@@ -923,9 +926,18 @@ async function save() {
           </div>
           <div class="grid">
             <div class="card">
-              <div class="card-title">工具循环最大轮数</div>
-              <input v-model="form.maxToolSteps" class="inp" type="number" min="1" max="32" />
-              <div class="hint">模型单次回复最多连续调用工具的次数，超限强制收尾。</div>
+              <div class="card-title">单段工具轮数</div>
+              <input v-model="form.maxToolSteps" class="inp" type="number" min="1" max="200" />
+              <div class="hint">一段连续工具调用的轮数。到达后不中断任务，而是自动续一段继续做。</div>
+            </div>
+            <div class="card">
+              <div class="card-title">总轮数预算</div>
+              <input v-model="form.maxTotalSteps" class="inp" type="number" min="0" max="1000" />
+              <div class="hint">
+                单次回复允许的工具轮数总和（含所有续跑段），长任务的真正天花板。
+                留空或 0 = 用默认 120；把它调成和单段一样 = 不续跑。
+                建议 120~300；调到 500 以上单次回复会跑很久、花费也高。
+              </div>
             </div>
             <div class="card">
               <div class="card-title">命令白名单（逗号分隔）</div>

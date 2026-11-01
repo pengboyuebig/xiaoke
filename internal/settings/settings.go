@@ -21,12 +21,16 @@ import (
 
 // Settings 是用户可在设置界面修改的全部内容。
 type Settings struct {
-	LLM              LLMSettings `json:"llm"`
-	MCPServers       []MCPServer `json:"mcpServers"`
-	ReadDirs         []string    `json:"readDirs"`         // 只读授权目录（用户手动添加）
-	ProjectsRoot     string      `json:"projectsRoot"`     // 项目根目录
-	MaxToolSteps     int         `json:"maxToolSteps"`     // agent 工具循环最大轮数
-	CommandAllowlist []string    `json:"commandAllowlist"` // 允许执行的命令白名单
+	LLM          LLMSettings `json:"llm"`
+	MCPServers   []MCPServer `json:"mcpServers"`
+	ReadDirs     []string    `json:"readDirs"`     // 只读授权目录（用户手动添加）
+	ProjectsRoot string      `json:"projectsRoot"` // 项目根目录
+	MaxToolSteps int         `json:"maxToolSteps"` // agent 单段工具循环轮数（撞顶后自动续跑）
+	// MaxTotalSteps 单次回复的总工具轮数预算（含所有续跑段）。
+	// 长任务（建项目、批量改文件）常需几十轮；这个值才是真正的天花板。
+	// <=0 = 用 maxToolSteps（即不续跑），上限见 normalize。
+	MaxTotalSteps    int      `json:"maxTotalSteps"`
+	CommandAllowlist []string `json:"commandAllowlist"` // 允许执行的命令白名单
 
 	// AutoCompact 上下文主动压缩：历史超过预算时，把旧回合总结成摘要（用当前模型），
 	// 替代「直接裁掉」，保留更早的语境。被动裁剪仍作为兜底。
@@ -166,20 +170,41 @@ func (s *Store) defaults() Settings {
 		MCPServers:       []MCPServer{},
 		ReadDirs:         []string{},
 		ProjectsRoot:     "", // 留空 = 用 <小柯目录>/projects
-		MaxToolSteps:     8,
+		MaxToolSteps:     defaultMaxToolSteps,
+		MaxTotalSteps:    defaultMaxTotalSteps,
 		CommandAllowlist: []string{"git", "npm", "npx", "node", "python", "pip"},
 		AutoCompact:      true, // 上下文超预算时主动总结，而不是硬裁
 		CompactKeepCount: 0,    // 0 = 跟随 MaxHistory
 	}
 }
 
+// 轮数默认值：单段 20 轮，总预算 120 轮（约 6 段续跑）。
+// 长任务（建中小项目）通常够用；再高会显著拉长单次回复时间与花费。
+const (
+	defaultMaxToolSteps  = 20
+	defaultMaxTotalSteps = 120
+)
+
 // normalize 修正越界值，保证切片非 nil（便于前端直接编辑）。
 func (s *Store) normalize() {
 	if s.data.MaxToolSteps <= 0 {
-		s.data.MaxToolSteps = 8
+		s.data.MaxToolSteps = defaultMaxToolSteps
 	}
-	if s.data.MaxToolSteps > 32 {
-		s.data.MaxToolSteps = 32
+	// 单段轮数上限放宽到 200：长任务一段就能跑完大半，减少续跑提示的干扰
+	if s.data.MaxToolSteps > 200 {
+		s.data.MaxToolSteps = 200
+	}
+	// 总轮数预算：<=0 用默认值兜底。老配置没有这个字段时 JSON 解出 0，
+	// 若把 0 当成「不续跑」，升级后会静默失去续跑能力——那不可是升级该有的行为。
+	if s.data.MaxTotalSteps <= 0 {
+		s.data.MaxTotalSteps = defaultMaxTotalSteps
+	}
+	if s.data.MaxTotalSteps > 1000 {
+		s.data.MaxTotalSteps = 1000
+	}
+	// 预算小于单段时按单段执行（等价于不续跑），避免「预算 5 但单段 20」的矛盾
+	if s.data.MaxTotalSteps < s.data.MaxToolSteps {
+		s.data.MaxTotalSteps = s.data.MaxToolSteps
 	}
 	if s.data.LLM.MaxHistory <= 0 {
 		s.data.LLM.MaxHistory = 20

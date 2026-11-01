@@ -52,6 +52,10 @@ type Handler struct {
 	grantsMu sync.Mutex
 	grants   map[string]map[string]bool
 
+	// streamFnOverride 仅供测试注入假上游（nil = 用真实 Upstream）。
+	// 生产代码永远不设置它。
+	streamFnOverride StreamFn
+
 	// revert 是会话回退的文件改动台账（data/revert/<sessionID>.json）。
 	revert *revertJournal
 }
@@ -89,6 +93,15 @@ const maxToolArgBytes = 1 << 20
 // maxNoActionNudges 是「模型只描述将要做什么却没调用工具」时的最大催办次数。
 // 催一次通常就够；给 2 次容错，再多就是模型能力问题，不该继续烧 token。
 const maxNoActionNudges = 2
+
+// maxStepsContinuationsCeiling 是续跑段数的绝对上限（防止总预算被算成天文数字）。
+// 实际段数由「总轮数预算 / 单段轮数」推导，用户可在设置里调总预算。
+const maxStepsContinuationsCeiling = 50
+
+// continuationPrompt 是撞到单段轮数上限后注入的提示。
+// 关键是最后一句：明确禁止模型向用户索要「继续」。
+const continuationPrompt = "（系统提示：工具调用轮数到达本段上限。任务没完成就继续执行下一步；" +
+	"全部完成就直接给出最终答复。不要向用户索要「继续」——用户不需要再按一次。）"
 
 func NewHandler(cfg *config.Config, st *store.Store, set *settings.Store, pm *projects.Manager, mm *mcp.Manager, ag *agents.Store, sk *skills.Store, mem *memory.Store, rs *rules.Store, cs *cron.Store) *Handler {
 	return &Handler{
@@ -971,6 +984,9 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 	//   2. 被动裁剪——对「摘要之后的近期消息」按条数/字节硬裁，兜底。
 	// 配置了 smallModel 时压缩摘要走轻量模型（总结不需要强推理，省钱且更快）。
 	streamFn := Upstream(effAsConfig(eff))
+	if h.streamFnOverride != nil {
+		streamFn = h.streamFnOverride // 测试注入
+	}
 	compactFn, compactCfg := streamFn, effAsConfig(eff)
 	if sm := strings.TrimSpace(sset.LLM.SmallModel); sm != "" && !strings.EqualFold(eff.Mode, "mock") {
 		compactCfg = effAsConfig(eff)
@@ -1024,6 +1040,22 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 	convo = append(convo, toWire(history)...)
 
 	maxSteps := sset.MaxToolSteps
+	// 总轮数预算：长任务的真正天花板。续跑段数由它和单段轮数推导，
+	// 不再用固定段数——否则用户调大单段值也突破不了总预算。
+	maxTotalSteps := sset.MaxTotalSteps
+	if maxTotalSteps > 0 && maxTotalSteps < maxSteps {
+		maxTotalSteps = maxSteps
+	}
+	// 续跑段数 = 总预算扣掉已跑的第一段后，还能再跑几个满段（向下取整，
+	// 保证总轮数不超过预算）。例：单段 20、预算 300 → 首段 20 + 续 14 段 = 300。
+	// 0 表示不续跑（总预算 <= 单段）。
+	continuationRounds := 0
+	if maxTotalSteps > maxSteps {
+		continuationRounds = (maxTotalSteps - maxSteps) / maxSteps
+		if continuationRounds > maxStepsContinuationsCeiling {
+			continuationRounds = maxStepsContinuationsCeiling
+		}
+	}
 	reasoning := normalizeReasoning(p.Reasoning)
 	// 计划模式没有显式指定思考程度时默认 high：
 	// 调研与计划的质量远比响应速度重要，且这是用户显式选择「慢工出细活」的模式。
@@ -1214,89 +1246,61 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 			return nil
 		}
 
-		// 有工具调用：先落库 assistant 消息（含 tool_calls），逐个执行
-		records := make([]store.ToolCallRecord, 0, len(calls))
-		for _, c := range calls {
-			records = append(records, store.ToolCallRecord{ID: c.ID, Name: c.Function.Name, Arguments: c.Function.Arguments})
-		}
-		if err := h.store.Append(sess.ID, store.Message{
-			Role: "assistant", Content: content, ToolCalls: records, CreatedAt: time.Now(),
-		}); err != nil {
-			send(map[string]any{"type": "error", "error": "保存消息失败: " + err.Error()})
-			return nil
-		}
-		convo = append(convo, ChatMessage{Role: "assistant", Content: content, ToolCalls: calls})
-
-		// 全部只读工具且多于一个时并发执行（写类工具必须串行，避免竞争同一文件）；
-		// 结果仍按调用顺序回填 convo 与落库，SSE 事件按完成顺序发出（前端按 id 配对）。
-		parallel := len(calls) > 1 && noneWriteCapable(defs, calls)
-		results := make([]toolOutcome, len(calls))
-		if parallel {
-			var wg sync.WaitGroup
-			sem := make(chan struct{}, parallelToolLimit)
-			for i := range calls {
-				wg.Add(1)
-				sem <- struct{}{}
-				go func(i int) {
-					defer wg.Done()
-					defer func() { <-sem }()
-					results[i] = h.runOneTool(ctx, env, defs, calls[i], send, takeDiff)
-				}(i)
-			}
-			wg.Wait()
-		} else {
-			for i := range calls {
-				results[i] = h.runOneTool(ctx, env, defs, calls[i], send, takeDiff)
-			}
-		}
-		for i := range calls {
-			out := results[i]
-			resultText := out.text
-			if out.err != nil {
-				resultText = "工具执行出错: " + out.err.Error() + orText(out.text)
-			}
-			// 回灌上下文前统一封顶（MCP 工具结果没有自带上限）
-			resultText = tools.TruncateMiddle(resultText, maxToolResultBytes)
-			if err := h.store.Append(sess.ID, store.Message{
-				Role: "tool", Content: resultText, ToolCallID: calls[i].ID,
-				Name: calls[i].Function.Name, CreatedAt: time.Now(),
-			}); err != nil {
-				send(map[string]any{"type": "error", "error": "保存工具结果失败: " + err.Error()})
-				return nil
-			}
-			convo = append(convo, ChatMessage{
-				Role: "tool", Content: resultText,
-				ToolCallID: calls[i].ID, Name: calls[i].Function.Name,
-			})
-		}
-		// doom loop：这一轮的全部调用与上一轮完全一致且已连续 3 轮 → 注入强提醒。
-		// 提醒后重新计数，避免每一轮都重复注入。
-		var sig strings.Builder
-		for _, c := range calls {
-			sig.WriteString(c.Function.Name)
-			sig.WriteByte(0)
-			sig.WriteString(c.Function.Arguments)
-			sig.WriteByte(1)
-		}
-		if sig.String() == lastSig {
-			sigRuns++
-		} else {
-			lastSig = sig.String()
-			sigRuns = 1
-		}
-		if sigRuns >= 3 {
-			convo = append(convo, ChatMessage{
-				Role: "user",
-				Content: "（系统提醒：完全相同的工具调用已连续重复 3 轮，继续重试只会得到同样结果。" +
-					"换一种方法、调整参数，或用 ask_user 向用户说明卡点。）",
-			})
-			sigRuns = 0
+		// 有工具调用：落库 assistant 消息（含 tool_calls），逐个执行
+		if err := h.execToolRound(ctx, sess.ID, &convo, content, calls, defs, env, send, takeDiff, &lastSig, &sigRuns); err != nil {
+			return err
 		}
 		if ctx.Err() != nil {
 			return ctx.Err() // 客户端断开，停止循环
 		}
 	}
-	// 达到最大轮数：强制做一轮无工具的最终答复
+	// 达到最大轮数：不中断任务，而是静默续跑。
+	// 长任务（建项目、批量改文件）动辄 20+ 轮，撞上限就停下来要求用户
+	// 输入「继续」是糟糕体验——用户只想把事做完。
+	for round := 0; round < continuationRounds; round++ {
+		convo = append(convo, ChatMessage{Role: "user", Content: continuationPrompt})
+		for step := 0; step < maxSteps; step++ {
+			content, calls, err := streamFn(ctx, effAsConfig(eff), convo, defs, hooks, reasoning)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				send(map[string]any{"type": "error", "error": err.Error()})
+				return nil
+			}
+			if len(calls) == 0 {
+				if strings.TrimSpace(content) == "" {
+					send(map[string]any{"type": "error", "error": "上游没有返回内容"})
+					return nil
+				}
+				if !planMode && nudgeRuns < maxNoActionNudges &&
+					promiseButNoAction(content, full.Todos, multiStep) {
+					nudgeRuns++
+					convo = append(convo, ChatMessage{Role: "assistant", Content: content})
+					convo = append(convo, ChatMessage{
+						Role:    "user",
+						Content: "（系统提醒：你刚才只描述了「将要做什么」，没有调用任何工具，那些事一件都没做。立刻动手。）",
+					})
+					continue
+				}
+				if err := h.store.Append(sess.ID, store.Message{
+					Role: "assistant", Content: content, CreatedAt: time.Now(),
+				}); err != nil {
+					send(map[string]any{"type": "error", "error": "保存回复失败: " + err.Error()})
+					return nil
+				}
+				finish()
+				return nil
+			}
+			if err := h.execToolRound(ctx, sess.ID, &convo, content, calls, defs, env, send, takeDiff, &lastSig, &sigRuns); err != nil {
+				return err
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
+	}
+	// 续跑也到顶了：强制做一轮无工具的最终答复
 	content, _, err := streamFn(ctx, effAsConfig(eff), append(convo, ChatMessage{
 		Role: "user", Content: "（系统提示：工具调用轮数已达上限，请直接给出最终答复。）",
 	}), nil, hooks, reasoning)
@@ -1525,6 +1529,95 @@ var doneMarkPattern = regexp.MustCompile(`已完成|已经(?:完成|创建|写�
 type toolOutcome struct {
 	text string
 	err  error
+}
+
+// execToolRound 执行一轮工具调用：落库 assistant 消息、并发/串行执行、
+// 回灌结果到 convo、doom-loop 检测。主循环与续跑段共用。
+// 返回非 nil 表示致命错误（保存失败等），调用方应终止整个回合。
+func (h *Handler) execToolRound(
+	ctx context.Context, sessID string, convo *[]ChatMessage, content string,
+	calls []ToolCall, defs []tools.ToolDef, env *tools.Env,
+	send func(map[string]any), takeDiff func() string,
+	lastSig *string, sigRuns *int,
+) error {
+	records := make([]store.ToolCallRecord, 0, len(calls))
+	for _, c := range calls {
+		records = append(records, store.ToolCallRecord{ID: c.ID, Name: c.Function.Name, Arguments: c.Function.Arguments})
+	}
+	if err := h.store.Append(sessID, store.Message{
+		Role: "assistant", Content: content, ToolCalls: records, CreatedAt: time.Now(),
+	}); err != nil {
+		send(map[string]any{"type": "error", "error": "保存消息失败: " + err.Error()})
+		return err
+	}
+	*convo = append(*convo, ChatMessage{Role: "assistant", Content: content, ToolCalls: calls})
+
+	// 全部只读工具且多于一个时并发执行（写类工具必须串行，避免竞争同一文件）；
+	// 结果仍按调用顺序回填 convo 与落库，SSE 事件按完成顺序发出（前端按 id 配对）。
+	parallel := len(calls) > 1 && noneWriteCapable(defs, calls)
+	results := make([]toolOutcome, len(calls))
+	if parallel {
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, parallelToolLimit)
+		for i := range calls {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				results[i] = h.runOneTool(ctx, env, defs, calls[i], send, takeDiff)
+			}(i)
+		}
+		wg.Wait()
+	} else {
+		for i := range calls {
+			results[i] = h.runOneTool(ctx, env, defs, calls[i], send, takeDiff)
+		}
+	}
+	for i := range calls {
+		out := results[i]
+		resultText := out.text
+		if out.err != nil {
+			resultText = "工具执行出错: " + out.err.Error() + orText(out.text)
+		}
+		// 回灌上下文前统一封顶（MCP 工具结果没有自带上限）
+		resultText = tools.TruncateMiddle(resultText, maxToolResultBytes)
+		if err := h.store.Append(sessID, store.Message{
+			Role: "tool", Content: resultText, ToolCallID: calls[i].ID,
+			Name: calls[i].Function.Name, CreatedAt: time.Now(),
+		}); err != nil {
+			send(map[string]any{"type": "error", "error": "保存工具结果失败: " + err.Error()})
+			return err
+		}
+		*convo = append(*convo, ChatMessage{
+			Role: "tool", Content: resultText,
+			ToolCallID: calls[i].ID, Name: calls[i].Function.Name,
+		})
+	}
+	// doom loop：这一轮的全部调用与上一轮完全一致且已连续 3 轮 → 注入强提醒。
+	// 提醒后重新计数，避免每一轮都重复注入。
+	var sig strings.Builder
+	for _, c := range calls {
+		sig.WriteString(c.Function.Name)
+		sig.WriteByte(0)
+		sig.WriteString(c.Function.Arguments)
+		sig.WriteByte(1)
+	}
+	if sig.String() == *lastSig {
+		*sigRuns++
+	} else {
+		*lastSig = sig.String()
+		*sigRuns = 1
+	}
+	if *sigRuns >= 3 {
+		*convo = append(*convo, ChatMessage{
+			Role: "user",
+			Content: "（系统提醒：完全相同的工具调用已连续重复 3 轮，继续重试只会得到同样结果。" +
+				"换一种方法、调整参数，或用 ask_user 向用户说明卡点。）",
+		})
+		*sigRuns = 0
+	}
+	return nil
 }
 
 // runOneTool 发出 tool 开始事件、执行、发出 tool_result 事件。

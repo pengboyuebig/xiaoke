@@ -258,6 +258,8 @@ export interface SettingsView {
   projectsRoot: string
   projectsRootEffective: string
   maxToolSteps: number
+  /** 单次回复的总工具轮数预算（含续跑段）；0 = 不续跑 */
+  maxTotalSteps: number
   commandAllowlist: string[]
   autoCompact: boolean
   compactKeepCount: number
@@ -335,6 +337,8 @@ export interface SettingsPayload {
   readDirs: string[]
   projectsRoot: string
   maxToolSteps: number
+  /** 单次回复的总工具轮数预算（含续跑段）；0 = 不续跑 */
+  maxTotalSteps: number
   commandAllowlist: string[]
   autoCompact: boolean
   compactKeepCount: number

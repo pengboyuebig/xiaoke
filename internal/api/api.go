@@ -71,6 +71,7 @@ type settingsView struct {
 	ProjectsRoot          string                    `json:"projectsRoot"`
 	ProjectsRootEffective string                    `json:"projectsRootEffective"`
 	MaxToolSteps          int                       `json:"maxToolSteps"`
+	MaxTotalSteps         int                       `json:"maxTotalSteps"`
 	CommandAllowlist      []string                  `json:"commandAllowlist"`
 	AutoCompact           bool                      `json:"autoCompact"`
 	CompactKeepCount      int                       `json:"compactKeepCount"`
@@ -114,6 +115,7 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 		ProjectsRoot:          s.ProjectsRoot,
 		ProjectsRootEffective: h.projects.Root(),
 		MaxToolSteps:          s.MaxToolSteps,
+		MaxTotalSteps:         s.MaxTotalSteps,
 		CommandAllowlist:      s.CommandAllowlist,
 		Permissions:           s.Permissions,
 		Commands:              s.Commands,

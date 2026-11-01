@@ -81,14 +81,18 @@ func TestNormalizeBounds(t *testing.T) {
 	}
 	next := s.Get()
 	next.MaxToolSteps = 999
+	next.MaxTotalSteps = 99999
 	next.LLM.MaxHistory = 0
 	next.LLM.Temperature = -1
 	if err := s.Update(next, nil); err != nil {
 		t.Fatal(err)
 	}
 	got := s.Get()
-	if got.MaxToolSteps != 32 {
-		t.Fatalf("maxToolSteps 应钳到 32，got %d", got.MaxToolSteps)
+	if got.MaxToolSteps != 200 {
+		t.Fatalf("maxToolSteps 应钳到 200，got %d", got.MaxToolSteps)
+	}
+	if got.MaxTotalSteps != 1000 {
+		t.Fatalf("maxTotalSteps 应钳到 1000，got %d", got.MaxTotalSteps)
 	}
 	if got.LLM.MaxHistory != 20 {
 		t.Fatalf("maxHistory 应回默认 20，got %d", got.LLM.MaxHistory)
