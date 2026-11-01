@@ -4,6 +4,7 @@ import type { Agent, LLMProfileView, Project, SessionMeta } from '../types'
 import { api } from '../lib/api'
 import AvatarBadge from './AvatarBadge.vue'
 import Icon from './Icon.vue'
+import SessionItem from './SessionItem.vue'
 
 const props = defineProps<{
   sessions: SessionMeta[]
@@ -50,25 +51,6 @@ const emit = defineEmits<{
 }>()
 
 
-// 会话重命名：双击标题进入行内编辑，Enter 确认 / Esc 取消
-const renamingId = ref('')
-const renamingText = ref('')
-function startRename(s: SessionMeta) {
-  renamingId.value = s.id
-  renamingText.value = s.title || ''
-}
-function commitRename() {
-  const id = renamingId.value
-  const title = renamingText.value.trim()
-  renamingId.value = ''
-  if (!id) return
-  emit('rename', id, title)
-}
-function cancelRename() {
-  renamingId.value = ''
-  renamingText.value = ''
-}
-
 // 会话搜索：标题/ID 本地过滤；输入 ≥2 字符按回车 → 后端全文搜索消息内容
 //（跨会话找「哪次聊过」，点击命中跳转会话）
 const sessionQuery = ref('')
@@ -79,6 +61,48 @@ const filteredSessions = computed(() => {
     (s) => (s.title || '').toLowerCase().includes(q) || s.id.includes(q),
   )
 })
+
+// ---------- 按项目分组：项目下创建的会话嵌在项目下方 ----------
+/** 项目下的会话最多显示几条（超出的引导到下方「最近会话」） */
+const PROJECT_SESSIONS_LIMIT = 5
+
+/** 一次性算出分组结果：projectId → 该项目下的会话（按更新时间倒序） */
+const sessionsByProject = computed(() => {
+  const map = new Map<string, SessionMeta[]>()
+  for (const s of filteredSessions.value) {
+    if (!s.projectId) continue
+    const arr = map.get(s.projectId)
+    if (arr) arr.push(s)
+    else map.set(s.projectId, [s])
+  }
+  // 每个项目内按更新时间倒序（新建数组再排序，避免改到原列表）
+  for (const arr of map.values()) {
+    arr.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''))
+  }
+  return map
+})
+
+/** 某项目下要展示的会话（截断到上限） */
+function sessionsOfProject(projectId: string): SessionMeta[] {
+  return (sessionsByProject.value.get(projectId) || []).slice(0, PROJECT_SESSIONS_LIMIT)
+}
+
+/** 某项目下会话总数 */
+function countSessionsOfProject(projectId: string): number {
+  return (sessionsByProject.value.get(projectId) || []).length
+}
+
+/** 不属于任何项目的会话（通用对话），在「最近会话」区单独列出 */
+const looseSessions = computed(() => filteredSessions.value.filter((s) => !s.projectId))
+
+/** 项目区块的展开状态：默认全部展开；用户可点项目名收起它的会话 */
+const collapsedProjects = ref<Record<string, boolean>>({})
+function toggleProjectSessions(projectId: string) {
+  collapsedProjects.value = { ...collapsedProjects.value, [projectId]: !collapsedProjects.value[projectId] }
+}
+function isCollapsed(projectId: string): boolean {
+  return !!collapsedProjects.value[projectId]
+}
 
 interface ContentHit {
   sessionId: string
@@ -122,21 +146,6 @@ const expanding = ref(false)
 const currentAgent = computed<Agent | null>(
   () => props.agents.find((a) => a.id === props.currentAgentId) || props.agents[0] || null,
 )
-
-function fmtTime(iso: string): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return ''
-  const now = new Date()
-  const sameDay = d.toDateString() === now.toDateString()
-  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-  if (sameDay) return hm
-  return `${d.getMonth() + 1}/${d.getDate()} ${hm}`
-}
-
-function projectName(projects: Project[], id?: string): string {
-  if (!id) return ''
-  return projects.find((p) => p.id === id)?.name || ''
-}
 </script>
 
 <template>
@@ -181,20 +190,47 @@ function projectName(projects: Project[], id?: string): string {
       </button>
     </div>
     <div class="list short">
-      <div
-        v-for="p in props.projects"
-        :key="p.id"
-        class="item"
-        :class="{ active: p.id === currentProjectId }"
-        :title="p.path"
-        @click="emit('selectProject', p.id)"
-      >
-        <span class="folder"><Icon name="folder" :size="15" /></span>
-        <span class="item-title">{{ p.name }}</span>
-        <button class="item-del" title="删除项目（含目录内全部文件）" @click.stop="emit('removeProject', p.id)">
-          <Icon name="x" :size="12" :stroke="2" />
-        </button>
-      </div>
+      <template v-for="p in props.projects" :key="p.id">
+        <div
+          class="item"
+          :class="{ active: p.id === currentProjectId }"
+          :title="p.path"
+          @click="emit('selectProject', p.id)"
+        >
+          <span class="folder"><Icon name="folder" :size="15" /></span>
+          <span class="item-title">{{ p.name }}</span>
+          <!-- 该项目的会话条数 + 折叠开关（只有存在会话时才显示） -->
+          <button
+            v-if="countSessionsOfProject(p.id)"
+            class="proj-toggle"
+            :title="isCollapsed(p.id) ? '展开项目下的会话' : '收起项目下的会话'"
+            @click.stop="toggleProjectSessions(p.id)"
+          >
+            <span class="proj-count">{{ countSessionsOfProject(p.id) }}</span>
+            <Icon :name="isCollapsed(p.id) ? 'chevron-down' : 'chevron-up'" :size="11" :stroke="2" />
+          </button>
+          <button class="item-del" title="删除项目（含目录内全部文件）" @click.stop="emit('removeProject', p.id)">
+            <Icon name="x" :size="12" :stroke="2" />
+          </button>
+        </div>
+        <!-- 项目下的会话：缩进显示，表示从属于上方项目 -->
+        <div v-if="!isCollapsed(p.id) && sessionsOfProject(p.id).length" class="proj-sessions">
+          <SessionItem
+            v-for="s in sessionsOfProject(p.id)"
+            :key="s.id"
+            :session="s"
+            :active="s.id === currentId"
+            nested
+            @select="emit('select', $event)"
+            @rename="(id, title) => emit('rename', id, title)"
+            @remove="emit('remove', $event)"
+            @fork="emit('fork', $event)"
+          />
+          <div v-if="countSessionsOfProject(p.id) > PROJECT_SESSIONS_LIMIT" class="proj-more">
+            还有 {{ countSessionsOfProject(p.id) - PROJECT_SESSIONS_LIMIT }} 条，见下方「最近会话」
+          </div>
+        </div>
+      </template>
       <div v-if="!projects.length" class="empty">还没有项目，点「＋」创建一个。</div>
     </div>
 
@@ -218,60 +254,20 @@ function projectName(projects: Project[], id?: string): string {
       </button>
     </div>
     <div class="list">
-      <div
-        v-for="s in filteredSessions"
+      <!-- 通用对话（不属于任何项目）-->
+      <SessionItem
+        v-for="s in looseSessions"
         :key="s.id"
-        class="item"
-        :class="{ active: s.id === currentId }"
-        @click="emit('select', s.id)"
-      >
-        <span v-if="projectName(projects, s.projectId)" class="proj-badge" :title="'项目：' + projectName(projects, s.projectId)">
-          {{ projectName(projects, s.projectId).slice(0, 4) }}
-        </span>
-        <input
-          v-if="renamingId === s.id"
-          v-model="renamingText"
-          class="item-rename"
-          autofocus
-          @click.stop
-          @keydown.enter.prevent="commitRename"
-          @keydown.esc.prevent="cancelRename"
-          @blur="commitRename"
-        />
-        <span
-          v-else
-          class="item-title"
-          :title="s.title || '新对话（双击重命名）'"
-          @dblclick.stop="startRename(s)"
-        >{{ s.title || '新对话' }}</span>
-        <span class="item-time">{{ fmtTime(s.updatedAt) }}</span>
-        <button class="item-export" title="分叉会话：复制全部消息为独立副本" @click.stop="emit('fork', s.id)">
-          <Icon name="clipboard" :size="12" />
-        </button>
-        <a
-          class="item-export"
-          :href="`/api/sessions/${s.id}/export`"
-          :download="`session-${s.id}.json`"
-          title="导出这个会话（JSON）"
-          @click.stop
-        >
-          <Icon name="download" :size="12" />
-        </a>
-        <a
-          class="item-export"
-          :href="`/api/sessions/${s.id}/export?format=md`"
-          :download="`session-${s.id}.md`"
-          title="导出这个会话（Markdown）"
-          @click.stop
-        >
-          <Icon name="book" :size="12" />
-        </a>
-        <button class="item-del" title="删除会话" @click.stop="emit('remove', s.id)">
-          <Icon name="x" :size="12" :stroke="2" />
-        </button>
-      </div>
+        :session="s"
+        :active="s.id === currentId"
+        @select="emit('select', $event)"
+        @rename="(id, title) => emit('rename', id, title)"
+        @remove="emit('remove', $event)"
+        @fork="emit('fork', $event)"
+      />
       <div v-if="!filteredSessions.length && sessionQuery.trim()" class="empty">没有匹配「{{ sessionQuery.trim() }}」的会话。</div>
       <div v-else-if="!sessions.length" class="empty">还没有会话。</div>
+      <div v-else-if="!looseSessions.length" class="empty">会话都已归到上方各自的项目下。</div>
     </div>
 
     <div ref="modelMenuWrap" class="foot">
@@ -682,6 +678,47 @@ function projectName(projects: Project[], id?: string): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 项目下的会话：缩进 + 左侧竖线，视觉上从属于上方项目 */
+.proj-sessions {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 1px 0 4px 14px;
+  padding-left: 10px;
+  border-left: 1px solid var(--border);
+}
+
+.proj-more {
+  padding: 5px 10px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+/* 项目行的会话条数 + 折叠开关 */
+.proj-toggle {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 5px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-faint);
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.proj-toggle:hover {
+  color: var(--accent);
+  border-color: var(--border);
+  background: var(--accent-soft);
+}
+
+.proj-count {
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 .item-title {
