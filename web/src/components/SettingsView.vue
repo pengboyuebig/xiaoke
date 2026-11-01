@@ -45,7 +45,6 @@ const form = reactive({
   mode: 'mock',
   baseURL: '',
   apiKey: '',
-  clearApiKey: false,
   model: '',
   temperature: 0.7,
   maxHistory: 20,
@@ -74,58 +73,119 @@ const profileTest = ref<Record<string, { ok: boolean; text: string }>>({})
 const profileModels = ref<Record<string, string[]>>({})
 const profileBusy = ref('')
 const customLLM = ref(false) // 当前生效值与激活档案不一致（手动自定义过）
+/** 档案区串行队列：所有「改档案 + 保存 + 刷新」排队执行——
+ *  并发 PUT 会乱序覆盖（后到的旧快照把新档案抹掉），loadSettings 的旧快照
+ *  也会把刚 push 的卡片抹掉，必须全部串行。 */
+let saveQueue: Promise<void> = Promise.resolve()
+function enqueue(task: () => Promise<void>): Promise<void> {
+  saveQueue = saveQueue.then(task, task)
+  return saveQueue
+}
+
+/** 无队列的保存本体：PUT + 激活同步 + 重载视图 */
+async function doSaveProfiles(syncActiveId?: string) {
+  await api.saveSettings(buildPayload())
+  if (syncActiveId && activeProfile.value === syncActiveId) {
+    await api.activateModel(syncActiveId)
+  }
+  await loadSettings()
+}
+
+const adoptBusy = ref(false)
+const adoptOpen = ref(false)
+const legacyBackend = ref(false)
+const adoptName = ref('')
+const shortModelName = computed(() => (form.model || '').split('/').pop() || '')
+
+/** 未绑定档案：起名收编当前生效配置（插入列表第一位，激活） */
+function confirmAdopt() {
+  adoptBusy.value = true
+  return enqueue(async () => {
+    await api.adoptModel({ name: adoptName.value.trim() || shortModelName.value })
+    adoptOpen.value = false
+    await loadSettings()
+    showToast('已保存为档案 ✓')
+  }).finally(() => {
+    adoptBusy.value = false
+  })
+}
+
+/** 生效值漂移：写回激活档案 */
+function adoptCurrent() {
+  adoptBusy.value = true
+  return enqueue(async () => {
+    await api.adoptModel({ id: activeProfile.value })
+    await loadSettings()
+    showToast('已同步到档案 ✓')
+  }).finally(() => {
+    adoptBusy.value = false
+  })
+}
 
 function newProfileID(): string {
   return 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
 }
+
 function addProfile() {
   if (form.profiles.length >= 20) return
-  const p: ProfileEdit = { id: newProfileID(), name: '', mode: 'openai', baseURL: '', apiKey: '', apiKeySet: false, apiKeyTail: '', model: '', smallModel: '' }
-  form.profiles.push(p)
-  expandedProfile.value = p.id
+  enqueue(async () => {
+    // 预填名字让新卡片立刻成为真实档案（立即落库：刷新不丢、可直接点「使用」）。
+    // push 必须在队列内做：并发的 loadSettings 会把刚 push 的卡片抹掉。
+    let n = form.profiles.length + 1
+    const taken = new Set(form.profiles.map((x) => x.name))
+    let name = `新配置 ${n}`
+    while (taken.has(name)) name = `新配置 ${++n}`
+    const p: ProfileEdit = { id: newProfileID(), name, mode: 'openai', baseURL: '', apiKey: '', apiKeySet: false, apiKeyTail: '', model: '', smallModel: '' }
+    form.profiles.push(p)
+    expandedProfile.value = p.id
+    await doSaveProfiles()
+  })
 }
-async function removeProfile(i: number) {
+
+function removeProfile(i: number) {
   const p = form.profiles[i]
-  const ok = await askConfirm({
+  return askConfirm({
     title: `删除模型配置「${p?.name || '未命名'}」`,
     message: p?.apiKeySet ? '该档案保存的 API Key 将一并删除，无法恢复。确定继续？' : '确定删除这个配置档案？',
     confirmText: '删除',
+  }).then((ok) => {
+    if (!ok) return
+    if (expandedProfile.value === p?.id) expandedProfile.value = ''
+    return enqueue(async () => {
+      const idx = form.profiles.findIndex((x) => x.id === p?.id)
+      if (idx >= 0) form.profiles.splice(idx, 1)
+      await doSaveProfiles()
+    })
   })
-  if (!ok) return
-  if (expandedProfile.value === p?.id) expandedProfile.value = ''
-  form.profiles.splice(i, 1)
-  saveProfiles()
 }
-async function activateNow(id: string) {
+
+function activateNow(id: string) {
   profileBusy.value = id
-  try {
-    const s = await api.activateModel(id)
+  return enqueue(async () => {
+    await api.activateModel(id)
     await loadSettings()
-    const name = (s.profiles || []).find((p) => p.id === id)?.name || id
+    const name = form.profiles.find((p) => p.id === id)?.name || id
     showToast(`已切换到「${name}」✓`)
-  } catch (e) {
-    saveErr.value = (e as Error).message
-  } finally {
+  }).finally(() => {
     profileBusy.value = ''
-  }
+  })
 }
+
 async function toggleProfileEdit(p: ProfileEdit) {
   if (expandedProfile.value === p.id) {
     expandedProfile.value = ''
-    await saveProfiles() // 收起即保存：档案编辑不依赖顶部的「保存并应用」
+    // 收起即保存；编辑的是激活档案 → 把档案值同步进生效配置（改激活档案 = 改当前配置）
+    const wasActive = p.id === activeProfile.value
+    await enqueue(() => doSaveProfiles(wasActive ? p.id : undefined))
   } else {
     expandedProfile.value = p.id
   }
 }
-/** 只保存档案（连同当前表单其余字段一起全量 PUT），随后重载视图 */
-async function saveProfiles() {
-  try {
-    await api.saveSettings(buildPayload())
-    await loadSettings()
-  } catch (e) {
-    saveErr.value = (e as Error).message
-  }
+
+function saveProfiles(syncActiveId?: string): Promise<void> {
+  return enqueue(() => doSaveProfiles(syncActiveId))
 }
+
 /** 对单个档案拉模型列表 / 测试连通（testLLM 接受任意组合） */
 async function pullProfileModels(p: ProfileEdit) {
   profileBusy.value = p.id + ':pull'
@@ -162,10 +222,6 @@ function applyPresetTo(p: ProfileEdit, key: string) {
   p.baseURL = pre.baseURL
 }
 const keyInfo = reactive({ set: false, tail: '' })
-const testResult = ref<{ ok: boolean; text: string } | null>(null)
-const modelList = ref<string[]>([])
-const pullingModels = ref(false)
-const testing = ref(false)
 
 const tabMeta = computed(() => TABS.find((t) => t.id === tab.value))
 
@@ -285,6 +341,8 @@ async function loadSettings() {
     form.commandTimeoutSec = s.commandTimeoutSec || 0
     form.permissions = (s.permissions || []).map((r) => ({ ...r }))
     form.commands = (s.commands || []).map((c) => ({ ...c }))
+    // 旧版本后端不下发 profiles 字段（新后端至少返回 []）：用于提示「请重启小柯」
+    legacyBackend.value = !('profiles' in s)
     form.profiles = (s.profiles || []).map((p) => ({ ...p, apiKey: '', apiKeyTail: p.apiKeyTail || '' }))
     activeProfile.value = s.activeProfile || ''
     const ap = (s.profiles || []).find((p) => p.id === s.activeProfile)
@@ -390,56 +448,11 @@ function showToast(msg: string) {
 }
 
 // ---------- 模型区 ----------
-function applyPreset(preset: 'deepseek' | 'gateway' | 'zen') {
-  form.mode = 'openai'
-  if (preset === 'deepseek') {
-    form.baseURL = 'https://api.deepseek.com'
-    form.model = 'deepseek-chat'
-  } else if (preset === 'gateway') {
-    form.baseURL = 'http://localhost:3000/api/v1'
-    form.model = ''
-  } else {
-    form.baseURL = 'https://opencode.ai/zen/v1'
-    form.model = ''
-  }
-  testResult.value = null
-}
-
-async function runTest() {
-  testing.value = true
-  testResult.value = null
-  try {
-    const r = await api.testLLM({ baseURL: form.baseURL, apiKey: form.apiKey || undefined, model: form.model })
-    if (r.ok) {
-      modelList.value = r.models || []
-      testResult.value = { ok: true, text: `连接成功，发现 ${modelList.value.length} 个模型` }
-    } else {
-      testResult.value = { ok: false, text: r.error || '连接失败' }
-    }
-  } catch (e) {
-    testResult.value = { ok: false, text: (e as Error).message }
-  } finally {
-    testing.value = false
-  }
-}
-
-async function pullModels() {
-  pullingModels.value = true
-  try {
-    // 用表单里的当前值测试/拉取，而不是已保存的旧配置
-    const r = await api.testLLM({ baseURL: form.baseURL, apiKey: form.apiKey || undefined, model: form.model })
-    modelList.value = r.models || []
-    if (r.ok) {
-      testResult.value = { ok: true, text: `拉取成功，发现 ${modelList.value.length} 个模型` }
-    } else {
-      testResult.value = { ok: false, text: r.error || '拉取失败' }
-    }
-  } catch (e) {
-    testResult.value = { ok: false, text: (e as Error).message }
-  } finally {
-    pullingModels.value = false
-  }
-}
+/** 摘要条的来源标注：激活档案名，或「未绑定档案」 */
+const activeProfileName = computed(() => {
+  const ap = form.profiles.find((p) => p.id === activeProfile.value)
+  return ap ? ap.name || '（未命名）' : ''
+})
 
 // ---------- MCP 区 ----------
 function addFilesystemServer() {
@@ -530,6 +543,8 @@ function buildPayload() {
             id: p.id, name: p.name.trim(), mode: p.mode, baseURL: p.baseURL.trim(),
             apiKey: p.apiKey, model: p.model.trim(), smallModel: p.smallModel?.trim() || '',
           })),
+        // 激活指向必须随请求体回传：后端 Update 是整字段替换，漏了就等于解绑
+        activeProfile: activeProfile.value,
       }
 }
 
@@ -539,7 +554,6 @@ async function save() {
   try {
     await api.saveSettings(
       buildPayload(),
-      form.clearApiKey,
     )
     showToast('已保存并应用 ✓')
     // 不自动关闭：避免在智能体/技能 tab 有未保存编辑时被一起关掉
@@ -604,136 +618,145 @@ async function save() {
         <section v-else-if="tab === 'llm'" class="panel">
           <div class="panel-head">
             <h2>模型 API</h2>
-            <p>任意 OpenAI 兼容上游；改完点右上角保存，热生效。</p>
+            <p>任意 OpenAI 兼容上游。模型配置以「档案」为单位管理：添加多套，随时一键切换，下一条消息生效。</p>
           </div>
+
+          <!-- 旧版本后端：档案能力未加载，提示重启 -->
+          <div v-if="legacyBackend" class="card legacy-banner">
+            <Icon name="warning" :size="15" />
+            <span>
+              检测到服务端是<b>旧版本</b>：模型配置档案需要重启小柯后才会生效。
+              重启时会把当前正在使用的配置自动保存为第一个档案；本页的保存/切换按钮暂不可用。
+            </span>
+          </div>
+
+          <!-- 当前生效（只读摘要）：来源 = 激活档案，或手动自定义 -->
+          <div class="card active-summary">
+            <span class="pr-badge" :class="form.mode">{{ form.mode === 'mock' ? '演示' : '在线' }}</span>
+            <span class="as-main">
+              <b>{{ form.model || '未设置模型' }}</b>
+              <i>{{ form.baseURL || '—' }}<template v-if="keyInfo.set"> · key 尾号 {{ keyInfo.tail }}</template></i>
+            </span>
+            <span v-if="activeProfileName" class="as-source">来自档案「{{ activeProfileName }}」</span>
+            <span v-else class="as-source warn">未绑定档案（手动自定义）</span>
+            <!-- 当前生效值没有档案载体或与激活档案漂移时：一键收编/同步（key 服务端直取） -->
+            <template v-if="!legacyBackend && !activeProfileName && !customLLM">
+              <!-- 未绑定档案：起个名字，把当前生效配置（含 Key）收编为第一张档案 -->
+              <template v-if="adoptOpen">
+                <input
+                  v-model="adoptName"
+                  class="inp adopt-name"
+                  :placeholder="'给这套配置起个名字，如 ' + shortModelName"
+                  @keydown.enter.prevent="confirmAdopt"
+                />
+                <button class="ab-btn primary" :disabled="adoptBusy" @click="confirmAdopt">{{ adoptBusy ? '保存中…' : '保存' }}</button>
+                <button class="ab-btn ghost" @click="adoptOpen = false">取消</button>
+              </template>
+              <button v-else class="btn ghost tiny adopt-btn" @click="adoptOpen = true; adoptName = ''">
+                ↗ 保存为档案
+              </button>
+            </template>
+            <button
+              v-else-if="!legacyBackend && customLLM"
+              class="btn ghost tiny adopt-btn"
+              :disabled="adoptBusy"
+              title="当前生效值与激活档案不一致：把生效值（含 Key）写回激活档案"
+              @click="adoptCurrent"
+            >
+              {{ adoptBusy ? '同步中…' : '⤴ 同步到档案' }}
+            </button>
+          </div>
+
+          <!-- 模型配置档案 -->
+          <div class="card profile-card">
+            <div class="card-title">
+              模型配置档案（{{ form.profiles.length }}/20）
+              <span v-if="customLLM" class="custom-flag" title="当前生效值被手动改过，与激活档案不同">已手动自定义</span>
+            </div>
+            <div class="hint">
+              每个档案是完整的一套配置（名称/模式/地址/Key/主模型/轻量模型），点「使用」即时切换（连运行模式一起切）。
+              编辑收起即自动保存。
+            </div>
+            <div v-if="!form.profiles.length" class="empty-box">
+              <template v-if="!legacyBackend && form.model">
+                当前正在使用的「{{ form.model }}」还没有保存为档案——点下面按钮一键收编（Key 在服务端直取，不经页面）：
+                <div class="eb-action">
+                  <button class="btn primary tiny" :disabled="adoptBusy" @click="confirmAdopt">
+                    {{ adoptBusy ? '保存中…' : '把当前配置保存为第一个档案' }}
+                  </button>
+                </div>
+              </template>
+              <template v-else-if="!legacyBackend">还没有配置档案，点「添加配置」新建一套。</template>
+            </div>
+            <div v-for="(p, pi) in form.profiles" :key="p.id" class="profile-item" :class="{ active: p.id === activeProfile, open: expandedProfile === p.id }">
+              <!-- 摘要行 -->
+              <div class="profile-row" @click="toggleProfileEdit(p)">
+                <span class="pr-badge" :class="p.mode">{{ p.mode === 'mock' ? '演示' : '在线' }}</span>
+                <span class="pr-main">
+                  <b>{{ p.name || '（未命名）' }}</b>
+                  <i>{{ p.model || '未设模型' }}<template v-if="p.baseURL"> · {{ p.baseURL }}</template><template v-if="p.apiKeySet"> · key 尾号 {{ p.apiKeyTail }}</template></i>
+                </span>
+                <button class="ab-btn primary" :class="{ used: p.id === activeProfile }" :disabled="profileBusy === p.id" @click.stop="p.id === activeProfile ? undefined : activateNow(p.id)">
+                  {{ p.id === activeProfile ? '✓ 使用中' : (profileBusy === p.id ? '切换中…' : '使用') }}
+                </button>
+                <button class="ab-btn danger" title="删除档案" @click.stop="removeProfile(pi)">
+                  <Icon name="trash" :size="13" />
+                </button>
+                <span class="pr-chevron" title="展开/收起" @click.stop="toggleProfileEdit(p)">
+                  <Icon :name="expandedProfile === p.id ? 'chevron-up' : 'chevron-down'" :size="15" />
+                </span>
+              </div>
+              <!-- 展开编辑 -->
+              <div v-if="expandedProfile === p.id" class="profile-edit" @click.stop>
+                <div class="pe-row">
+                  <input v-model="p.name" class="inp pe-name" placeholder="配置名，如 DeepSeek 官方" />
+                  <select v-model="p.mode" class="inp pe-mode">
+                    <option value="openai">OpenAI 兼容上游</option>
+                    <option value="mock">mock 演示（免 Key）</option>
+                  </select>
+                </div>
+                <div v-if="p.mode === 'openai'" class="pe-presets">
+                  <button v-for="(pre, key) in { deepseek: 'DeepSeek 官方', gateway: '本地网关', zen: 'OpenCode Zen' }" :key="key" class="chip" @click="applyPresetTo(p, key)">{{ pre }}</button>
+                </div>
+                <template v-if="p.mode === 'openai'">
+                  <input v-model="p.baseURL" class="inp" placeholder="Base URL，如 https://api.deepseek.com" />
+                  <input v-model="p.apiKey" class="inp" type="password" autocomplete="off"
+                    :placeholder="p.apiKeySet ? `已配置（尾号 ${p.apiKeyTail}），留空保持不变` : 'sk-… / oc-…'" />
+                  <div class="model-line">
+                    <input v-model="p.model" class="inp" :list="'pm-' + p.id" placeholder="主模型名" />
+                    <datalist :id="'pm-' + p.id">
+                      <option v-for="m in profileModels[p.id] || []" :key="m" :value="m" />
+                    </datalist>
+                    <button class="btn ghost" :disabled="profileBusy === p.id + ':pull'" @click="pullProfileModels(p)">
+                      {{ profileBusy === p.id + ':pull' ? '拉取中…' : '拉取列表' }}
+                    </button>
+                    <button class="btn ghost" :disabled="profileBusy === p.id + ':test'" @click="testProfile(p)">
+                      {{ profileBusy === p.id + ':test' ? '测试中…' : '测试连接' }}
+                    </button>
+                  </div>
+                  <input v-model="p.smallModel" class="inp" :list="'pm-' + p.id" placeholder="轻量模型（可选，留空 = 主模型）" />
+                  <div v-if="profileTest[p.id]" class="test" :class="profileTest[p.id].ok ? 'ok' : 'bad'">{{ profileTest[p.id].text }}</div>
+                </template>
+                <div class="pe-foot hint">收起本档案（再点一次摘要行）即自动保存。</div>
+              </div>
+            </div>
+            <button class="btn ghost tiny" :disabled="form.profiles.length >= 20" @click="addProfile">
+              <Icon name="plus" :size="13" /> 添加配置
+            </button>
+          </div>
+
           <div class="grid">
             <div class="card">
-              <div class="card-title">运行模式</div>
-              <select v-model="form.mode" class="inp">
-                <option value="mock">mock 演示（免 Key）</option>
-                <option value="openai">OpenAI 兼容上游</option>
-              </select>
+              <div class="card-title">温度</div>
+              <input v-model="form.temperature" class="inp" type="number" step="0.1" min="0" max="2" />
+              <div class="hint">所有档案共享的全局生成参数。</div>
             </div>
             <div class="card">
-              <div class="card-title">快捷预设</div>
-              <div class="preset-row">
-                <button class="chip" @click="applyPreset('deepseek')">DeepSeek 官方</button>
-                <button class="chip" @click="applyPreset('gateway')">本地 opencode 网关</button>
-                <button class="chip" @click="applyPreset('zen')">OpenCode Zen</button>
-              </div>
+              <div class="card-title">历史条数上限</div>
+              <input v-model="form.maxHistory" class="inp" type="number" min="4" max="100" />
             </div>
           </div>
-
-            <div class="card profile-card">
-              <div class="card-title">
-                模型配置档案（{{ form.profiles.length }}/20）
-                <span v-if="customLLM" class="custom-flag" title="当前生效值被手动改过，与激活档案不同">已手动自定义</span>
-              </div>
-              <div class="hint">
-                每个档案是完整的一套配置（名称/模式/地址/Key/主模型/轻量模型），点「使用」即时切换（连运行模式一起切，下一条消息生效）。
-                编辑收起即自动保存。
-              </div>
-              <div v-for="(p, pi) in form.profiles" :key="p.id" class="profile-item" :class="{ active: p.id === activeProfile, open: expandedProfile === p.id }">
-                <!-- 摘要行 -->
-                <div class="profile-row" @click="toggleProfileEdit(p)">
-                  <span class="pr-badge" :class="p.mode">{{ p.mode === 'mock' ? '演示' : '在线' }}</span>
-                  <span class="pr-main">
-                    <b>{{ p.name || '（未命名）' }}</b>
-                    <i>{{ p.model || '未设模型' }}<template v-if="p.baseURL"> · {{ p.baseURL }}</template><template v-if="p.apiKeySet"> · key 尾号 {{ p.apiKeyTail }}</template></i>
-                  </span>
-                  <span v-if="p.id === activeProfile" class="pr-active">使用中</span>
-                  <button class="ab-btn primary" :disabled="profileBusy === p.id" @click.stop="activateNow(p.id)">
-                    {{ p.id === activeProfile ? '使用中' : (profileBusy === p.id ? '切换中…' : '使用') }}
-                  </button>
-                  <button class="ab-btn danger" title="删除档案" @click.stop="removeProfile(pi)">
-                    <Icon name="trash" :size="13" />
-                  </button>
-                </div>
-                <!-- 展开编辑 -->
-                <div v-if="expandedProfile === p.id" class="profile-edit" @click.stop>
-                  <div class="pe-row">
-                    <input v-model="p.name" class="inp pe-name" placeholder="配置名，如 DeepSeek 官方" />
-                    <select v-model="p.mode" class="inp pe-mode">
-                      <option value="openai">OpenAI 兼容上游</option>
-                      <option value="mock">mock 演示（免 Key）</option>
-                    </select>
-                  </div>
-                  <div v-if="p.mode === 'openai'" class="pe-presets">
-                    <button v-for="(pre, key) in { deepseek: 'DeepSeek 官方', gateway: '本地网关', zen: 'OpenCode Zen' }" :key="key" class="chip" @click="applyPresetTo(p, key)">{{ pre }}</button>
-                  </div>
-                  <template v-if="p.mode === 'openai'">
-                    <input v-model="p.baseURL" class="inp" placeholder="Base URL，如 https://api.deepseek.com" />
-                    <input v-model="p.apiKey" class="inp" type="password" autocomplete="off"
-                      :placeholder="p.apiKeySet ? `已配置（尾号 ${p.apiKeyTail}），留空保持不变` : 'sk-… / oc-…'" />
-                    <div class="model-line">
-                      <input v-model="p.model" class="inp" :list="'pm-' + p.id" placeholder="主模型名" />
-                      <datalist :id="'pm-' + p.id">
-                        <option v-for="m in profileModels[p.id] || []" :key="m" :value="m" />
-                      </datalist>
-                      <button class="btn ghost" :disabled="profileBusy === p.id + ':pull'" @click="pullProfileModels(p)">
-                        {{ profileBusy === p.id + ':pull' ? '拉取中…' : '拉取列表' }}
-                      </button>
-                      <button class="btn ghost" :disabled="profileBusy === p.id + ':test'" @click="testProfile(p)">
-                        {{ profileBusy === p.id + ':test' ? '测试中…' : '测试连接' }}
-                      </button>
-                    </div>
-                    <input v-model="p.smallModel" class="inp" :list="'pm-' + p.id" placeholder="轻量模型（可选，留空 = 主模型）" />
-                    <div v-if="profileTest[p.id]" class="test" :class="profileTest[p.id].ok ? 'ok' : 'bad'">{{ profileTest[p.id].text }}</div>
-                  </template>
-                  <div class="pe-foot hint">收起本档案（再点一次摘要行）即自动保存。</div>
-                </div>
-              </div>
-              <button class="btn ghost tiny" :disabled="form.profiles.length >= 20" @click="addProfile">
-                <Icon name="plus" :size="13" /> 添加配置
-              </button>
-            </div>
-
-          <template v-if="form.mode === 'openai'">
-            <div class="card">
-              <div class="card-title">Base URL</div>
-              <input v-model="form.baseURL" class="inp" placeholder="https://api.deepseek.com 或 http://localhost:3000/api/v1" />
-            </div>
-            <div class="card">
-              <div class="card-title">API Key</div>
-              <div class="key-row">
-                <input v-model="form.apiKey" class="inp" type="password" autocomplete="off"
-                  :placeholder="keyInfo.set ? `已配置（尾号 ${keyInfo.tail}），留空保持不变` : 'sk-… / oc-…'" />
-                <label class="chk"><input type="checkbox" v-model="form.clearApiKey" /> 清除</label>
-              </div>
-            </div>
-            <div class="card">
-              <div class="card-title">模型</div>
-              <div class="model-line">
-                <input v-model="form.model" class="inp" list="model-options" placeholder="deepseek-chat" />
-                <datalist id="model-options">
-                  <option v-for="m in modelList" :key="m" :value="m" />
-                </datalist>
-                <button class="btn ghost" :disabled="pullingModels" @click="pullModels">
-                  {{ pullingModels ? '拉取中…' : '拉取列表' }}
-                </button>
-                <button class="btn ghost" :disabled="testing" @click="runTest">{{ testing ? '测试中…' : '测试连接' }}</button>
-              </div>
-              <div v-if="testResult" class="test" :class="testResult.ok ? 'ok' : 'bad'">{{ testResult.text }}</div>
-            </div>
-            <div class="card">
-              <div class="card-title">轻量模型（可选）</div>
-              <input v-model="form.smallModel" class="inp" list="model-options" placeholder="留空 = 主模型" />
-              <div class="hint">
-                上下文压缩摘要、会话自动起标题等辅助调用走它——不需要强推理，用便宜的小模型（如 deepseek-chat 配主 deepseek-reasoner）省钱且更快。
-              </div>
-            </div>
-            <div class="grid">
-              <div class="card">
-                <div class="card-title">温度</div>
-                <input v-model="form.temperature" class="inp" type="number" step="0.1" min="0" max="2" />
-              </div>
-              <div class="card">
-                <div class="card-title">历史条数上限</div>
-                <input v-model="form.maxHistory" class="inp" type="number" min="4" max="100" />
-              </div>
-            </div>
-          </template>
-          <div class="note"><Icon name="sparkles" :size="14" /> 思考程度在对话页右下角随时调节，无需进设置。</div>
+          <div class="note"><Icon name="sparkles" :size="14" /> 思考程度在对话页右下角随时调节，无需进设置。轻量模型、上下文窗口、命令超时等在「高级」页。</div>
         </section>
 
         <!-- MCP -->
@@ -1431,6 +1454,103 @@ textarea.inp {
 }
 
 /* 定时任务管理 */
+/* ---------- 旧版本横幅 ---------- */
+.legacy-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 12px;
+  border-color: rgba(250, 204, 21, 0.35);
+  color: #facc15;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.legacy-banner b {
+  color: #fde68a;
+}
+
+.legacy-banner span {
+  flex: 1;
+}
+
+/* ---------- 当前生效摘要条 ---------- */
+.active-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.active-summary .as-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.active-summary .as-main b {
+  font-size: 13.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.active-summary .as-main i {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.as-source {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+
+.as-source.warn {
+  color: #facc15;
+  border-color: rgba(250, 204, 21, 0.35);
+}
+
+.adopt-btn {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.adopt-name {
+  width: 240px;
+  flex-shrink: 0;
+}
+
+.pr-chevron {
+  flex-shrink: 0;
+  display: flex;
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 3px;
+  border-radius: 6px;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.pr-chevron:hover {
+  color: var(--accent);
+  background: rgba(255, 154, 61, 0.08);
+}
+
+/* ---------- 空态收编按钮 ---------- */
+.eb-action {
+  margin-top: 10px;
+}
+
 /* ---------- 模型配置档案 ---------- */
 .custom-flag {
   margin-left: 10px;
@@ -1454,6 +1574,13 @@ textarea.inp {
 .profile-item.active {
   border-color: rgba(255, 154, 61, 0.4);
   background: linear-gradient(135deg, rgba(255, 154, 61, 0.05), transparent);
+}
+
+.ab-btn.primary.used {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--accent);
+  box-shadow: none;
+  cursor: default;
 }
 
 .profile-row {
@@ -1510,12 +1637,6 @@ textarea.inp {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.pr-active {
-  flex-shrink: 0;
-  font-size: 10.5px;
-  color: var(--accent);
 }
 
 .profile-edit {

@@ -285,6 +285,7 @@ function projectName(projects: Project[], id?: string): string {
       </button>
       <!-- 模型档案快速切换 -->
       <div v-if="modelMenuOpen" class="model-menu">
+        <div v-if="!(props.profiles?.length)" class="mm-empty">还没有配置档案——去设置把当前模型保存为档案。</div>
         <button
           v-for="p in props.profiles || []"
           :key="p.id"
@@ -843,6 +844,13 @@ function projectName(projects: Project[], id?: string): string {
 .mm-check {
   display: flex;
   color: var(--accent);
+}
+
+.mm-empty {
+  padding: 9px 10px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  line-height: 1.6;
 }
 
 .mm-manage {

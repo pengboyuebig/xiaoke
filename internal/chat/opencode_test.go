@@ -643,3 +643,127 @@ func TestActivateProfileE2E(t *testing.T) {
 		t.Fatalf("删除激活档案后 activeProfile 应清空: %v", sv["activeProfile"])
 	}
 }
+
+// TestAdoptProfileE2E：模拟「未绑定档案 + 生效值手动配置」场景——
+// adopt 一键把生效值（含真实 Key）收编为档案并激活，随后可编辑同步。
+func TestAdoptProfileE2E(t *testing.T) {
+	f := newE2E(t)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+
+	getSettings := func() map[string]any {
+		resp, err := http.Get(f.srv.URL + "/api/settings")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var v map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	putSettings := func(v map[string]any) map[string]any {
+		body, _ := json.Marshal(v)
+		req, _ := http.NewRequest(http.MethodPut, f.srv.URL+"/api/settings", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// 场景准备：清空档案（未绑定）+ 手动配置生效值（模拟旧版本升级用户）。
+	// 注意每次 PUT 都基于上一次响应重新取 llm（putSettings 返回最新视图）。
+	key := "sk-live-key"
+	sv := getSettings()
+	sv["llmProfiles"] = []any{}
+	sv["llm"].(map[string]any)["mode"] = "openai"
+	sv["llm"].(map[string]any)["baseURL"] = up.URL
+	sv["llm"].(map[string]any)["model"] = "live-model"
+	sv = putSettings(sv)
+	// 主 key 合并约定：apiKey 非空 = 设置新值
+	sv["llm"].(map[string]any)["apiKey"] = key
+	sv = putSettings(sv)
+	sv["llm"].(map[string]any)["apiKey"] = "" // 还原（此后为空=保持）
+	sv = putSettings(sv)
+
+	// adopt：未绑定 → 新建档案并激活，key 服务端直取
+	adopt := func(payload map[string]any) map[string]any {
+		body, _ := json.Marshal(payload)
+		resp, err := http.Post(f.srv.URL+"/api/models/adopt", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("adopt 应 200，got %d: %s", resp.StatusCode, b)
+		}
+		var out map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	sv = adopt(map[string]any{"name": "我的配置"})
+	if sv["activeProfile"] == "" {
+		t.Fatal("收编后应自动激活")
+	}
+	profiles, _ := sv["profiles"].([]any)
+	if len(profiles) != 1 {
+		t.Fatalf("应收编出 1 个档案: %d", len(profiles))
+	}
+	p0, _ := profiles[0].(map[string]any)
+	if p0["model"] != "live-model" || p0["baseURL"] != up.URL || p0["apiKeySet"] != true {
+		t.Fatalf("档案应携带生效值（key 脱敏但 apiKeySet=true）: %v", p0)
+	}
+	// 明文 key 不回传
+	resp, err := http.Get(f.srv.URL + "/api/settings")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	raw := string(rawBytes)
+	if strings.Contains(raw, key) {
+		t.Fatal("明文 key 不应出现在响应里")
+	}
+
+	// 编辑激活档案（改 model）→ 回写同步 → 生效值跟着变
+	p0["model"] = "live-model-v2"
+	sv["llmProfiles"] = []any{p0}
+	sv = putSettings(sv)
+	// 前端 saveProfiles(syncActiveId) 的同步 = activate
+	actBody, _ := json.Marshal(map[string]string{"id": sv["activeProfile"].(string)})
+	act, err := http.Post(f.srv.URL+"/api/models/activate", "application/json", bytes.NewReader(actBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	act.Body.Close()
+	sv = getSettings()
+	if sv["llm"].(map[string]any)["model"] != "live-model-v2" {
+		t.Fatalf("编辑激活档案后同步应更新生效值: %v", sv["llm"].(map[string]any)["model"])
+	}
+
+	// adopt 回写模式：生效值漂移后回写激活档案
+	sv["llm"].(map[string]any)["model"] = "live-model-v3"
+	sv = putSettings(sv)
+	sv = adopt(map[string]any{"id": sv["activeProfile"]})
+	profiles, _ = sv["profiles"].([]any)
+	p0, _ = profiles[0].(map[string]any)
+	if p0["model"] != "live-model-v3" {
+		t.Fatalf("回写应把漂移的生效值同步回档案: %v", p0["model"])
+	}
+}

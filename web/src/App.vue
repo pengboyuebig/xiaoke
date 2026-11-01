@@ -31,6 +31,8 @@ const model = ref('')
 // 当前会话的待办清单与最近一次用量（todo/usage SSE 事件维护，切会话随会话还原）
 const sessionTodos = ref<Todo[]>([])
 const lastUsage = ref<UsageInfo | null>(null)
+// 本会话累计用量（服务端会话快照累计；切会话/每次请求结束后刷新）
+const sessionUsage = ref<{ prompt: number; completion: number; requests: number } | null>(null)
 
 // ask 交互（ask_user 提问 / ask 模式审批）：SSE ask 事件 → 弹窗 → POST 回答
 interface AskRequest {
@@ -108,6 +110,13 @@ async function refreshCommands() {
   } catch {
     /* 忽略 */
   }
+}
+
+/** 从会话快照取累计用量（promptTokens/completionTokens/requests） */
+function setSessionUsage(s: { promptTokens?: number; completionTokens?: number; requests?: number }) {
+  const p = s.promptTokens || 0
+  const c = s.completionTokens || 0
+  sessionUsage.value = p || c ? { prompt: p, completion: c, requests: s.requests || 0 } : null
 }
 
 /** 一键切换模型档案：值拷入生效配置热生效，刷新健康状态与档案高亮 */
@@ -286,6 +295,7 @@ onMounted(async () => {
       if (s.agentId) currentAgentId.value = s.agentId
       messages.value = s.messages
       sessionTodos.value = s.todos || []
+      setSessionUsage(s)
     } else if (last) {
       localStorage.removeItem(CURRENT_SESSION_KEY)
     }
@@ -306,6 +316,7 @@ function handleSelectAgent(id: string) {
   messages.value = []
   sessionTodos.value = []
   lastUsage.value = null
+  sessionUsage.value = null
   error.value = ''
 }
 
@@ -533,6 +544,7 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
         if (r.sessionId === currentId.value) {
           messages.value = s.messages
           sessionTodos.value = s.todos || []
+          setSessionUsage(s)
           const last = s.messages[s.messages.length - 1]
           serverHadThis = last?.role === 'assistant' && !!last.content && last.content === streamingText.value
         }
@@ -639,6 +651,7 @@ function handleNewChat() {
   messages.value = []
   sessionTodos.value = []
   lastUsage.value = null
+  sessionUsage.value = null
   liveTools.value = []
   error.value = ''
 }
@@ -656,6 +669,7 @@ async function handleSelect(id: string) {
     if (s.agentId) currentAgentId.value = s.agentId
     messages.value = s.messages
     sessionTodos.value = s.todos || []
+    setSessionUsage(s)
     lastUsage.value = null
     error.value = ''
   } catch (e) {
@@ -690,6 +704,7 @@ async function handleRemove(id: string) {
     messages.value = []
     sessionTodos.value = []
     lastUsage.value = null
+    sessionUsage.value = null
     try {
       localStorage.removeItem(CURRENT_SESSION_KEY)
     } catch {
@@ -709,6 +724,7 @@ function handleSelectProject(id: string) {
   messages.value = []
   sessionTodos.value = []
   lastUsage.value = null
+  sessionUsage.value = null
   error.value = ''
 }
 
@@ -721,6 +737,7 @@ function unbindProject() {
   messages.value = []
   sessionTodos.value = []
   lastUsage.value = null
+  sessionUsage.value = null
   error.value = ''
 }
 
@@ -829,6 +846,7 @@ function onSettingsClosed() {
         :profiles="modelProfiles"
         :active-profile="activeProfile"
         :model-name="model"
+        :session-usage="sessionUsage"
         @activate-model="activateModel"
         @send="handleSend"
         @stop="handleStop"

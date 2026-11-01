@@ -36,6 +36,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/settings/test", h.testLLM)
 	mux.HandleFunc("GET /api/models", h.listModels)
 	mux.HandleFunc("POST /api/models/activate", h.activateProfile)
+	mux.HandleFunc("POST /api/models/adopt", h.adoptCurrentLLM)
 	mux.HandleFunc("GET /api/mcp/status", h.mcpStatus)
 	mux.HandleFunc("POST /api/mcp/retry", h.retryMCP)
 	mux.HandleFunc("GET /api/projects", h.listProjects)
@@ -200,6 +201,30 @@ func (h *Handler) activateProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := h.set.ActivateProfile(strings.TrimSpace(in.ID)); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	h.getSettings(w, r)
+}
+
+// adoptCurrentLLM 处理 POST /api/models/adopt {id?, name?}：把当前生效配置
+//（含真实 Key）收编为档案——id 空 = 新建并激活（未绑定档案/旧版本升级场景）；
+// id 非空 = 回写该档案（编辑激活档案后生效值同步回去）。
+func (h *Handler) adoptCurrentLLM(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ID   string `json:"id,omitempty"`
+		Name string `json:"name,omitempty"`
+	}
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if _, err := h.set.AdoptCurrentAsProfile(strings.TrimSpace(in.ID), strings.TrimSpace(in.Name)); err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "不存在") {
+			status = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "已满") {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 	h.getSettings(w, r)

@@ -224,9 +224,13 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
         />
       </div>
       <!-- 最近一次对话的 token 用量（done 事件上报；估算值仅作参考） -->
-      <div v-if="props.lastUsage && (props.lastUsage.prompt || props.lastUsage.completion)" class="usage-line">
+      <div
+        v-if="props.lastUsage && (props.lastUsage.prompt || props.lastUsage.completion)"
+        class="usage-line"
+        title="本轮请求用量（上游返回真实 usage 优先，缺失时按字节估算）；本会话累计见输入框下方"
+      >
         <Icon name="clock" :size="12" />
-        本次用量 ↑{{ props.lastUsage.prompt }} ↓{{ props.lastUsage.completion }} tokens（估算值，仅供参考）
+        本次用量 ↑{{ props.lastUsage.prompt }} ↓{{ props.lastUsage.completion }} tokens
       </div>
       <!-- 计划已生成：批准后切开发模式并立即按计划开工；也可用自己的方式实现 -->
       <div v-if="props.awaitingApproval" class="approve-bar">

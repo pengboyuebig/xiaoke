@@ -290,8 +290,9 @@ func (s *Store) normalizeProfiles() {
 		if p.Mode != "mock" {
 			p.Mode = "openai"
 		}
-		// 既没模型又没 baseURL 的空壳丢弃；没起名用模型名兜底
-		if p.Model == "" && p.BaseURL == "" {
+		// 彻底的空壳（无名/无模型/无地址）丢弃；有名字的新卡片即使还没填模型也保留
+		//（前端「添加配置」会预填名字并立即落库，用户随后补全连接信息）
+		if p.Model == "" && p.BaseURL == "" && p.Name == "" {
 			continue
 		}
 		if p.Name == "" {
@@ -325,6 +326,62 @@ func newProfileID() string {
 		return fmt.Sprintf("p%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// AdoptCurrentAsProfile 把当前生效配置（LLM 字段，含真实 Key）收编为档案。
+// id 为空 = 新建档案（name 兜底「当前配置」）并激活——覆盖「手动自定义」场景：
+// 用户手改过生效值或从旧版本升级，一键把现在用的配置变成可编辑的档案。
+// id 非空 = 用当前生效值回写该档案（key 一并同步；name 非空才改名），
+// 激活状态不变——覆盖「编辑了激活档案但生效值漂移」的同步场景。
+func (s *Store) AdoptCurrentAsProfile(id, name string) (Settings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id == "" {
+		if len(s.data.LLMProfiles) >= maxProfiles {
+			return s.snapshot(), fmt.Errorf("档案已满（%d 个）：请先删除不需要的配置", maxProfiles)
+		}
+		p := LLMProfile{
+			ID:         newProfileID(),
+			Name:       strings.TrimSpace(name),
+			Mode:       s.data.LLM.Mode,
+			BaseURL:    s.data.LLM.BaseURL,
+			APIKey:     s.data.LLM.APIKey,
+			Model:      s.data.LLM.Model,
+			SmallModel: s.data.LLM.SmallModel,
+		}
+		if p.Name == "" {
+			p.Name = "当前配置"
+		}
+		// 插到列表第一位：当前正在用的配置排在最前面（用户心智：第一张卡 = 现在用的）
+		s.data.LLMProfiles = append([]LLMProfile{p}, s.data.LLMProfiles...)
+		s.data.ActiveProfile = p.ID
+	} else {
+		idx := -1
+		for i, p := range s.data.LLMProfiles {
+			if p.ID == id {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return s.snapshot(), fmt.Errorf("配置档案 %q 不存在", id)
+		}
+		p := s.data.LLMProfiles[idx]
+		p.Mode = s.data.LLM.Mode
+		p.BaseURL = s.data.LLM.BaseURL
+		p.APIKey = s.data.LLM.APIKey
+		p.Model = s.data.LLM.Model
+		p.SmallModel = s.data.LLM.SmallModel
+		if strings.TrimSpace(name) != "" {
+			p.Name = strings.TrimSpace(name)
+		}
+		s.data.LLMProfiles[idx] = p
+	}
+	s.normalizeProfiles()
+	if err := s.save(); err != nil {
+		return s.snapshot(), err
+	}
+	return s.snapshot(), nil
 }
 
 // ActivateProfile 把指定档案的值拷入当前生效配置（LLM 字段），并记为激活。
@@ -380,7 +437,9 @@ func (s *Store) snapshot() Settings {
 	return cp
 }
 
-// Update 合并保存：apiKey 为 nil 指针表示「保持原值」，空串表示清除。
+// Update 合并保存：apiKey 为 nil 指针表示「保持原值」，空串表示清除；
+// activeProfile 未携带（空串）且原激活档案在新档案列表中仍存在时，视为「未变更」
+// 而非「解绑」——旧客户端/局部保存的请求体不会意外丢掉激活指向。
 func (s *Store) Update(next Settings, apiKey *string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -388,6 +447,14 @@ func (s *Store) Update(next Settings, apiKey *string) error {
 		next.LLM.APIKey = *apiKey
 	} else {
 		next.LLM.APIKey = s.data.LLM.APIKey
+	}
+	if next.ActiveProfile == "" && s.data.ActiveProfile != "" {
+		for _, p := range next.LLMProfiles {
+			if p.ID == s.data.ActiveProfile {
+				next.ActiveProfile = s.data.ActiveProfile
+				break
+			}
+		}
 	}
 	s.data = next
 	s.normalize()

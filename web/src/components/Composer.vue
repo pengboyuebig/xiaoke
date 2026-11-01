@@ -24,6 +24,8 @@ const props = defineProps<{
   sessionId?: string
   /** 自定义斜杠命令（设置 → 高级维护）；busy 时发送自动进入队列 */
   commands?: CustomCommand[]
+  /** 本会话累计 token 用量（服务端会话快照累计，切会话随会话还原） */
+  sessionUsage?: { prompt: number; completion: number; requests: number } | null
   /** 模型配置档案：输入框左下角快捷切换 */
   profiles?: LLMProfileView[]
   activeProfile?: string
@@ -96,6 +98,21 @@ function onDocClick(e: MouseEvent) {
 }
 onMounted(() => document.addEventListener('mousedown', onDocClick))
 onUnmounted(() => document.removeEventListener('mousedown', onDocClick))
+
+/** 大数字紧凑显示：1.2 万 / 12 万 / 1.2 亿 */
+function fmtTokens(n: number): string {
+  if (!n) return '0'
+  if (n < 10000) return String(n)
+  if (n < 100000000) {
+    const w = n / 10000
+    return (w >= 100 ? Math.round(w) : w.toFixed(1).replace(/\.0$/, '')) + ' 万'
+  }
+  return (n / 100000000).toFixed(1).replace(/\.0$/, '') + ' 亿'
+}
+const totalTokens = computed(() => {
+  const u = props.sessionUsage
+  return u ? (u.prompt || 0) + (u.completion || 0) : 0
+})
 
 // 思考程度选项（none 不注入请求体；其余映射为 reasoning_effort）
 const LEVELS = [
@@ -261,6 +278,7 @@ function onLevelChange(e: Event) {
       <!-- 模型档案快捷切换（模式按钮旁） -->
       <div ref="modelWrap" class="mode-wrap">
         <div v-if="modelMenuOpen" class="mode-menu model-menu">
+          <div v-if="!(props.profiles?.length)" class="mo-empty">还没有配置档案——去设置把当前模型保存为档案。</div>
           <button
             v-for="p in props.profiles || []"
             :key="p.id"
@@ -314,7 +332,18 @@ function onLevelChange(e: Event) {
       </button>
     </div>
     <div class="hint-row">
-      <span class="hint">小柯可能也会犯错，重要信息请自行核实。</span>
+      <div class="hint-left">
+        <span class="hint">小柯可能也会犯错，重要信息请自行核实。</span>
+        <!-- 本会话累计用量：所有请求累加，切会话随会话还原 -->
+        <span
+          v-if="totalTokens > 0"
+          class="usage-chip"
+          :title="`本会话累计：输入 ${props.sessionUsage?.prompt ?? 0} / 输出 ${props.sessionUsage?.completion ?? 0} tokens（共 ${props.sessionUsage?.requests ?? 0} 次请求，上游未返回用量时为估算）`"
+        >
+          <Icon name="clock" :size="11" />
+          本会话 ↑{{ fmtTokens(props.sessionUsage?.prompt || 0) }} ↓{{ fmtTokens(props.sessionUsage?.completion || 0) }}
+        </span>
+      </div>
       <!-- 右下角：思考程度（当前会话的下一条消息生效，浏览器本地记住） -->
       <label class="level" title="模型思考程度（reasoning_effort），下一条消息生效">
         <span class="level-icon"><Icon name="brain" :size="14" /></span>
@@ -578,6 +607,13 @@ textarea::placeholder {
   right: auto;
 }
 
+.mo-empty {
+  padding: 9px 11px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  line-height: 1.6;
+}
+
 .mode-opt.slim {
   padding: 8px 11px;
 }
@@ -653,9 +689,32 @@ textarea::placeholder {
   padding: 0 4px;
 }
 
+.hint-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
 .hint {
   color: var(--text-faint);
   font-size: 10.5px;
+}
+
+.usage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: default;
 }
 
 .level {

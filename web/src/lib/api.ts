@@ -187,6 +187,11 @@ export const api = {
   activateModel(id: string): Promise<SettingsView> {
     return jfetch('/api/models/activate', jsonBody('POST', { id }))
   },
+  /** 把当前生效配置收编为档案（id 空 = 新建并激活；id 非空 = 回写该档案）。
+   *  真实 Key 在服务端直取，不经前端。 */
+  adoptModel(payload: { id?: string; name?: string }): Promise<SettingsView> {
+    return jfetch('/api/models/adopt', jsonBody('POST', payload))
+  },
   mcpStatus(): Promise<{ servers: MCPStatus[] }> {
     return jfetch('/api/mcp/status')
   },

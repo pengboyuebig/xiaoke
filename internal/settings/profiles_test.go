@@ -159,3 +159,67 @@ func TestProfileRoundTripKeepsFields(t *testing.T) {
 		t.Fatal("落盘文件应包含 key（settings.json 本地明文，0600）")
 	}
 }
+
+// 收编：当前生效配置一键变成档案（含真实 Key）；回写模式同步激活档案。
+func TestAdoptCurrentAsProfile(t *testing.T) {
+	s, _ := openStore(t, config.LLMConfig{Mode: "openai", Model: "m1"})
+	// 未绑定档案场景：直接收编生效值 → 新档案创建并激活，key 从 LLM 字段直取
+	if _, err := s.ActivateProfile("nope"); err == nil {
+		t.Fatal("前置：无档案时 activate 应失败（模拟未绑定）")
+	}
+	got := s.Get()
+	got.LLMProfiles = []LLMProfile{}
+	if err := s.Update(got, nil); err != nil {
+		t.Fatal(err)
+	}
+	got = s.Get()
+	got.LLM.BaseURL = "https://api.deepseek.com"
+	got.LLM.Model = "deepseek-chat"
+	got.LLM.SmallModel = "deepseek-lite"
+	key := "sk-adopt-me"
+	if err := s.Update(got, &key); err != nil { // key 走指针参数（nil=保留旧值的合并约定）
+		t.Fatal(err)
+	}
+	after, err := s.AdoptCurrentAsProfile("", "我的配置")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.LLMProfiles) != 1 || after.LLMProfiles[0].Name != "我的配置" {
+		t.Fatalf("应收编为新档案: %+v", after.LLMProfiles)
+	}
+	p := after.LLMProfiles[0]
+	if p.APIKey != "sk-adopt-me" || p.SmallModel != "deepseek-lite" || p.Model != "deepseek-chat" {
+		t.Fatalf("档案应携带生效值（含真实 key）: %+v", p)
+	}
+	if after.ActiveProfile != p.ID {
+		t.Fatal("收编后应自动激活")
+	}
+	if after.LLMProfiles[0].ID != p.ID {
+		t.Fatal("收编档案应插入到列表第一位")
+	}
+
+	// 回写模式：改生效值 → 回写到激活档案 → 两者一致
+	got = s.Get()
+	got.LLM.Model = "deepseek-chat-v2"
+	if err := s.Update(got, nil); err != nil {
+		t.Fatal(err)
+	}
+	activeID := after.ActiveProfile
+	after, err = s.AdoptCurrentAsProfile(activeID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range after.LLMProfiles {
+		if p.ID == activeID && p.Model != "deepseek-chat-v2" {
+			t.Fatalf("回写应同步生效值到档案: %+v", p)
+		}
+	}
+	if after.ActiveProfile != activeID {
+		t.Fatal("回写不应改变激活档案")
+	}
+
+	// 不存在的档案
+	if _, err := s.AdoptCurrentAsProfile("ghost", ""); err == nil {
+		t.Fatal("回写不存在的档案应报错")
+	}
+}
