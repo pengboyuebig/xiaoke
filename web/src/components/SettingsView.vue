@@ -2,6 +2,8 @@
 import { computed, onMounted, reactive, ref, watch, watchEffect } from 'vue'
 import { api } from '../lib/api'
 import type { Agent, Automation, CustomCommand, LLMProfilePayload, MCPServerCfg, MCPStatus, PermissionRule, SettingsView, Skill, TrashItem } from '../types'
+import type { VersionInfo } from '../lib/api'
+import { renderMarkdown } from '../lib/markdown'
 
 /** 档案的本地编辑态：apiKey 输入框值（空=保持）+ 脱敏信息 + 每档案的拉取/测试状态 */
 interface ProfileEdit extends LLMProfilePayload {
@@ -15,7 +17,7 @@ import { askConfirm } from '../lib/confirm'
 
 const emit = defineEmits<{ close: [] }>()
 
-type Tab = 'agents' | 'skills' | 'llm' | 'mcp' | 'dirs' | 'adv'
+type Tab = 'agents' | 'skills' | 'llm' | 'mcp' | 'dirs' | 'adv' | 'about'
 const tab = ref<Tab>('llm')
 const loading = ref(true)
 const saving = ref(false)
@@ -29,6 +31,7 @@ const TABS: { id: Tab; icon: string; label: string; desc: string }[] = [
   { id: 'mcp', icon: 'plug', label: 'MCP', desc: '外部工具服务' },
   { id: 'dirs', icon: 'folder', label: '目录', desc: '只读授权与项目根' },
   { id: 'adv', icon: 'settings', label: '高级', desc: '轮数与命令白名单' },
+  { id: 'about', icon: 'circle-dot', label: '关于', desc: '版本与更新说明' },
 ]
 
 // ---------- 数据 ----------
@@ -226,8 +229,18 @@ const keyInfo = reactive({ set: false, tail: '' })
 
 const tabMeta = computed(() => TABS.find((t) => t.id === tab.value))
 
+// ---------- 关于（版本信息） ----------
+const ver = ref<VersionInfo | null>(null)
+async function loadVersion() {
+  try {
+    ver.value = await api.getVersion()
+  } catch {
+    ver.value = null
+  }
+}
+
 onMounted(async () => {
-  await Promise.all([loadSettings(), refreshAgents(), refreshSkills(), refreshMcpStatus(), refreshTrash(), loadMemory(), refreshAutomations()])
+  await Promise.all([loadSettings(), refreshAgents(), refreshSkills(), refreshMcpStatus(), refreshTrash(), loadMemory(), refreshAutomations(), loadVersion()])
   loading.value = false
 })
 
@@ -919,7 +932,7 @@ async function save() {
         </section>
 
         <!-- 高级 -->
-        <section v-else class="panel">
+        <section v-else-if="tab === 'adv'" class="panel">
           <div class="panel-head">
             <h2>高级</h2>
             <p>工具循环、上下文与命令执行的边界控制。</p>
@@ -1182,6 +1195,33 @@ async function save() {
           </div>
         </section>
 
+        <section v-else class="panel">
+          <div class="panel-head">
+            <h2>关于</h2>
+            <p>当前版本与本次更新内容。更新说明由发版脚本从 git 提交记录生成，只保留最新一版。</p>
+          </div>
+
+          <div class="grid">
+            <div class="card about-card">
+              <div class="card-title">当前版本</div>
+              <div class="about-ver">
+                <span class="about-num">v{{ ver?.version || '—' }}</span>
+                <span v-if="ver?.date" class="about-date">发布于 {{ ver.date }}</span>
+              </div>
+              <div class="about-app">
+                <b>小柯</b>
+                <span>专属智能体 · Go + Vue · 本地运行</span>
+              </div>
+            </div>
+
+            <div class="card about-notes">
+              <div class="card-title">本次更新</div>
+              <div v-if="ver?.notes" class="about-md md" v-html="renderMarkdown(ver.notes)"></div>
+              <div v-else class="hint">暂无更新说明（可能是后端版本较旧，或尚未发版）。</div>
+            </div>
+          </div>
+        </section>
+
         <div v-if="saveErr" class="err-bar"><Icon name="warning" :size="14" /> {{ saveErr }}</div>
       </main>
     </div>
@@ -1193,6 +1233,87 @@ async function save() {
 </template>
 
 <style scoped>
+/* ---------- 关于 ---------- */
+.about-card {
+  justify-content: center;
+  gap: 10px;
+}
+
+.about-ver {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.about-num {
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.about-date {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.about-app {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.about-app b {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.about-notes {
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.about-md {
+  margin-top: 10px;
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--text-muted);
+}
+
+.about-md :deep(h1),
+.about-md :deep(h2),
+.about-md :deep(h3) {
+  margin: 14px 0 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.about-md :deep(h1:first-child),
+.about-md :deep(h2:first-child),
+.about-md :deep(h3:first-child) {
+  margin-top: 0;
+}
+
+.about-md :deep(ul) {
+  margin: 6px 0;
+  padding-left: 18px;
+}
+
+.about-md :deep(li) {
+  margin: 4px 0;
+}
+
+.about-md :deep(code) {
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 11.5px;
+}
+
 .settings-page {
   position: fixed;
   inset: 0;

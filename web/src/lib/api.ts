@@ -20,6 +20,14 @@ import type {
 } from '../types'
 
 /** 一次对话的 token 用量（上游真实 usage 优先，缺失时后端按字节估算） */
+/** 版本信息（设置页「关于」） */
+export interface VersionInfo {
+  version: string
+  date: string
+  /** Markdown 格式的本次更新说明 */
+  notes: string
+}
+
 export interface UsageInfo {
   prompt: number
   completion: number
@@ -118,6 +126,10 @@ export const api = {
   },
   health(): Promise<HealthInfo> {
     return jfetch('/healthz')
+  },
+  /** 当前版本与本次更新说明（设置页「关于」用） */
+  getVersion(): Promise<VersionInfo> {
+    return jfetch('/api/version')
   },
 
   // ---------- 项目 ----------

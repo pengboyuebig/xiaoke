@@ -17,6 +17,7 @@ import (
 	"xiaoke/internal/mcp"
 	"xiaoke/internal/projects"
 	"xiaoke/internal/settings"
+	"xiaoke/internal/version"
 )
 
 type Handler struct {
@@ -32,6 +33,7 @@ func New(cfg *config.Config, set *settings.Store, pm *projects.Manager, mm *mcp.
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/version", h.getVersion)
 	mux.HandleFunc("GET /api/settings", h.getSettings)
 	mux.HandleFunc("PUT /api/settings", h.putSettings)
 	mux.HandleFunc("POST /api/settings/test", h.testLLM)
@@ -48,6 +50,18 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/fs/dirs", h.listDirs)
 	// 按文件夹名查找：拖拽文件夹进窗口时用（浏览器不给绝对路径）
 	mux.HandleFunc("GET /api/fs/find-dir", h.findDir)
+}
+
+// ---------- 版本 ----------
+
+// getVersion 返回当前版本号、发布日期与本次更新说明（设置页「关于」用）。
+// 数据来自 internal/version，由 scripts/release.sh 在发版时自动改写。
+func (h *Handler) getVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"version": version.Version,
+		"date":    version.ReleaseDate,
+		"notes":   version.ReleaseNotes,
+	})
 }
 
 // ---------- 设置 ----------
