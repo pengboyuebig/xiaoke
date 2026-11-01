@@ -67,8 +67,11 @@ else
 fi
 
 # ---------- 更新说明（上一次发版 tag 到 HEAD） ----------
-LAST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
-if [ -n "$LAST_TAG" ]; then
+# 注意：tag 打在 main 的合并提交上，而脚本在 dev 上跑，
+# git describe 找不到「指向 main 的 tag」，所以按版本号取最高的 tag。
+# vX..HEAD 的语义是「HEAD 有、tag 没有的提交」，与祖先关系无关，正好可用。
+LAST_TAG="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)"
+if [ -n "$LAST_TAG" ] && git rev-parse --verify "$LAST_TAG" >/dev/null 2>&1; then
   RANGE="$LAST_TAG..HEAD"
   info "更新说明范围：$LAST_TAG → HEAD"
 else
