@@ -86,6 +86,10 @@ const maxToolResultBytes = 64 * 1024
 // maxToolArgBytes 单次工具调用参数体的字节上限（1MB）。
 const maxToolArgBytes = 1 << 20
 
+// maxNoActionNudges 是「模型只描述将要做什么却没调用工具」时的最大催办次数。
+// 催一次通常就够；给 2 次容错，再多就是模型能力问题，不该继续烧 token。
+const maxNoActionNudges = 2
+
 func NewHandler(cfg *config.Config, st *store.Store, set *settings.Store, pm *projects.Manager, mm *mcp.Manager, ag *agents.Store, sk *skills.Store, mem *memory.Store, rs *rules.Store, cs *cron.Store) *Handler {
 	return &Handler{
 		cfg: cfg, store: st, set: set, projects: pm, mcp: mm, agents: ag, skills: sk,
@@ -109,6 +113,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/trash", h.listTrash)
 	mux.HandleFunc("POST /api/trash/{dir}/restore", h.restoreTrash)
 	mux.HandleFunc("DELETE /api/trash/{dir}", h.purgeTrash)
+	// 批量操作：多选/全选后一次性恢复或彻底删除
+	mux.HandleFunc("POST /api/trash/batch-restore", h.restoreTrashBatch)
+	mux.HandleFunc("POST /api/trash/batch-purge", h.purgeTrashBatch)
 	mux.HandleFunc("POST /api/chat", h.chat)
 	mux.HandleFunc("POST /api/questions/{qid}", h.resolveQuestion)
 	h.RegisterAutomationAPI(mux)
@@ -413,6 +420,87 @@ func (h *Handler) purgeTrash(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusOK, map[string]string{"ok": "1"})
 	}
+}
+
+// trashBatchReq 批量操作的请求体：dir 是回收站目录名列表。
+type trashBatchReq struct {
+	Dirs []string `json:"dirs"`
+}
+
+// maxTrashBatch 单次批量操作的条数上限（防一次误传超大数组打爆磁盘 IO）。
+const maxTrashBatch = 500
+
+// purgeTrashBatch 批量彻底删除。逐条执行，失败的跳过不影响其余，
+// 最后汇总成功数与失败原因回给前端。
+func (h *Handler) purgeTrashBatch(w http.ResponseWriter, r *http.Request) {
+	var in trashBatchReq
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+		return
+	}
+	if len(in.Dirs) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "没有指定要删除的记录"})
+		return
+	}
+	if len(in.Dirs) > maxTrashBatch {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("一次最多删除 %d 条（本次 %d 条）", maxTrashBatch, len(in.Dirs)),
+		})
+		return
+	}
+	ok, errs := h.store.PurgeTrashBatch(in.Dirs)
+	resp := map[string]any{"ok": ok, "failed": len(errs)}
+	if len(errs) > 0 {
+		msgs := make([]string, 0, len(errs))
+		for _, e := range errs {
+			msgs = append(msgs, e.Error())
+		}
+		resp["errors"] = msgs
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// restoreTrashBatch 批量恢复。同样逐条执行并汇总结果
+// （已存在的会话按冲突跳过，不影响其他条目恢复）。
+func (h *Handler) restoreTrashBatch(w http.ResponseWriter, r *http.Request) {
+	var in trashBatchReq
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+		return
+	}
+	if len(in.Dirs) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "没有指定要恢复的记录"})
+		return
+	}
+	if len(in.Dirs) > maxTrashBatch {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("一次最多恢复 %d 条（本次 %d 条）", maxTrashBatch, len(in.Dirs)),
+		})
+		return
+	}
+	ok := 0
+	errs := make([]string, 0, len(in.Dirs))
+	for _, dir := range in.Dirs {
+		id, err := h.store.RestoreTrash(dir)
+		if err != nil {
+			switch {
+			case errors.Is(err, store.ErrSessionExists):
+				errs = append(errs, fmt.Sprintf("%s: 会话已存在，跳过", dir))
+			case errors.Is(err, store.ErrTrashNotFound):
+				errs = append(errs, fmt.Sprintf("%s: 记录不存在", dir))
+			default:
+				errs = append(errs, fmt.Sprintf("%s: %v", dir, err))
+			}
+			continue
+		}
+		_ = id
+		ok++
+	}
+	resp := map[string]any{"ok": ok, "failed": len(errs)}
+	if len(errs) > 0 {
+		resp["errors"] = errs
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // serveDownload 以附件形式返回数据（浏览器直接触发下载）。
@@ -913,6 +1001,13 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 			content += "\n\n【当前待办（压缩后仍然有效，完成一项就更新一次）】\n" + todosText(todos)
 		}
 		convo = append(convo, ChatMessage{Role: "system", Content: content})
+	} else if todos := pendingTodos(full.Todos); len(todos) > 0 {
+		// 没有摘要时也要注入未完成待办：否则模型在后续轮次里看不到任务进度，
+		// 容易把「之前说要做的」当成已经做过，或者忘了自己列过哪些步骤。
+		convo = append(convo, ChatMessage{
+			Role:    "system",
+			Content: "【当前待办（这些还没完成，接着往下做；完成一项就更新状态）】\n" + todosText(todos),
+		})
 	}
 	// todo 提醒（对标 todo nudge）：这条请求看起来是多步任务，但会话还没有待办——
 	// 注入一条系统提醒引导模型先建清单。已有待办（或不像多步任务）时不打扰。
@@ -1073,6 +1168,10 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 	// doomLoop 检测：完全相同的一批工具调用连续重复 ≥3 轮时注入提醒，防模型死循环。
 	var lastSig string
 	sigRuns := 0
+	// 光说不做的催办计数：同一回合最多催 2 次，避免无限刷屏。
+	// 只在 build 模式生效——plan 模式「输出计划后就停」是设计意图。
+	nudgeRuns := 0
+	multiStep := stepHintPattern.MatchString(p.Content)
 	for step := 0; step < maxSteps; step++ {
 		content, calls, err := streamFn(ctx, effAsConfig(eff), convo, defs, hooks, reasoning)
 		if err != nil {
@@ -1086,6 +1185,24 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 			if strings.TrimSpace(content) == "" {
 				send(map[string]any{"type": "error", "error": "上游没有返回内容"})
 				return nil
+			}
+			// 光说不做：模型描述了「我先看一下 / 开工前先建待办 / 接下来我要…」，
+			// 却一个工具都没调。此时直接把回合结束会让任务原地不动——追加一条
+			// 催办消息继续循环，逼它真的动手。最多催 2 次，之后正常收尾。
+			if !planMode && nudgeRuns < maxNoActionNudges &&
+				promiseButNoAction(content, full.Todos, multiStep) {
+				nudgeRuns++
+				// 把这段「空承诺」作为 assistant 消息留在上下文里，
+				// 让模型自己看到「我说了要做但没做」。
+				convo = append(convo, ChatMessage{Role: "assistant", Content: content})
+				convo = append(convo, ChatMessage{
+					Role: "user",
+					Content: "（系统提醒：你刚才的回复只描述了「将要做什么」，但没有调用任何工具，" +
+						"所以那些事一件都还没做。现在立刻动手：要么调用工具把下一步真正执行掉，" +
+						"要么明确说明为什么无法执行（缺什么信息、卡在哪）。" +
+						"不要再用「我先…」「接下来我…」这类描述代替行动。）",
+				})
+				continue
 			}
 			if err := h.store.Append(sess.ID, store.Message{
 				Role: "assistant", Content: content, CreatedAt: time.Now(),
@@ -1364,6 +1481,45 @@ func planOrBuildNeedsNudge(content string, todos []store.Todo) bool {
 	}
 	return hits >= 3
 }
+
+// futureTensePattern 匹配「只描述将要做什么、却没有真的动手」的中文未来时句式。
+// 命中只是嫌疑，还要结合「有没有未完成待办 / 请求是否多步」才判定。
+//
+// 刻意收紧：裸的「先看」「先读」不算（「先看结论：…」是常见行文习惯，
+// 不是行动承诺）。只认明确的未来时标记，或「先 + 明确要动手的动词」。
+var futureTensePattern = regexp.MustCompile(`我将会|我这就|接下来我|下面我(?:们)?(?:要|将|会)|` +
+	`(?:即将|马上|立刻就?)(?:开始|动手|执行)|` +
+	`先(?:把|去)(?:[^，。；\n]{0,12})(?:写|建|搭|做|装|改|配|创建|安装|配置|实现|开始|动手)|` +
+	`先(?:建|写|搭|创建|安装|配置|实现)`)
+
+// promiseButNoAction 判断这一轮的纯文本回复是不是「光说不做」：
+// 模型描述了接下来要做的动作，却没有发出任何工具调用。
+//
+// 判定条件（三者同时满足，宁缺毋滥，避免误催）：
+//  1. 文本里有未来时叙述（我先看一下 / 开工前先建待办 / 接下来我要…）
+//  2. 文本没有「已完成/已创建/已经…」这类完成时收尾信号
+//  3. 上下文里确实有未完成的工作（未完成待办，或多步请求）
+func promiseButNoAction(content string, todos []store.Todo, multiStep bool) bool {
+	if strings.TrimSpace(content) == "" {
+		return false
+	}
+	if !futureTensePattern.MatchString(content) {
+		return false
+	}
+	// 已经明确说「做完了」就不催
+	if doneMarkPattern.MatchString(content) {
+		return false
+	}
+	// 有未完成待办，或这条请求本身是多步任务，才算「该动手却没动手」
+	return len(pendingTodos(todos)) > 0 || multiStep
+}
+
+// doneMarkPattern 是「已经完成」的收尾信号，出现即认为不是光说不做。
+// 覆盖「先看了…然后创建了…」这类先动作后完成的叙述。
+var doneMarkPattern = regexp.MustCompile(`已完成|已经(?:完成|创建|写好|做完|改好|建好|跑通|验证|安装好|确认|检查|核实|读过|看过)|` +
+	`全部完成|都做完了|写好了|改好了|建好了|跑通了|创建了|写入了|改了|装了|建了|搭了|配好了|` +
+	`已创建|已写入|已修改|已安装|已配置|` +
+	`已(?:确认|核实|检查|读|看|跑|测|验证|发现|查到)`)
 
 // toolOutcome 是一次工具执行的完整结果（SSE 已在执行中发出，这里供落库/回填）。
 type toolOutcome struct {
