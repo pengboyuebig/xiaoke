@@ -1,5 +1,7 @@
 import type {
   Agent,
+  FindDirResp,
+  FsDirsResp,
   HealthInfo,
   ListResponse,
   MCPStatus,
@@ -12,6 +14,7 @@ import type {
   Skill,
   Todo,
   TrashItem,
+  TrashBatchResult,
   TreeItem,
   Automation,
 } from '../types'
@@ -105,6 +108,14 @@ export const api = {
   purgeTrash(dir: string): Promise<{ ok: string }> {
     return jfetch(`/api/trash/${encodeURIComponent(dir)}`, { method: 'DELETE' })
   },
+  /** 批量恢复（多选/全选后用） */
+  restoreTrashBatch(dirs: string[]): Promise<TrashBatchResult> {
+    return jfetch('/api/trash/batch-restore', jsonBody('POST', { dirs }))
+  },
+  /** 批量彻底删除（多选/全选后用） */
+  purgeTrashBatch(dirs: string[]): Promise<TrashBatchResult> {
+    return jfetch('/api/trash/batch-purge', jsonBody('POST', { dirs }))
+  },
   health(): Promise<HealthInfo> {
     return jfetch('/healthz')
   },
@@ -121,6 +132,16 @@ export const api = {
   },
   projectTree(id: string): Promise<{ tree: TreeItem[] }> {
     return jfetch(`/api/projects/${id}/tree`)
+  },
+  /** 列出某目录下的子目录（新建项目的文件夹选择器用；path 空 = 默认项目根目录） */
+  listDirs(path?: string): Promise<FsDirsResp> {
+    const q = path ? `?path=${encodeURIComponent(path)}` : ''
+    return jfetch(`/api/fs/dirs${q}`)
+  },
+  /** 按文件夹名查找同名目录（拖拽文件夹进窗口用；浏览器不暴露绝对路径） */
+  findDir(name: string, deep = false): Promise<FindDirResp> {
+    const q = `?name=${encodeURIComponent(name)}${deep ? '&deep=1' : ''}`
+    return jfetch(`/api/fs/find-dir${q}`)
   },
 
   // ---------- 智能体 ----------

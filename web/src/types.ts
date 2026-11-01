@@ -109,6 +109,13 @@ export interface TrashItem {
   sizeBytes: number
 }
 
+/** 批量恢复/彻底删除的结果 */
+export interface TrashBatchResult {
+  ok: number
+  failed: number
+  errors?: string[]
+}
+
 export interface Session {
   id: string
   title: string
@@ -145,6 +152,32 @@ export interface Project {
   path: string
   template?: string
   createdAt: string
+}
+
+/** 目录浏览接口返回（新建项目的文件夹选择器用） */
+export interface FsDirEntry {
+  name: string
+  path: string
+}
+
+export interface FsDirsResp {
+  path: string
+  name: string
+  /** 上级目录绝对路径；空 = 已到顶 */
+  parent: string
+  dirs: FsDirEntry[]
+  /** 是否因 500 条上限被截断 */
+  truncated: boolean
+  /** 可快速跳转的根（Windows 盘符） */
+  roots: string[]
+}
+
+/** 按文件夹名查找的结果（拖拽文件夹用） */
+export interface FindDirResp {
+  query: string
+  dirs: FsDirEntry[]
+  /** 是否因搜索预算/上限提前结束（结果可能不全） */
+  truncated: boolean
 }
 
 // ---------- 智能体 ----------

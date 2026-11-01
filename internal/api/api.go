@@ -44,6 +44,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/projects", h.createProject)
 	mux.HandleFunc("DELETE /api/projects/{id}", h.deleteProject)
 	mux.HandleFunc("GET /api/projects/{id}/tree", h.projectTree)
+	// 目录浏览：新建项目的「创建位置」文件夹选择器用
+	mux.HandleFunc("GET /api/fs/dirs", h.listDirs)
+	// 按文件夹名查找：拖拽文件夹进窗口时用（浏览器不给绝对路径）
+	mux.HandleFunc("GET /api/fs/find-dir", h.findDir)
 }
 
 // ---------- 设置 ----------
