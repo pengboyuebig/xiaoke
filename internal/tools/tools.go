@@ -267,7 +267,23 @@ func (e *Env) resolveWrite(p string) (string, error) {
 	if p == "" {
 		return "", fmt.Errorf("路径不能为空")
 	}
+	if err := rejectNonPathScheme(p); err != nil {
+		return "", err
+	}
 	return safeJoin(e.Workspace, p)
+}
+
+// rejectNonPathScheme 拒绝把 URL/协议前缀当路径的输入。
+// 这类输入在 Windows 上 filepath.IsAbs 为 false，会被 Join 成
+// "workspaceile:\etc\passwd" 这种既非用户本意、又难排查的怪路径。
+func rejectNonPathScheme(p string) error {
+	lower := strings.ToLower(p)
+	for _, scheme := range []string{"file://", "http://", "https://", "ftp://", "data:", "javascript:"} {
+		if strings.HasPrefix(lower, scheme) {
+			return fmt.Errorf("路径不能是 URL（%q 看起来是链接而非文件路径）：请给出项目内的相对路径或绝对路径", p)
+		}
+	}
+	return nil
 }
 
 // safeJoin 把用户相对路径安全地拼到 root 下，拒绝一切逃逸（..、绝对路径注入、盘符），

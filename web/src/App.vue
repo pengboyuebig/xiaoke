@@ -34,6 +34,10 @@ const lastUsage = ref<UsageInfo | null>(null)
 // 本会话累计用量（服务端会话快照累计；切会话/每次请求结束后刷新）
 const sessionUsage = ref<{ prompt: number; completion: number; requests: number } | null>(null)
 
+// 后端 AskWait 的超时是 5 分钟（questions.go: questionTimeout）；
+// 前端留 30 秒余量，保证弹窗总在后端失效前收起。
+const ASK_TIMEOUT_MS = 4.5 * 60 * 1000
+
 // ask 交互（ask_user 提问 / ask 模式审批）：SSE ask 事件 → 弹窗 → POST 回答
 interface AskRequest {
   id: string
@@ -44,6 +48,8 @@ interface AskRequest {
   tool?: string
   summary?: string
   resolve: (answer: string) => void
+  /** 超时自动关闭的定时器句柄（后端 5 分钟超时后弹窗不能永久残留） */
+  timer?: number
 }
 const askQueue = ref<AskRequest[]>([])
 // AskDialog 一次只展示队首；并行工具/子代理可同时提问，排队逐个回答
@@ -54,11 +60,15 @@ function handleAsk(req: AskRequest) {
 function handleAskAnswer(answer: string) {
   const req = askQueue.value.shift()
   if (!req) return
+  if (req.timer) window.clearTimeout(req.timer)
   req.resolve(answer) // POST 投递由 api.ts 的 SSE 循环统一处理
 }
 function clearAskQueue() {
   // 流结束/出错：未决提问全部按「跳过」结清，弹窗不残留
-  for (const req of askQueue.value) req.resolve('')
+  for (const req of askQueue.value) {
+    if (req.timer) window.clearTimeout(req.timer)
+    req.resolve('')
+  }
   askQueue.value = []
 }
 
@@ -528,9 +538,16 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
         sessionTodos.value = todos
       },
       onAsk: (req) => {
-        // SSE ask 事件：挂起等待用户操作（返回的 promise 由按钮点击 resolve）
+        // SSE ask 事件：挂起等待用户操作（返回的 promise 由按钮点击 resolve）。
+        // 后端 AskWait 有 5 分钟超时（超时后工具按「未响应」继续跑），前端必须
+        // 同步收起弹窗——否则用户 5 分钟后点「回答」会 POST 到已失效的 qid。
         return new Promise<string>((resolve) => {
-          handleAsk({ ...req, resolve })
+          const timer = window.setTimeout(() => {
+            const idx = askQueue.value.findIndex((q) => q.resolve === resolve)
+            if (idx >= 0) askQueue.value.splice(idx, 1)
+            resolve('') // 与「跳过」同语义：按最佳判断继续
+          }, ASK_TIMEOUT_MS)
+          handleAsk({ ...req, resolve, timer })
         })
       },
       onDone: (usage) => {
