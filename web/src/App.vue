@@ -6,6 +6,7 @@ import type { UsageInfo } from './lib/api'
 import SideBar from './components/SideBar.vue'
 import ChatView from './components/ChatView.vue'
 import Composer from './components/Composer.vue'
+import TodoPanel from './components/TodoPanel.vue'
 import SettingsView from './components/SettingsView.vue'
 import ProjectModal from './components/ProjectModal.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
@@ -838,42 +839,47 @@ function onSettingsClosed() {
           <Icon name="x" :size="11" :stroke="2" />
         </span>
       </div>
-      <ChatView
-        :turns="turns"
-        :streaming="streaming"
-        :streaming-text="streamingText"
-        :live-tools="liveTools"
-        :error="error"
-        :greeting="greeting"
-        :empty-project-hint="emptyProjectHint"
-        :current-project="currentProject"
-        :agent="currentAgent"
-        :messages="messages"
-        :awaiting-approval="planAwaitingApproval"
-        :todos="sessionTodos"
-        :last-usage="lastUsage"
-        @approve="handleApprove"
-        @approve-custom="handleApproveCustom"
-        @adjust-plan="handleAdjustPlan"
-        @quick="handleSend"
-        @revert="handleRevert"
-      />
-      <Composer
-        :busy="streaming"
-        :reasoning="reasoning"
-        :mode="workMode"
-        :session-id="currentId"
-        :commands="slashCommands"
-        :profiles="modelProfiles"
-        :active-profile="activeProfile"
-        :model-name="model"
-        :session-usage="sessionUsage"
-        @activate-model="activateModel"
-        @send="handleSend"
-        @stop="handleStop"
-        @update:reasoning="setReasoning"
-        @set-mode="onModeChange"
-      />
+      <div class="main-body">
+        <div class="main-col">
+          <ChatView
+            :turns="turns"
+            :streaming="streaming"
+            :streaming-text="streamingText"
+            :live-tools="liveTools"
+            :error="error"
+            :greeting="greeting"
+            :empty-project-hint="emptyProjectHint"
+            :current-project="currentProject"
+            :agent="currentAgent"
+            :messages="messages"
+            :awaiting-approval="planAwaitingApproval"
+            :last-usage="lastUsage"
+            @approve="handleApprove"
+            @approve-custom="handleApproveCustom"
+            @adjust-plan="handleAdjustPlan"
+            @quick="handleSend"
+            @revert="handleRevert"
+          />
+          <Composer
+            :busy="streaming"
+            :reasoning="reasoning"
+            :mode="workMode"
+            :session-id="currentId"
+            :commands="slashCommands"
+            :profiles="modelProfiles"
+            :active-profile="activeProfile"
+            :model-name="model"
+            :session-usage="sessionUsage"
+            @activate-model="activateModel"
+            @send="handleSend"
+            @stop="handleStop"
+            @update:reasoning="setReasoning"
+            @set-mode="onModeChange"
+          />
+        </div>
+        <!-- 右侧待办面板：可收起为竖条，用户自行决定是否展开 -->
+        <TodoPanel :todos="sessionTodos" />
+      </div>
     </main>
 
     <SettingsView v-if="settingsOpen" @close="settingsOpen = false; onSettingsClosed()" />
@@ -900,6 +906,20 @@ function onSettingsClosed() {
   display: flex;
   flex-direction: column;
   background: transparent;
+}
+
+/* 主体区：左侧聊天列 + 右侧待办面板 */
+.main-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.main-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .proj-banner {
