@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -46,8 +45,7 @@ func (h *Handler) listAgents(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) createAgent(w http.ResponseWriter, r *http.Request) {
 	var in agents.Agent
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+	if !decodeJSON(w, r, &in) {
 		return
 	}
 	a, err := h.Res.Agents.Create(in)
@@ -60,13 +58,20 @@ func (h *Handler) createAgent(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) updateAgent(w http.ResponseWriter, r *http.Request) {
 	var in agents.Agent
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+	if !decodeJSON(w, r, &in) {
 		return
 	}
 	a, err := h.Res.Agents.Update(r.PathValue("id"), in)
 	if errors.Is(err, agents.ErrNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "智能体不存在"})
+		return
+	}
+	if errors.Is(err, agents.ErrBuiltin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, agents.ErrDuplicateName) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
 	if err != nil {
@@ -80,6 +85,14 @@ func (h *Handler) deleteAgent(w http.ResponseWriter, r *http.Request) {
 	err := h.Res.Agents.Delete(r.PathValue("id"))
 	if errors.Is(err, agents.ErrNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "智能体不存在"})
+		return
+	}
+	if errors.Is(err, agents.ErrBuiltin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, agents.ErrDuplicateName) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
 	if err != nil {
@@ -101,6 +114,10 @@ func (h *Handler) toggleAgentTools(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	if a.Builtin {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": agents.ErrBuiltin.Error()})
+		return
+	}
 	a.Tools = !a.Tools
 	out, err := h.Res.Agents.Update(id, a)
 	if err != nil {
@@ -118,8 +135,7 @@ func (h *Handler) listSkills(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) createSkill(w http.ResponseWriter, r *http.Request) {
 	var in skills.Skill
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+	if !decodeJSON(w, r, &in) {
 		return
 	}
 	s, err := h.Res.Skills.Create(in)
@@ -132,8 +148,7 @@ func (h *Handler) createSkill(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) updateSkill(w http.ResponseWriter, r *http.Request) {
 	var in skills.Skill
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+	if !decodeJSON(w, r, &in) {
 		return
 	}
 	s, err := h.Res.Skills.Update(r.PathValue("id"), in)

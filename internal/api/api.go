@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"xiaoke/internal/mcp"
 	"xiaoke/internal/projects"
 	"xiaoke/internal/settings"
+	"xiaoke/internal/version"
 )
 
 type Handler struct {
@@ -31,16 +33,35 @@ func New(cfg *config.Config, set *settings.Store, pm *projects.Manager, mm *mcp.
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/version", h.getVersion)
 	mux.HandleFunc("GET /api/settings", h.getSettings)
 	mux.HandleFunc("PUT /api/settings", h.putSettings)
 	mux.HandleFunc("POST /api/settings/test", h.testLLM)
 	mux.HandleFunc("GET /api/models", h.listModels)
+	mux.HandleFunc("POST /api/models/activate", h.activateProfile)
+	mux.HandleFunc("POST /api/models/adopt", h.adoptCurrentLLM)
 	mux.HandleFunc("GET /api/mcp/status", h.mcpStatus)
 	mux.HandleFunc("POST /api/mcp/retry", h.retryMCP)
 	mux.HandleFunc("GET /api/projects", h.listProjects)
 	mux.HandleFunc("POST /api/projects", h.createProject)
 	mux.HandleFunc("DELETE /api/projects/{id}", h.deleteProject)
 	mux.HandleFunc("GET /api/projects/{id}/tree", h.projectTree)
+	// 目录浏览：新建项目的「创建位置」文件夹选择器用
+	mux.HandleFunc("GET /api/fs/dirs", h.listDirs)
+	// 按文件夹名查找：拖拽文件夹进窗口时用（浏览器不给绝对路径）
+	mux.HandleFunc("GET /api/fs/find-dir", h.findDir)
+}
+
+// ---------- 版本 ----------
+
+// getVersion 返回当前版本号、发布日期与本次更新说明（设置页「关于」用）。
+// 数据来自 internal/version，由 scripts/release.sh 在发版时自动改写。
+func (h *Handler) getVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"version": version.Version,
+		"date":    version.ReleaseDate,
+		"notes":   version.ReleaseNotes,
+	})
 }
 
 // ---------- 设置 ----------
@@ -48,20 +69,56 @@ func (h *Handler) Register(mux *http.ServeMux) {
 // settingsView 是给前端的设置视图：apiKey 永不下发，只给「是否已配置 + 尾 4 位」。
 type settingsView struct {
 	LLM struct {
-		Mode        string  `json:"mode"`
-		BaseURL     string  `json:"baseURL"`
-		APIKeySet   bool    `json:"apiKeySet"`
-		APIKeyTail  string  `json:"apiKeyTail"`
-		Model       string  `json:"model"`
-		Temperature float64 `json:"temperature"`
-		MaxHistory  int     `json:"maxHistory"`
+		Mode          string  `json:"mode"`
+		BaseURL       string  `json:"baseURL"`
+		APIKeySet     bool    `json:"apiKeySet"`
+		APIKeyTail    string  `json:"apiKeyTail"`
+		Model         string  `json:"model"`
+		SmallModel    string  `json:"smallModel"`
+		Temperature   float64 `json:"temperature"`
+		MaxHistory    int     `json:"maxHistory"`
+		MaxTokens     int     `json:"maxTokens"`
+		ContextWindow int     `json:"contextWindow"`
 	} `json:"llm"`
-	MCPServers            []settings.MCPServer `json:"mcpServers"`
-	ReadDirs              []string             `json:"readDirs"`
-	ProjectsRoot          string               `json:"projectsRoot"`
-	ProjectsRootEffective string               `json:"projectsRootEffective"`
-	MaxToolSteps          int                  `json:"maxToolSteps"`
-	CommandAllowlist      []string             `json:"commandAllowlist"`
+	MCPServers            []settings.MCPServer      `json:"mcpServers"`
+	ReadDirs              []string                  `json:"readDirs"`
+	ProjectsRoot          string                    `json:"projectsRoot"`
+	ProjectsRootEffective string                    `json:"projectsRootEffective"`
+	MaxToolSteps          int                       `json:"maxToolSteps"`
+	MaxTotalSteps         int                       `json:"maxTotalSteps"`
+	CommandAllowlist      []string                  `json:"commandAllowlist"`
+	AutoCompact           bool                      `json:"autoCompact"`
+	CompactKeepCount      int                       `json:"compactKeepCount"`
+	CommandTimeoutSec     int                       `json:"commandTimeoutSec"`
+	Permissions           []settings.PermissionRule `json:"permissions"`
+	Commands              []settings.CustomCommand  `json:"commands"`
+	Profiles              []llmProfileView          `json:"profiles"`
+	ActiveProfile         string                    `json:"activeProfile"`
+}
+
+// llmProfileView 是档案的前端视图：apiKey 永不明文下发，只给「是否已配置 + 尾 4 位」。
+type llmProfileView struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Mode       string `json:"mode"`
+	BaseURL    string `json:"baseURL"`
+	APIKeySet  bool   `json:"apiKeySet"`
+	APIKeyTail string `json:"apiKeyTail,omitempty"`
+	Model      string `json:"model"`
+	SmallModel string `json:"smallModel,omitempty"`
+}
+
+// profileViews 把档案列表转成脱敏视图。
+func profileViews(profiles []settings.LLMProfile) []llmProfileView {
+	out := make([]llmProfileView, 0, len(profiles))
+	for _, p := range profiles {
+		has, tail := settings.MaskKey(p.APIKey)
+		out = append(out, llmProfileView{
+			ID: p.ID, Name: p.Name, Mode: p.Mode, BaseURL: p.BaseURL,
+			APIKeySet: has, APIKeyTail: tail, Model: p.Model, SmallModel: p.SmallModel,
+		})
+	}
+	return out
 }
 
 func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
@@ -72,20 +129,38 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 		ProjectsRoot:          s.ProjectsRoot,
 		ProjectsRootEffective: h.projects.Root(),
 		MaxToolSteps:          s.MaxToolSteps,
+		MaxTotalSteps:         s.MaxTotalSteps,
 		CommandAllowlist:      s.CommandAllowlist,
+		Permissions:           s.Permissions,
+		Commands:              s.Commands,
+		Profiles:              profileViews(s.LLMProfiles),
+		ActiveProfile:         s.ActiveProfile,
 	}
 	v.LLM.Mode = s.LLM.Mode
 	v.LLM.BaseURL = s.LLM.BaseURL
 	v.LLM.APIKeySet, v.LLM.APIKeyTail = settings.MaskKey(s.LLM.APIKey)
 	v.LLM.Model = s.LLM.Model
+	v.LLM.SmallModel = s.LLM.SmallModel
 	v.LLM.Temperature = s.LLM.Temperature
 	v.LLM.MaxHistory = s.LLM.MaxHistory
+	v.LLM.MaxTokens = s.LLM.MaxTokens
+	v.LLM.ContextWindow = s.LLM.ContextWindow
+	v.AutoCompact = s.AutoCompact
+	v.CompactKeepCount = s.CompactKeepCount
+	v.CommandTimeoutSec = s.CommandTimeoutSec
 	writeJSON(w, http.StatusOK, v)
 }
 
 func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
+	// 设置体很小，1MB 是宽容上限：decode 前先拦，防程序化调用把超大 body 读进内存
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var in settings.Settings
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "请求体过大"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
 		return
 	}
@@ -100,6 +175,19 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 	} else if clearKey {
 		empty := ""
 		newKey = &empty
+	}
+	// 档案 apiKey 合并：前端永远不回传明文 key，空串 = 保持该档案原有 key
+	//（按 ID 匹配）；新档案 key 非空才存。
+	if len(in.LLMProfiles) > 0 {
+		oldKeys := map[string]string{}
+		for _, p := range h.set.Get().LLMProfiles {
+			oldKeys[p.ID] = p.APIKey
+		}
+		for i := range in.LLMProfiles {
+			if in.LLMProfiles[i].APIKey == "" {
+				in.LLMProfiles[i].APIKey = oldKeys[in.LLMProfiles[i].ID]
+			}
+		}
 	}
 	if err := h.set.Update(in, newKey); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -119,6 +207,50 @@ func lookClearKey(r *http.Request) (bool, bool) {
 	return v == "true" || v == "1", true
 }
 
+// activateProfile 处理 POST /api/models/activate {id}：把指定档案的值拷入
+// 当前生效配置（LLM 字段）并记为激活，热生效即时。返回最新设置视图。
+func (h *Handler) activateProfile(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ID string `json:"id"`
+	}
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if strings.TrimSpace(in.ID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "需要档案 id"})
+		return
+	}
+	if _, err := h.set.ActivateProfile(strings.TrimSpace(in.ID)); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	h.getSettings(w, r)
+}
+
+// adoptCurrentLLM 处理 POST /api/models/adopt {id?, name?}：把当前生效配置
+// （含真实 Key）收编为档案——id 空 = 新建并激活（未绑定档案/旧版本升级场景）；
+// id 非空 = 回写该档案（编辑激活档案后生效值同步回去）。
+func (h *Handler) adoptCurrentLLM(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ID   string `json:"id,omitempty"`
+		Name string `json:"name,omitempty"`
+	}
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if _, err := h.set.AdoptCurrentAsProfile(strings.TrimSpace(in.ID), strings.TrimSpace(in.Name)); err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "不存在") {
+			status = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "已满") {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	h.getSettings(w, r)
+}
+
 // testReq 是「测试连接」的请求体；空字段沿用当前已保存配置。
 type testReq struct {
 	BaseURL string `json:"baseURL"`
@@ -129,7 +261,7 @@ type testReq struct {
 // testLLM 用给定配置请求上游 /models，验证 baseURL+key 是否可用。
 func (h *Handler) testLLM(w http.ResponseWriter, r *http.Request) {
 	var in testReq
-	_ = json.NewDecoder(r.Body).Decode(&in)
+	_ = decodeJSON(w, r, &in)
 	eff := h.set.Effective()
 	if in.BaseURL != "" {
 		eff.BaseURL = in.BaseURL
@@ -182,12 +314,17 @@ func fetchModels(ctx context.Context, baseURL, apiKey string) ([]string, error) 
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("请求 %s 失败: %w", url, err)
+		// 脱敏：URL 里可能带 user:pass@ 凭据，错误信息会回显到前端
+		return nil, fmt.Errorf("请求 %s 失败: %w", maskURLCreds(url), maskErrCreds(err, apiKey))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("上游返回 %s: %s", resp.Status, strings.TrimSpace(string(body[:min(len(body), 300)])))
+		snippet := strings.TrimSpace(string(body[:min(len(body), 300)]))
+		if k := strings.TrimSpace(apiKey); k != "" {
+			snippet = strings.ReplaceAll(snippet, k, "***")
+		}
+		return nil, fmt.Errorf("上游返回 %s: %s", resp.Status, snippet)
 	}
 	var wrap struct {
 		Data []struct {
@@ -294,8 +431,49 @@ func genID() string {
 	return string(out)
 }
 
+// decodeJSON 统一的请求体解码：1MB 上限（decode 前生效的内存保护），
+// 超限 413、坏 JSON 400；返回 false 表示已写响应，调用方直接 return。
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "请求体过大（上限 1MB）"})
+			return false
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+		return false
+	}
+	return true
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// maskURLCreds 去掉 URL 里的 userinfo（user:pass@host → host），避免凭据回显。
+func maskURLCreds(raw string) string {
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.User != nil {
+		u.User = nil
+	}
+	return u.String()
+}
+
+// maskErrCreds 把错误文本里出现的 API Key 替换成 ***（网络库错误偶尔会带上完整 URL）。
+func maskErrCreds(err error, apiKey string) error {
+	if err == nil {
+		return nil
+	}
+	k := strings.TrimSpace(apiKey)
+	if k == "" {
+		return err
+	}
+	msg := strings.ReplaceAll(err.Error(), k, "***")
+	return fmt.Errorf("%s", msg)
 }

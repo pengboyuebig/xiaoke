@@ -1,5 +1,7 @@
 import type {
   Agent,
+  FindDirResp,
+  FsDirsResp,
   HealthInfo,
   ListResponse,
   MCPStatus,
@@ -10,8 +12,26 @@ import type {
   SettingsPayload,
   SettingsView,
   Skill,
+  Todo,
+  TrashItem,
+  TrashBatchResult,
   TreeItem,
+  Automation,
 } from '../types'
+
+/** 一次对话的 token 用量（上游真实 usage 优先，缺失时后端按字节估算） */
+/** 版本信息（设置页「关于」） */
+export interface VersionInfo {
+  version: string
+  date: string
+  /** Markdown 格式的本次更新说明 */
+  notes: string
+}
+
+export interface UsageInfo {
+  prompt: number
+  completion: number
+}
 
 async function jfetch<T>(input: string, init?: RequestInit): Promise<T> {
   const res = await fetch(input, init)
@@ -43,8 +63,18 @@ export interface ChatOptions {
   approve?: boolean
   signal?: AbortSignal
   onDelta: (text: string) => void
-  onToolStart?: (name: string, args: string) => void
-  onToolResult?: (info: { name: string; ok: boolean; preview: string; error?: string; ms: number }) => void
+  /** 本次请求触发了上下文压缩：covered 是被摘要覆盖的消息数 */
+  onCompact?: (covered: number) => void
+  onToolStart?: (name: string, args: string, id: string) => void
+  onToolResult?: (info: { id: string; name: string; ok: boolean; preview: string; error?: string; ms: number; diff?: string }) => void
+  /** 上游临时故障即将重试：attempt 从 1 开始，delayMs 为本次退避 */
+  onRetry?: (info: { attempt: number; maxAttempts: number; delayMs: number; reason: string }) => void
+  /** 待办清单更新（todo_write 工具执行成功后推送） */
+  onTodo?: (todos: Todo[]) => void
+  /** ask_user 提问 / ask 模式审批：返回的 Promise 在用户作答后 resolve */
+  onAsk?: (req: { id: string; kind: 'question' | 'permission'; question?: string; options?: string[]; multiSelect?: boolean; tool?: string; summary?: string }) => Promise<string>
+  /** 对话结束：携带本次累计的 token 用量 */
+  onDone?: (usage?: UsageInfo) => void
 }
 
 export const api = {
@@ -61,8 +91,45 @@ export const api = {
   deleteSession(id: string): Promise<void> {
     return jfetch(`/api/sessions/${id}`, { method: 'DELETE' })
   },
+  renameSession(id: string, title: string): Promise<{ ok: string; title: string }> {
+    return jfetch(`/api/sessions/${id}/title`, jsonBody('PUT', { title }))
+  },
+  /** 回退会话到第 index 条用户消息（含）：之后的消息删除，期间被改写的文件恢复 */
+  revertSession(id: string, index: number): Promise<{ index: number; files: { path: string; action: string; reason?: string }[] }> {
+    return jfetch(`/api/sessions/${id}/revert`, jsonBody('POST', { index }))
+  },
+  /** 分叉会话：复制全部消息为新会话 */
+  forkSession(id: string): Promise<{ id: string; title: string; messages: number }> {
+    return jfetch(`/api/sessions/${id}/fork`, { method: 'POST' })
+  },
+  /** 跨会话全文搜索消息内容 */
+  search(q: string): Promise<{ q: string; hits: { sessionId: string; title: string; role: string; snippet: string }[] }> {
+    return jfetch(`/api/search?q=${encodeURIComponent(q)}`)
+  },
+  // ---------- 回收站 ----------
+  listTrash(): Promise<{ items: TrashItem[] }> {
+    return jfetch('/api/trash')
+  },
+  restoreTrash(dir: string): Promise<{ ok: string; id: string }> {
+    return jfetch(`/api/trash/${encodeURIComponent(dir)}/restore`, { method: 'POST' })
+  },
+  purgeTrash(dir: string): Promise<{ ok: string }> {
+    return jfetch(`/api/trash/${encodeURIComponent(dir)}`, { method: 'DELETE' })
+  },
+  /** 批量恢复（多选/全选后用） */
+  restoreTrashBatch(dirs: string[]): Promise<TrashBatchResult> {
+    return jfetch('/api/trash/batch-restore', jsonBody('POST', { dirs }))
+  },
+  /** 批量彻底删除（多选/全选后用） */
+  purgeTrashBatch(dirs: string[]): Promise<TrashBatchResult> {
+    return jfetch('/api/trash/batch-purge', jsonBody('POST', { dirs }))
+  },
   health(): Promise<HealthInfo> {
     return jfetch('/healthz')
+  },
+  /** 当前版本与本次更新说明（设置页「关于」用） */
+  getVersion(): Promise<VersionInfo> {
+    return jfetch('/api/version')
   },
 
   // ---------- 项目 ----------
@@ -77,6 +144,16 @@ export const api = {
   },
   projectTree(id: string): Promise<{ tree: TreeItem[] }> {
     return jfetch(`/api/projects/${id}/tree`)
+  },
+  /** 列出某目录下的子目录（新建项目的文件夹选择器用；path 空 = 默认项目根目录） */
+  listDirs(path?: string): Promise<FsDirsResp> {
+    const q = path ? `?path=${encodeURIComponent(path)}` : ''
+    return jfetch(`/api/fs/dirs${q}`)
+  },
+  /** 按文件夹名查找同名目录（拖拽文件夹进窗口用；浏览器不暴露绝对路径） */
+  findDir(name: string, deep = false): Promise<FindDirResp> {
+    const q = `?name=${encodeURIComponent(name)}${deep ? '&deep=1' : ''}`
+    return jfetch(`/api/fs/find-dir${q}`)
   },
 
   // ---------- 智能体 ----------
@@ -139,12 +216,46 @@ export const api = {
   listModels(): Promise<{ models: string[]; error?: string }> {
     return jfetch('/api/models')
   },
+  /** 激活一个模型配置档案：值拷入当前生效配置，热生效即时，返回最新设置视图 */
+  activateModel(id: string): Promise<SettingsView> {
+    return jfetch('/api/models/activate', jsonBody('POST', { id }))
+  },
+  /** 把当前生效配置收编为档案（id 空 = 新建并激活；id 非空 = 回写该档案）。
+   *  真实 Key 在服务端直取，不经前端。 */
+  adoptModel(payload: { id?: string; name?: string }): Promise<SettingsView> {
+    return jfetch('/api/models/adopt', jsonBody('POST', payload))
+  },
   mcpStatus(): Promise<{ servers: MCPStatus[] }> {
     return jfetch('/api/mcp/status')
   },
   /** 收敛 MCP 进程：退出/启动失败的 server 会重新拉起 */
   retryMCP(): Promise<{ servers: MCPStatus[] }> {
     return jfetch('/api/mcp/retry', { method: 'POST' })
+  },
+
+  // ---------- 定时任务 ----------
+  listAutomations(): Promise<{ items: Automation[] }> {
+    return jfetch('/api/automations')
+  },
+  createAutomation(a: { title: string; cron: string; prompt: string; projectId?: string; maxRuns?: number }): Promise<Automation> {
+    return jfetch('/api/automations', jsonBody('POST', a))
+  },
+  updateAutomation(id: string, patch: { title?: string; cron?: string; prompt?: string; maxRuns?: number; enabled?: boolean }): Promise<Automation> {
+    return jfetch(`/api/automations/${encodeURIComponent(id)}`, jsonBody('PUT', patch))
+  },
+  deleteAutomation(id: string): Promise<{ ok: string }> {
+    return jfetch(`/api/automations/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  },
+
+  // ---------- 长期记忆（全局层；项目记忆由模型经工具维护） ----------
+  answerQuestion(qid: string, answer: string): Promise<{ ok: string }> {
+    return jfetch(`/api/questions/${encodeURIComponent(qid)}`, jsonBody('POST', { answer }))
+  },
+  getMemory(): Promise<{ content: string }> {
+    return jfetch('/api/memory')
+  },
+  saveMemory(content: string): Promise<{ ok: string }> {
+    return jfetch('/api/memory', jsonBody('PUT', { content }))
   },
 
   /**
@@ -201,23 +312,71 @@ export const api = {
                   case 'delta':
                     opts.onDelta(evt.text as string)
                     break
+                  case 'compact':
+                    opts.onCompact?.((evt.covered as number) || 0)
+                    break
                   case 'tool':
-                    opts.onToolStart?.(evt.name as string, (evt.args as string) || '')
+                    opts.onToolStart?.(
+                      evt.name as string,
+                      (evt.args as string) || '',
+                      (evt.id as string) || '',
+                    )
                     break
                   case 'tool_result':
                     opts.onToolResult?.({
+                      id: (evt.id as string) || '',
                       name: evt.name as string,
                       ok: evt.ok as boolean,
                       preview: (evt.preview as string) || '',
                       error: evt.error as string | undefined,
                       ms: (evt.ms as number) || 0,
+                      diff: evt.diff as string | undefined,
                     })
                     break
+                  case 'retry':
+                    opts.onRetry?.({
+                      attempt: (evt.attempt as number) || 1,
+                      maxAttempts: (evt.maxAttempts as number) || 0,
+                      delayMs: (evt.delayMs as number) || 0,
+                      reason: (evt.reason as string) || '',
+                    })
+                    break
+                  case 'todo':
+                    opts.onTodo?.((evt.todos as Todo[]) || [])
+                    break
+                  case 'ask': {
+                    if (opts.onAsk) {
+                      const answer = await opts.onAsk({
+                        id: (evt.id as string) || '',
+                        kind: (evt.kind as 'question' | 'permission') || 'question',
+                        question: evt.question as string | undefined,
+                        options: evt.options as string[] | undefined,
+                        multiSelect: evt.multi_select as boolean | undefined,
+                        tool: evt.tool as string | undefined,
+                        summary: evt.summary as string | undefined,
+                      })
+                      // 答案投回后端（工具侧的 AskWait 已在 Promise resolve 时继续，
+                      // 这里 POST 只是通知前端意图持久化；失败不阻断对话）
+                      try {
+                        await fetch(`/api/questions/${encodeURIComponent((evt.id as string) || '')}`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ answer }),
+                        })
+                      } catch {
+                        /* 超时失效由后端超时语义兜底 */
+                      }
+                    }
+                    break
+                  }
                   case 'error':
                     throw new Error((evt.error as string) || '未知错误')
-                  case 'done':
+                  case 'done': {
+                    const u = evt.usage as { prompt?: number; completion?: number } | undefined
+                    opts.onDone?.(u ? { prompt: u.prompt || 0, completion: u.completion || 0 } : undefined)
                     resolve({ sessionId })
                     return
+                  }
                 }
               }
             }

@@ -21,9 +21,12 @@ import (
 	"xiaoke/internal/api"
 	"xiaoke/internal/chat"
 	"xiaoke/internal/config"
+	"xiaoke/internal/cron"
 	"xiaoke/internal/mcp"
+	"xiaoke/internal/memory"
 	"xiaoke/internal/persona"
 	"xiaoke/internal/projects"
+	"xiaoke/internal/rules"
 	"xiaoke/internal/settings"
 	"xiaoke/internal/skills"
 	"xiaoke/internal/store"
@@ -61,7 +64,7 @@ func main() {
 		log.Fatalf("加载智能体失败: %v", err)
 	}
 	if err := agentsStore.EnsureDefault(agents.Agent{
-		Name: persona.Name, Description: "你的专属智能体，冷静靠谱，偶尔毒舌",
+		Name: persona.Name, Description: "你的专属智能体：傲娇但靠谱，冷静毒舌，参与感强",
 		Avatar: "/assets/avatar.png", SystemPrompt: persona.SystemPrompt, Tools: true,
 	}); err != nil {
 		log.Fatalf("种子默认智能体失败: %v", err)
@@ -92,8 +95,29 @@ func main() {
 		log.Fatalf("初始化会话存储失败: %v", err)
 	}
 
+	// 长期记忆（全局 + 项目两级 MEMORY.md）与项目规则文件读取
+	memStore, err := memory.Open(filepath.Join(cfg.DataDir, "memory"))
+	if err != nil {
+		log.Fatalf("初始化长期记忆失败: %v", err)
+	}
+	rulesStore := rules.New()
+	cronStore, err := cron.Open(filepath.Join(cfg.DataDir, "automations.json"))
+	if err != nil {
+		log.Fatalf("初始化定时任务失败: %v", err)
+	}
+
+	// 自动备份：启动时立即备份一份，之后每 24 小时一次，只保留最近 14 份。
+	// 备份失败只记日志，不影响服务启动。
+	go autoBackup(st, filepath.Join(cfg.DataDir, "backups"))
+
 	mux := http.NewServeMux()
-	chat.NewHandler(cfg, st, setStore, projectsMgr, mcpMgr, agentsStore, skillsStore).Register(mux)
+	chatHandler := chat.NewHandler(cfg, st, setStore, projectsMgr, mcpMgr, agentsStore, skillsStore, memStore, rulesStore, cronStore)
+	chatHandler.Register(mux)
+	// 长期记忆离线整理（对标 autoDream）：每 24 小时把近期会话蒸馏成记忆条目
+	//（真实模型模式才生效；mock/无 Key 自动跳过）。
+	chatHandler.StartDreamLoop()
+	// 定时任务调度器：每 30s 领取到期任务，无人值守执行（build 模式）。
+	chatHandler.StartAutomationLoop()
 	res := &api.Resources{
 		Agents: agentsStore, Skills: skillsStore,
 		AvatarsDir: "avatars", AssetsDir: cfg.AssetsDir,
@@ -101,6 +125,7 @@ func main() {
 	apiHandler := api.New(cfg, setStore, projectsMgr, mcpMgr, res)
 	apiHandler.Register(mux)
 	apiHandler.RegisterResources(mux)
+	chatHandler.RegisterMemoryAPI(mux)
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		eff := setStore.Effective()
@@ -130,7 +155,14 @@ func main() {
 		log.Printf("  MCP servers: %d 个", n)
 	}
 	log.Printf("================================================")
-	srv := &http.Server{Addr: addr, Handler: securityHeaders(mux)}
+	// 读头超时防 slowloris（本地服务，风险低但属于零成本加固）；
+	// 不设 Read/Write 总超时——SSE 流式回答会持续几分钟。
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           securityHeaders(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	errCh := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -151,6 +183,36 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 	mcpMgr.Close()
+}
+
+// 自动备份保留份数、间隔，以及回收站保留天数。
+const (
+	backupKeep  = 14
+	backupEvery = 24 * time.Hour
+	trashKeep   = 30 * 24 * time.Hour
+)
+
+// autoBackup 启动时先备份一份，之后按 backupEvery 周期备份；顺带清理过期回收站。
+func autoBackup(st *store.Store, dir string) {
+	run := func() {
+		p, err := st.Backup(dir, backupKeep)
+		if err != nil {
+			log.Printf("自动备份失败: %v", err)
+		} else {
+			log.Printf("会话已自动备份: %s", p)
+		}
+		if n, err := st.PurgeTrashOlderThan(trashKeep); err != nil {
+			log.Printf("清理回收站失败: %v", err)
+		} else if n > 0 {
+			log.Printf("回收站已清理 %d 条超过 %d 天的记录", n, int(trashKeep.Hours()/24))
+		}
+	}
+	run()
+	t := time.NewTicker(backupEvery)
+	defer t.Stop()
+	for range t.C {
+		run()
+	}
 }
 
 // noDirList 包装 FileSystem，禁止目录列表（避免 /assets/ 暴露上传文件名）。

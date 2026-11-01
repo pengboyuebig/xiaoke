@@ -18,19 +18,27 @@ import (
 
 var ErrNotFound = errors.New("agent not found")
 
+// ErrBuiltin 表示试图修改/删除内置人格（小柯）。
+var ErrBuiltin = errors.New("内置智能体不可修改或删除")
+
+// ErrDuplicateName 表示新建/改名与现有智能体重名。
+var ErrDuplicateName = errors.New("该名字已被其他智能体使用")
+
 var validName = regexp.MustCompile(`^[\p{Han}\w\- ]{1,16}$`)
 var validID = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
 // Agent 是一个可选的智能体人格。SystemPrompt 为空时回退到默认「小柯」人设。
 type Agent struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Description  string    `json:"description,omitempty"`
-	Avatar       string    `json:"avatar,omitempty"` // 图片 URL（/assets/...）或单个 emoji
-	SystemPrompt string    `json:"systemPrompt,omitempty"`
-	Tools        bool      `json:"tools"`
-	CreatedAt    time.Time `json:"createdAt"`
-	UpdatedAt    time.Time `json:"updatedAt"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Description  string `json:"description,omitempty"`
+	Avatar       string `json:"avatar,omitempty"` // 图片 URL（/assets/...）或单个 emoji
+	SystemPrompt string `json:"systemPrompt,omitempty"`
+	Tools        bool   `json:"tools"`
+	// Builtin 标记内置人格（小柯）：始终存在、对用户隐藏，不可编辑或删除。
+	Builtin   bool      `json:"builtin,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 type indexFile struct {
@@ -61,17 +69,50 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// EnsureDefault 确保至少有一个默认智能体（小柯）。
+// EnsureDefault 确保至少有一个默认智能体（小柯），并标记为内置。
+// 旧数据里已存在同名智能体时只补上 Builtin 标记，保留用户改过的人格。
+//
+// 内置人格的人设由代码维护（persona.go），用户不能编辑它，
+// 所以每次启动都同步成最新的 seed 值——否则升级后改的人设永远不生效。
 func (s *Store) EnsureDefault(seed Agent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.items) > 0 {
-		return nil
+	seed.Builtin = true
+	for i, a := range s.items {
+		if a.Builtin {
+			// 内置人格：人设与描述跟随代码更新（用户无法编辑，不会覆盖用户改动）
+			changed := false
+			if seed.SystemPrompt != "" && s.items[i].SystemPrompt != seed.SystemPrompt {
+				s.items[i].SystemPrompt = seed.SystemPrompt
+				changed = true
+			}
+			if seed.Description != "" && s.items[i].Description != seed.Description {
+				s.items[i].Description = seed.Description
+				changed = true
+			}
+			if changed {
+				s.items[i].UpdatedAt = time.Now()
+				return s.saveLocked()
+			}
+			return nil
+		}
+		if a.Name == seed.Name {
+			// 旧数据里的同名小柯：补 Builtin 标记并同步人设
+			s.items[i].Builtin = true
+			if seed.SystemPrompt != "" {
+				s.items[i].SystemPrompt = seed.SystemPrompt
+			}
+			if seed.Description != "" {
+				s.items[i].Description = seed.Description
+			}
+			s.items[i].UpdatedAt = time.Now()
+			return s.saveLocked()
+		}
 	}
 	seed.ID = genID()
 	now := time.Now()
 	seed.CreatedAt, seed.UpdatedAt = now, now
-	s.items = []Agent{seed}
+	s.items = append([]Agent{seed}, s.items...)
 	return s.saveLocked()
 }
 
@@ -107,11 +148,43 @@ func (s *Store) Get(id string) (Agent, error) {
 	return Agent{}, ErrNotFound
 }
 
-// Create 新建智能体。
+// nameTakenLocked 名字是否已被其他智能体占用（excludeID 用于改名时排除自己）。
+// 调用方需持有 s.mu。
+func (s *Store) nameTakenLocked(name string, excludeID string) bool {
+	for _, a := range s.items {
+		if a.ID != excludeID && a.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// Default 返回未指定智能体时使用的默认人格：优先内置小柯，否则列表第一个。
+func (s *Store) Default() (Agent, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.items {
+		if a.Builtin {
+			return a, true
+		}
+	}
+	if len(s.items) == 0 {
+		return Agent{}, false
+	}
+	return s.items[0], true
+}
+
+// Create 新建智能体。Builtin 只能由 EnsureDefault 设置，这里一律忽略。
 func (s *Store) Create(in Agent) (Agent, error) {
 	in.Name = strings.TrimSpace(in.Name)
 	if !validName.MatchString(in.Name) {
 		return Agent{}, fmt.Errorf("名字只能包含中文、字母、数字、空格、下划线和短横线（1-16 字符）")
+	}
+	s.mu.Lock()
+	dup := s.nameTakenLocked(in.Name, "")
+	s.mu.Unlock()
+	if dup {
+		return Agent{}, ErrDuplicateName
 	}
 	in.Description = strings.TrimSpace(in.Description)
 	in.SystemPrompt = strings.TrimSpace(in.SystemPrompt)
@@ -122,6 +195,7 @@ func (s *Store) Create(in Agent) (Agent, error) {
 	defer s.mu.Unlock()
 	now := time.Now()
 	in.ID = genID()
+	in.Builtin = false
 	in.CreatedAt, in.UpdatedAt = now, now
 	s.items = append(s.items, in)
 	if err := s.saveLocked(); err != nil {
@@ -130,7 +204,7 @@ func (s *Store) Create(in Agent) (Agent, error) {
 	return in, nil
 }
 
-// Update 修改智能体（保留 ID 与创建时间）。
+// Update 修改智能体（保留 ID 与创建时间）。内置人格不可修改。
 func (s *Store) Update(id string, in Agent) (Agent, error) {
 	if !validID.MatchString(id) {
 		return Agent{}, ErrNotFound
@@ -144,11 +218,18 @@ func (s *Store) Update(id string, in Agent) (Agent, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.nameTakenLocked(in.Name, id) {
+		return Agent{}, ErrDuplicateName
+	}
 	for i, a := range s.items {
 		if a.ID != id {
 			continue
 		}
+		if a.Builtin {
+			return Agent{}, ErrBuiltin
+		}
 		in.ID = id
+		in.Builtin = false
 		in.CreatedAt = a.CreatedAt
 		in.UpdatedAt = time.Now()
 		s.items[i] = in
@@ -160,12 +241,10 @@ func (s *Store) Update(id string, in Agent) (Agent, error) {
 	return Agent{}, ErrNotFound
 }
 
+// Delete 删除智能体。内置人格不可删除；至少要留一个智能体。
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.items) <= 1 {
-		return fmt.Errorf("至少保留一个智能体")
-	}
 	idx := -1
 	for i, a := range s.items {
 		if a.ID == id {
@@ -175,6 +254,12 @@ func (s *Store) Delete(id string) error {
 	}
 	if idx < 0 {
 		return ErrNotFound
+	}
+	if s.items[idx].Builtin {
+		return ErrBuiltin
+	}
+	if len(s.items) <= 1 {
+		return fmt.Errorf("至少保留一个智能体")
 	}
 	s.items = append(s.items[:idx], s.items[idx+1:]...)
 	return s.saveLocked()

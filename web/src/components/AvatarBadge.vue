@@ -29,8 +29,9 @@ const isImg = (v?: string) => !!v && (v.startsWith('/assets/') || v.startsWith('
   border-radius: 50%;
   overflow: hidden;
   flex-shrink: 0;
-  background: var(--bg-surface-2);
+  background: linear-gradient(145deg, var(--bg-surface-3), var(--bg-inset));
   border: 1px solid var(--border-strong);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
   line-height: 1;
   user-select: none;
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +56,7 @@ func (m *Manager) Apply(servers []settings.MCPServer) {
 		if !keep || !sameServer(cli.cfg, w) {
 			cli.Stop()
 			delete(m.clients, name)
+			log.Printf("MCP server %q 已停止（配置移除或变更）", name)
 		}
 	}
 	// 启动新增 / 重试失败或已退出的
@@ -71,10 +74,12 @@ func (m *Manager) Apply(servers []settings.MCPServer) {
 			}
 			cli.Stop()
 			delete(m.clients, name)
+			log.Printf("MCP server %q 异常，尝试重新拉起", name)
 		}
 		cli, err := Start(m.ctx, s)
 		if err != nil {
 			// 启动失败记录在伪 Client 里，状态页可见，不阻塞其它 server
+			log.Printf("MCP server %q 启动失败: %v", name, err)
 			m.clients[name] = &Client{
 				name: name, cfg: s,
 				exited:   closedChan(),
@@ -85,6 +90,7 @@ func (m *Manager) Apply(servers []settings.MCPServer) {
 			}
 			continue
 		}
+		log.Printf("MCP server %q 已启动（%s）", name, s.Command)
 		m.clients[name] = cli
 	}
 }
@@ -132,7 +138,10 @@ func (m *Manager) Status() []Status {
 		st.Error = cli.errText
 		if cli.errText == "" {
 			st.Running = cli.Alive()
-			for _, t := range cli.Tools {
+			// 工具列表排序：状态页每次刷新顺序稳定，避免跳动
+			toolInfos := append([]ToolInfo(nil), cli.Tools...)
+			sort.Slice(toolInfos, func(i, j int) bool { return toolInfos[i].Name < toolInfos[j].Name })
+			for _, t := range toolInfos {
 				st.Tools = append(st.Tools, t.Name)
 			}
 			// readyCh 未闭合 = 握手还在进行（npx 冷启动）
@@ -163,10 +172,13 @@ func (c *Client) readyClosed() bool {
 }
 
 // Tools 返回全部已就绪 server 的工具，转为可注入模型的 ToolDef。
+// 同名工具去重：个别 server 会在 tools/list 里重复声明同一工具，
+// 重复注入会浪费上下文还可能让模型困惑。
 func (m *Manager) Tools() []tools.ToolDef {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var defs []tools.ToolDef
+	seen := map[string]bool{}
 	for _, cli := range m.clients {
 		cli.mu.Lock()
 		for _, t := range cli.Tools {
@@ -175,6 +187,10 @@ func (m *Manager) Tools() []tools.ToolDef {
 				continue
 			}
 			name := QualifyName(cli.name, t.Name)
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
 			desc := fmt.Sprintf("[MCP:%s] %s", cli.name, strings.TrimSpace(t.Description))
 			if strings.TrimSpace(t.Description) == "" {
 				desc = fmt.Sprintf("[MCP:%s] %s", cli.name, t.Name)
@@ -198,9 +214,14 @@ func (m *Manager) Tools() []tools.ToolDef {
 }
 
 // Call 调用指定 server 的工具；若握手尚未完成，最多等 30 秒。
+// 单次调用的超时取该 server 配置的 TimeoutSec（<=0 用默认 60s）。
 func (m *Manager) Call(ctx context.Context, server, tool string, args json.RawMessage) (string, error) {
 	m.mu.Lock()
 	cli := m.clients[server]
+	var timeoutSec int
+	if cli != nil {
+		timeoutSec = cli.cfg.TimeoutSec
+	}
 	m.mu.Unlock()
 	if cli == nil {
 		return "", fmt.Errorf("MCP server %q 未运行", server)
@@ -214,7 +235,12 @@ func (m *Manager) Call(ctx context.Context, server, tool string, args json.RawMe
 	if err := cli.Ready(wctx); err != nil {
 		return "", err
 	}
-	return cli.CallTool(ctx, tool, args)
+	if timeoutSec <= 0 {
+		return cli.CallTool(ctx, tool, args)
+	}
+	tctx, tcancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer tcancel()
+	return cli.CallTool(tctx, tool, args)
 }
 
 // Close 停止所有 MCP 子进程（应用退出时调用）。

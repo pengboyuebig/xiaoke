@@ -1,8 +1,21 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, onUpdated, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, onUpdated, ref, watch } from 'vue'
 import hljs from 'highlight.js/lib/common'
 import type { MsgGroup, ToolPair } from '../types'
+import Icon from './Icon.vue'
 import { renderMarkdownCollapsed } from '../lib/markdown'
+
+// ---------- 编辑 diff 渲染 ----------
+const DIFF_NL = '\n'
+function diffLines(diff: string): string[] {
+  return (diff || '').split(DIFF_NL)
+}
+function diffClass(line: string): string {
+  if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) return 'diff-meta'
+  if (line.startsWith('+')) return 'diff-add'
+  if (line.startsWith('-')) return 'diff-del'
+  return 'diff-ctx'
+}
 
 const props = defineProps<{
   /** 回合内的分组（assistant 工具块 + 正文；流式实时组已由 App 并入） */
@@ -12,6 +25,8 @@ const props = defineProps<{
   /** 回合结束时间（末条消息）；流式中为空表示进行中 */
   endTime?: string
   streaming?: boolean
+  /** 用户中途停止生成 */
+  stopped?: boolean
   agentName?: string
   avatar?: string
 }>()
@@ -55,6 +70,95 @@ const hasWork = computed(() => toolCount.value > 0 || !!turnError.value)
 // 工具调用（跨分组合并）
 const allTools = computed<ToolPair[]>(() => allGroups.value.flatMap((g) => g.tools || []))
 const toolCount = computed(() => allTools.value.length)
+
+// ---------- 「工作中」明细的内部自动滚动 ----------
+// 明细区自己有滚动条（max-height 460px）：工具行不断追加时必须跟着滚到底，
+// 否则用户只能看到最早那几条、以为卡住了。规则与主聊天区一致：
+// 用户手动上翻就停；停手 10 秒后自动恢复跟随（仅生成中）。
+const RESUME_DETAIL_MS = 10_000
+const detailEl = ref<HTMLElement | null>(null)
+const detailPinned = ref(true)
+let detailResumeTimer: number | undefined
+let detailAutoScrolling = false
+
+function clearDetailResume() {
+  if (detailResumeTimer !== undefined) {
+    window.clearTimeout(detailResumeTimer)
+    detailResumeTimer = undefined
+  }
+}
+
+function stickDetail() {
+  const el = detailEl.value
+  if (!el || !detailPinned.value) return
+  detailAutoScrolling = true
+  el.scrollTop = el.scrollHeight
+  requestAnimationFrame(() => {
+    detailAutoScrolling = false
+  })
+}
+
+function onDetailScroll() {
+  if (detailAutoScrolling) return // 程序滚动，不算用户操作
+  const el = detailEl.value
+  if (!el) return
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  if (atBottom) {
+    clearDetailResume()
+  } else if (props.streaming) {
+    // 还在生成：每次滚动重置 10 秒计时，用户在看就别抢滚动条
+    clearDetailResume()
+    detailResumeTimer = window.setTimeout(() => {
+      detailResumeTimer = undefined
+      if (props.streaming) {
+        detailPinned.value = true
+        stickDetail()
+      }
+    }, RESUME_DETAIL_MS)
+  }
+  detailPinned.value = atBottom
+}
+
+// 工具条数 / 结果长度 / 流式状态任一变化都尝试贴底（结果晚于调用到达，需覆盖两次增长）
+const detailSig = computed(() => {
+  const ts = allTools.value
+  let n = 0
+  for (const t of ts) n += (t.result?.length || 0) + (t.diff?.length || 0)
+  return `${ts.length}:${n}:${props.streaming ? 1 : 0}`
+})
+
+watch(
+  detailSig,
+  async () => {
+    await nextTick()
+    stickDetail()
+  },
+  { flush: 'post' },
+)
+
+// 展开明细时的初始位置：生成中贴底（看最新进度），已完成则回到顶部（从头读）
+watch(expanded, async (v) => {
+  if (!v) return
+  await nextTick()
+  const el = detailEl.value
+  if (!el) return
+  if (props.streaming) {
+    detailPinned.value = true
+    stickDetail()
+  } else {
+    detailPinned.value = false
+    el.scrollTop = 0
+  }
+})
+
+// 生成开始时重置跟随状态
+watch(
+  () => props.streaming,
+  (st) => {
+    if (st) detailPinned.value = true
+    else clearDetailResume()
+  },
+)
 const toolRounds = computed(() => {
   const rounds = new Set<number>()
   for (const g of allGroups.value) {
@@ -62,6 +166,39 @@ const toolRounds = computed(() => {
   }
   return rounds.size
 })
+
+// 是否有可见正文（忽略只有空白字符的 delta）
+const hasSections = computed(() =>
+  allGroups.value.some((g) => (g.sections || []).some((s) => s.trim() !== '')),
+)
+
+// 流式中且没有工具/错误时显示状态胶囊：
+// 首 token 前显示「正在思考」，文本开始输出后显示「正在输入」。
+const showStatus = computed(() => props.streaming && !hasWork.value && !turnError.value)
+const statusText = computed(() => (hasSections.value ? '正在输入' : '正在思考'))
+
+// 流式结束但既没有正文也没有工具（模型空回复 / 首 token 前停止）
+// 用户主动停止时不算「空回复」，改由下面的 stoppedEmpty 提示
+const isEmptyReply = computed(
+  () =>
+    !props.streaming &&
+    !props.stopped &&
+    !turnError.value &&
+    toolCount.value === 0 &&
+    !hasSections.value &&
+    !!props.startTime,
+)
+
+// 用户停止且没有留下任何内容：说明是首 token 前就停了，提示「已停止」而非让用户重试
+const stoppedEmpty = computed(
+  () =>
+    !props.streaming &&
+    !!props.stopped &&
+    !turnError.value &&
+    toolCount.value === 0 &&
+    !hasSections.value &&
+    !!props.startTime,
+)
 
 // 工作时长（首条→末条；流式中实时走秒）
 const now = ref(Date.now())
@@ -84,6 +221,7 @@ onUnmounted(() => {
     window.clearInterval(timer)
     timer = undefined
   }
+  clearDetailResume()
 })
 
 function durMs(): number {
@@ -170,11 +308,13 @@ function resultLabel(t: ToolPair): string {
 }
 
 function toolIcon(name: string): string {
-  if (name.startsWith('mcp_')) return '🔌'
-  if (name === 'run_command') return '⌨'
-  if (name === 'write_file') return '✏️'
-  if (name === 'read_file' || name === 'list_files' || name === 'search_files') return '🔍'
-  return '⚙'
+  if (name.startsWith('mcp_')) return 'plug'
+  if (name === 'run_command') return 'terminal'
+  if (name === 'write_file') return 'edit'
+  if (name === 'read_file') return 'file'
+  if (name === 'list_files') return 'folder'
+  if (name === 'search_files') return 'search'
+  return 'settings'
 }
 
 // 代码高亮（内容为 v-html 注入，需要在挂载/更新后处理）
@@ -196,28 +336,43 @@ onUpdated(highlight)
         <span class="live-dot"></span>
         工作中 · {{ durText }}
       </span>
-      <span v-else-if="turnError" class="th-err">⚠ 出错了 · 点击查看详情</span>
+      <span v-else-if="turnError" class="th-err"><Icon name="warning" :size="14" /> 出错了 · 点击查看详情</span>
       <span v-else class="th-done">已工作 {{ durText }}</span>
       <span class="th-meta" v-if="toolCount">{{ toolRounds }} 轮 · {{ toolCount }} 次工具</span>
-      <span class="th-chevron">{{ expanded ? '▲' : '▼' }}</span>
+      <span class="th-chevron" :class="{ up: expanded }">
+        <Icon :name="expanded ? 'chevron-up' : 'chevron-down'" :size="14" />
+      </span>
     </button>
 
     <!-- 错误全文常显（不随明细收起） -->
-    <div v-if="turnError && !expanded" class="err-inline">⚠ {{ turnError }}</div>
+    <div v-if="turnError && !expanded" class="err-inline">
+      <Icon name="warning" :size="14" />
+      <span>{{ turnError }}</span>
+    </div>
 
-    <!-- 工作过程（可折叠）：工具时间线 + 完整参数结果 + 错误 -->
-    <div v-if="expanded" class="turn-detail">
+    <!-- 工作过程（可折叠）：工具时间线 + 完整参数结果 + 错误；没有内容时不渲染空框 -->
+    <div
+      v-if="expanded && (toolCount || turnError)"
+      ref="detailEl"
+      class="turn-detail"
+      @scroll="onDetailScroll"
+    >
       <!-- 工具时间线 -->
       <div v-if="toolCount" class="tl">
         <div v-for="(t, i) in allTools" :key="'t' + i" class="tl-row">
-          <span class="tl-icon">{{ toolIcon(t.name) }}</span>
+          <span class="tl-icon"><Icon :name="toolIcon(t.name)" :size="14" /></span>
           <span class="tl-tool">{{ t.name }}</span>
           <span v-if="argLabel(t)" class="tl-arg">{{ argLabel(t) }}</span>
-          <span v-if="t.result !== undefined" class="tl-arrow">→</span>
+          <span v-if="t.result !== undefined" class="tl-arrow"><Icon name="arrow-right" :size="12" /></span>
           <span v-if="t.result !== undefined" class="tl-res" :class="t.ok ? 'ok' : 'bad'">
-            {{ t.ok ? resultLabel(t) : '✗ 失败' }}
+            <Icon v-if="!t.ok" name="x" :size="12" />
+            {{ t.ok ? resultLabel(t) : '失败' }}
           </span>
           <span v-else class="tl-run">运行中…</span>
+          <!-- 编辑 diff（tool_result 事件携带）：+绿 -红 -->
+          <div v-if="t.diff" class="diff-view">
+            <div v-for="(dl, di) in diffLines(t.diff)" :key="'d' + i + '-' + di" :class="diffClass(dl)">{{ dl || ' ' }}</div>
+          </div>
         </div>
       </div>
 
@@ -226,19 +381,26 @@ onUpdated(highlight)
         <summary>查看完整参数与结果</summary>
         <div v-for="(t, i) in allTools" :key="'r' + i" class="raw-item">
           <div class="ri-head">
-            <span class="ri-tool">⚙ {{ t.name }}</span>
+            <span class="ri-tool"><Icon name="settings" :size="12" /> {{ t.name }}</span>
             <span class="ri-status" :class="t.ok === false ? 'bad' : t.ok === true ? 'ok' : ''">
-              {{ t.result === undefined ? '执行中…' : t.ok ? '✓ 成功' : '✗ 失败' }}
+              <Icon :name="t.result === undefined ? 'clock' : t.ok ? 'check' : 'x'" :size="12" />
+              {{ t.result === undefined ? '执行中…' : t.ok ? '成功' : '失败' }}
             </span>
           </div>
           <pre v-if="t.arguments" class="ri-args">{{ t.arguments }}</pre>
           <pre v-if="t.result !== undefined" class="ri-res" :class="t.ok ? 'ok' : 'bad'">{{ t.result }}</pre>
+          <div v-if="t.diff" class="diff-view">
+            <div v-for="(dl, di) in diffLines(t.diff)" :key="'rd' + i + '-' + di" :class="diffClass(dl)">{{ dl || ' ' }}</div>
+          </div>
         </div>
       </details>
 
       <!-- 错误（展开态内） -->
       <div v-for="(g, gi) in allGroups" :key="'e' + gi">
-        <div v-if="g.error" class="error-box">⚠ {{ g.error }}</div>
+        <div v-if="g.error" class="error-box">
+          <Icon name="warning" :size="14" />
+          <span>{{ g.error }}</span>
+        </div>
       </div>
     </div>
 
@@ -248,12 +410,24 @@ onUpdated(highlight)
         <div v-for="(s, si) in g.sections || []" :key="'s' + si" class="turn-text md" v-html="render(s)"></div>
       </div>
     </div>
+
+    <!-- 流式状态：首 token 前「正在思考」，出字后「正在输入」 -->
+    <div v-if="showStatus" class="turn-status" role="status" aria-live="polite">
+      <span class="ts-agent">{{ agentNameLabel() }}</span>
+      <span>{{ statusText }}</span>
+      <span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+    </div>
+
+    <!-- 空回复兜底：模型没返回内容 -->
+    <div v-if="isEmptyReply" class="turn-empty">没有收到内容，请重试</div>
+    <!-- 用户停止：没有内容时明确说是「已停止」，而不是让用户以为模型坏了 -->
+    <div v-else-if="stoppedEmpty" class="turn-empty turn-stopped">已停止生成</div>
   </div>
 </template>
 
 <style scoped>
 .turn {
-  margin: 6px 0 14px;
+  margin: 4px 0 18px;
 }
 
 /* 回答正文区（始终可见） */
@@ -265,25 +439,96 @@ onUpdated(highlight)
   margin-top: 10px;
 }
 
+/* ---------- 流式状态 ---------- */
+.turn-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: var(--shadow-sm);
+}
+
+.ts-agent {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.typing-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.3;
+  animation: typingBounce 1.2s infinite ease-in-out;
+}
+
+.typing-dots i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.typing-dots i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes typingBounce {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+.turn-empty {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+/* 用户主动停止：中性提示，不用告警色，避免看起来像出错 */
+.turn-stopped {
+  color: var(--text-muted);
+}
+
 /* ---------- 顶栏 ---------- */
 .turn-head {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   width: 100%;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 9px 14px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  padding: 7px 10px;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--text-muted);
-  transition: border-color 0.15s ease, background 0.15s ease;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
 
 .turn-head:hover {
-  border-color: var(--border-strong);
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.035);
+  border-color: var(--border);
 }
 
 .th-live {
@@ -295,11 +540,12 @@ onUpdated(highlight)
 }
 
 .live-dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--accent);
-  animation: pulse 1.1s infinite ease-in-out;
+  box-shadow: 0 0 10px rgba(255, 154, 61, 0.65);
+  animation: pulse 1.4s infinite ease-in-out;
 }
 
 @keyframes pulse {
@@ -309,8 +555,8 @@ onUpdated(highlight)
     transform: scale(1);
   }
   50% {
-    opacity: 0.4;
-    transform: scale(0.8);
+    opacity: 0.35;
+    transform: scale(0.72);
   }
 }
 
@@ -320,74 +566,158 @@ onUpdated(highlight)
 }
 
 .th-err {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   color: var(--danger);
   font-weight: 600;
 }
 
 .err-inline {
-  margin-top: 6px;
-  padding: 8px 14px;
-  border: 1px solid var(--danger);
-  border-radius: var(--radius);
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 6px 10px 0;
+  padding: 9px 12px;
+  border: 1px solid rgba(251, 113, 133, 0.24);
+  border-radius: 10px;
   color: var(--danger);
-  background: rgba(255, 107, 107, 0.08);
-  font-size: 13px;
+  background: var(--danger-soft);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.err-inline :deep(.ic) {
+  margin-top: 2px;
 }
 
 .th-meta {
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
 .th-chevron {
   margin-left: auto;
+  display: flex;
   color: var(--text-faint);
-  font-size: 11px;
+}
+
+/* ---------- 编辑 diff ---------- */
+.diff-view {
+  flex-basis: 100%; /* tl-row 是 flex 横排：diff 必须独占整行，否则会挤在结果右侧 */
+  margin: 6px 0 2px 26px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: rgba(0, 0, 0, 0.28);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  overflow-x: auto;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 6px 0;
+  white-space: pre;
+}
+
+.diff-view > div {
+  padding: 0 10px;
+}
+
+.diff-add {
+  color: #4ade80;
+  background: rgba(74, 222, 128, 0.07);
+}
+
+.diff-del {
+  color: #fb7185;
+  background: rgba(251, 113, 133, 0.07);
+}
+
+.diff-meta {
+  color: var(--text-faint);
+}
+
+.diff-ctx {
+  color: var(--text-muted);
 }
 
 /* ---------- 明细 ---------- */
 .turn-detail {
   margin-top: 8px;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg-inset);
-  padding: 10px 14px;
-  max-height: 420px;
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.028), rgba(255, 255, 255, 0.01));
+  padding: 13px 16px;
+  max-height: 460px;
   overflow-y: auto;
+  box-shadow: var(--shadow-sm), var(--ring-inset);
 }
 
 /* 时间线 */
 .tl {
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 5px;
+  padding-left: 18px;
+}
+
+.tl::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 6px;
+  bottom: 6px;
+  width: 1px;
+  background: linear-gradient(180deg, rgba(255, 154, 61, 0.32), rgba(255, 255, 255, 0.05));
 }
 
 .tl-row {
+  position: relative;
   display: flex;
+  flex-wrap: wrap; /* 编辑 diff 需要另起一行（diff-view 独占 100% 宽） */
   align-items: baseline;
   gap: 7px;
-  font-size: 12.5px;
+  font-size: 12px;
   line-height: 1.75;
   min-width: 0;
+}
+
+.tl-row::before {
+  content: '';
+  position: absolute;
+  left: -16px;
+  top: 8px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--bg-surface-3);
+  border: 1px solid rgba(255, 255, 255, 0.18);
 }
 
 .tl-icon {
   flex-shrink: 0;
   width: 16px;
-  text-align: center;
-  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  align-self: center;
 }
 
 .tl-tool {
   color: var(--accent);
-  font-family: 'Cascadia Code', Consolas, monospace;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
   flex-shrink: 0;
 }
 
 .tl-arg {
   color: var(--text-muted);
-  font-family: 'Cascadia Code', Consolas, monospace;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -395,15 +725,22 @@ onUpdated(highlight)
 }
 
 .tl-arrow {
+  display: flex;
+  align-items: center;
   color: var(--text-faint);
   flex-shrink: 0;
+  align-self: center;
 }
 
 .tl-res {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+  font-size: 11.5px;
 }
 
 .tl-res.ok {
@@ -416,82 +753,133 @@ onUpdated(highlight)
 
 .tl-run {
   color: var(--text-faint);
-  font-size: 11.5px;
+  font-size: 11px;
 }
 
 /* 正文 */
 .turn-text {
-  margin-top: 8px;
+  margin-top: 9px;
   color: var(--text);
+  font-size: 14.5px;
+  line-height: 1.78;
 }
 
 .turn-text :deep(p) {
-  margin: 6px 0;
+  margin: 8px 0;
+}
+
+.turn-text :deep(p:first-child) {
+  margin-top: 0;
+}
+
+.turn-text :deep(strong) {
+  color: #fff;
+  font-weight: 600;
 }
 
 .turn-text :deep(ul),
 .turn-text :deep(ol) {
-  margin: 6px 0;
+  margin: 8px 0;
   padding-left: 22px;
 }
 
 .turn-text :deep(li) {
-  margin: 3px 0;
+  margin: 4px 0;
+}
+
+.turn-text :deep(li::marker) {
+  color: var(--accent);
 }
 
 .turn-text :deep(h1),
 .turn-text :deep(h2),
+.turn-text :deep(h3),
+.turn-text :deep(h4) {
+  margin: 16px 0 8px;
+  line-height: 1.42;
+  color: #fff;
+  font-weight: 700;
+}
+
+.turn-text :deep(h1) {
+  font-size: 20px;
+}
+
+.turn-text :deep(h2) {
+  font-size: 17px;
+}
+
 .turn-text :deep(h3) {
-  margin: 12px 0 6px;
-  line-height: 1.4;
+  font-size: 15px;
 }
 
 .turn-text :deep(a) {
   color: var(--accent-hover);
   text-decoration: none;
+  border-bottom: 1px solid rgba(255, 176, 102, 0.28);
+  transition: border-color 0.15s ease;
+}
+
+.turn-text :deep(a:hover) {
+  border-bottom-color: var(--accent-hover);
 }
 
 .turn-text :deep(code) {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 1px 5px;
+  background: rgba(255, 255, 255, 0.055);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 6px;
+  padding: 1px 6px;
   font-size: 12.5px;
-  font-family: 'Cascadia Code', Consolas, monospace;
+  color: #ffd7b0;
 }
 
 .turn-text :deep(pre) {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
+  background: #0b0d12;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 14px 16px;
   overflow-x: auto;
-  margin: 8px 0;
+  margin: 10px 0;
+  box-shadow: var(--shadow-sm);
 }
 
 .turn-text :deep(pre code) {
   background: none;
   border: none;
   padding: 0;
+  color: inherit;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.turn-text :deep(hr) {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 16px 0;
+}
+
+.turn-text :deep(img) {
+  max-width: 100%;
+  border-radius: 10px;
 }
 
 /* 长代码块折叠：默认只显示一行摘要 */
 .turn-text :deep(.code-collapse) {
-  margin: 8px 0;
+  margin: 10px 0;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg-surface);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.025);
   overflow: hidden;
 }
 
 .turn-text :deep(.code-collapse > summary) {
   cursor: pointer;
-  padding: 8px 12px;
-  font-size: 12px;
+  padding: 9px 13px;
+  font-size: 11.5px;
   color: var(--text-muted);
   list-style: none;
   user-select: none;
-  transition: background 0.12s ease;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
 .turn-text :deep(.code-collapse > summary::-webkit-details-marker) {
@@ -499,16 +887,19 @@ onUpdated(highlight)
 }
 
 .turn-text :deep(.code-collapse > summary::before) {
-  content: '▸ ';
+  content: '›';
+  display: inline-block;
+  margin-right: 7px;
   color: var(--text-faint);
+  transition: transform 0.15s ease;
 }
 
 .turn-text :deep(.code-collapse[open] > summary::before) {
-  content: '▾ ';
+  transform: rotate(90deg);
 }
 
 .turn-text :deep(.code-collapse > summary:hover) {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.04);
   color: var(--text);
 }
 
@@ -517,42 +908,73 @@ onUpdated(highlight)
   border: none;
   border-top: 1px solid var(--border);
   border-radius: 0;
-  max-height: 420px;
+  max-height: 440px;
   overflow: auto;
+  box-shadow: none;
+  background: #090b10;
 }
 
 .turn-text :deep(blockquote) {
-  margin: 8px 0;
-  padding: 2px 12px;
+  margin: 10px 0;
+  padding: 9px 14px;
   border-left: 3px solid var(--accent);
   background: var(--accent-soft);
-  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  border-radius: 0 10px 10px 0;
   color: var(--text-muted);
 }
 
 .turn-text :deep(table) {
-  border-collapse: collapse;
-  margin: 8px 0;
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  margin: 10px 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  font-size: 13px;
 }
 
 .turn-text :deep(th),
 .turn-text :deep(td) {
-  border: 1px solid var(--border);
-  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.turn-text :deep(th:last-child),
+.turn-text :deep(td:last-child) {
+  border-right: none;
+}
+
+.turn-text :deep(tr:last-child td) {
+  border-bottom: none;
+}
+
+.turn-text :deep(th) {
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text-muted);
+  font-weight: 600;
 }
 
 /* 完整原文折叠 */
 .raw {
-  margin-top: 10px;
+  margin-top: 12px;
   border-top: 1px solid var(--border);
-  padding-top: 8px;
+  padding-top: 10px;
 }
 
 .raw summary {
   cursor: pointer;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-faint);
   list-style: none;
+  user-select: none;
+  transition: color 0.15s ease;
+}
+
+.raw summary:hover {
+  color: var(--text-muted);
 }
 
 .raw summary::-webkit-details-marker {
@@ -560,18 +982,21 @@ onUpdated(highlight)
 }
 
 .raw summary::before {
-  content: '▸ ';
+  content: '›';
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s ease;
 }
 
 .raw[open] summary::before {
-  content: '▾ ';
+  transform: rotate(90deg);
 }
 
 .raw-item {
-  margin-top: 8px;
+  margin-top: 9px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 5px;
 }
 
 .ri-head {
@@ -581,13 +1006,19 @@ onUpdated(highlight)
 }
 
 .ri-tool {
-  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
   color: var(--accent);
   font-weight: 600;
 }
 
 .ri-status {
-  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
   color: var(--text-faint);
 }
 
@@ -602,14 +1033,16 @@ onUpdated(highlight)
 .ri-args,
 .ri-res {
   margin: 0;
-  background: var(--bg-surface);
+  background: rgba(255, 255, 255, 0.025);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 7px 10px;
-  font-size: 11.5px;
+  border-radius: 9px;
+  padding: 8px 11px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 160px;
+  max-height: 180px;
   overflow-y: auto;
   color: var(--text-muted);
 }
@@ -624,12 +1057,30 @@ onUpdated(highlight)
 }
 
 .error-box {
-  margin-top: 8px;
-  padding: 8px 12px;
-  border: 1px solid var(--danger);
-  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 9px;
+  padding: 9px 12px;
+  border: 1px solid rgba(251, 113, 133, 0.24);
+  border-radius: 9px;
   color: var(--danger);
-  background: rgba(255, 107, 107, 0.08);
-  font-size: 13px;
+  background: var(--danger-soft);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.error-box :deep(.ic) {
+  margin-top: 2px;
+}
+
+@media (max-width: 760px) {
+  .turn-text {
+    font-size: 14px;
+  }
+
+  .turn-detail {
+    padding: 11px 12px;
+  }
 }
 </style>

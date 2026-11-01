@@ -15,11 +15,58 @@ import (
 	"strings"
 )
 
+// TodoItem 是一条待办（tools 层自有类型，handler 负责与 store 互转）。
+type TodoItem struct {
+	Content string `json:"content"`
+	Status  string `json:"status"` // pending | in_progress | completed
+}
+
 // Env 是一次工具执行的环境（每次请求按当前设置/项目构造）。
 type Env struct {
 	Workspace string   // 可读写的工作区根（项目目录）；为空表示未选择项目
 	ReadDirs  []string // 只读授权目录
 	Allowlist []string // 可执行命令白名单（basename 匹配）
+	// CommandTimeoutSec run_command 超时（秒；<=0 用默认 30）。构建/安装类命令可能需要调大。
+	CommandTimeoutSec int
+
+	// SetTodos / MemoryAppend / MemoryRead / RunSubagent 是会话级能力的回调，
+	// 由 handler 在每次请求时用闭包注入（携带会话 ID、项目 ID 等上下文），
+	// tools 包保持零依赖。为 nil 表示该能力本次不可用（工具执行时报错并提示）。
+	SetTodos     func(todos []TodoItem) error
+	MemoryAppend func(scope, content string) (string, error)
+	MemoryRead   func(scope string) (string, error)
+	// RunSubagent 派一个子代理执行子任务：kind 为 "explore"（只读）或
+	// "general-purpose"（完整工具），prompt 必须自包含。返回子代理的最终汇报。
+	RunSubagent func(kind, prompt string) (string, error)
+	// SkillRead 读取一个已启用技能的完整正文（系统提示词只注入技能清单）。
+	SkillRead func(name string) (string, error)
+	// AskUser 阻塞式向用户提问（ask_user 工具回调）：问题 + 选项（可空 = 自由输入）
+	// + 是否多选。返回用户回答（多选时逗号分隔 / 自由输入时原文）。
+	// 为 nil 表示本次会话无法交互（工具执行时报错）。
+	AskUser func(question string, options []string, multiSelect bool) (string, error)
+	// PermissionAsk 是 ask 模式的执行前审批回调（仅对写类工具调用）：
+	// 返回 false = 用户拒绝，工具不执行。nil = 不拦截（非 ask 模式）。
+	PermissionAsk func(toolName, summary string) bool
+	// OnDiff 是 edit_file/write_file 修改已有文件成功后的回调（统一 diff 文本），
+	// 仅供前端展示，不进模型上下文。写类工具永远串行执行，回调无需并发保护。
+	OnDiff func(diff string)
+	// OnFileChange 是写类工具成功落盘后的回调（会话回退台账记录写前快照）：
+	// abs 绝对路径、before 写前内容（新建文件时 existed=false 且 before 为空）。
+	OnFileChange func(abs, before string, existed bool)
+	// SessionID 是当前会话 ID（后台任务完成唤醒时定位回写会话用；空 = 未知）。
+	SessionID string
+	// OnTaskDone 由 chat 层注入：后台命令任务结束时回调（会话唤醒）。
+	// 任务 goroutine 中调用，实现方需自行保证并发安全。
+	OnTaskDone func(taskID string)
+	// Cron 族回调：定时任务管理。CronCreate 为 nil 表示当前会话禁建
+	//（自动化触发的会话，防递归）；其余 nil = 功能不可用。
+	CronCreate func(title, expr, prompt, projectID string, maxRuns int) (string, error)
+	CronList   func() (string, error)
+	CronUpdate func(id, title, expr, prompt string, maxRuns int, enabled *bool) (string, error)
+	CronDelete func(id string) (string, error)
+	// Files 是会话级「已读文件」状态表（nil = 未启用新鲜度护栏）。
+	// read_file 登记、edit_file/write_file 修改已有文件前校验，防盲写覆盖。
+	Files *FileStateTracker
 }
 
 func (e *Env) clone() *Env {
@@ -27,6 +74,13 @@ func (e *Env) clone() *Env {
 	cp.ReadDirs = append([]string(nil), e.ReadDirs...)
 	cp.Allowlist = append([]string(nil), e.Allowlist...)
 	return &cp
+}
+
+// emitDiff nil 安全的 diff 回调（空 diff 不发）。
+func (e *Env) emitDiff(d string) {
+	if e != nil && e.OnDiff != nil && d != "" {
+		e.OnDiff(d)
+	}
 }
 
 // Tool 是一个可被模型调用的工具（OpenAI function 形态）。
@@ -39,7 +93,35 @@ type Tool struct {
 
 // Builtin 返回全部内置工具。
 func Builtin() []Tool {
-	return []Tool{toolListFiles, toolReadFile, toolWriteFile, toolSearchFiles, toolRunCommand}
+	return []Tool{
+		toolListFiles, toolReadFile, toolEditFile, toolWriteFile,
+		toolSearchFiles, toolFindFiles, toolTodoWrite, toolMemoryAppend,
+		toolMemoryRead, toolSkillRead, toolWebFetch, toolTask,
+		toolAskUser, toolCronCreate, toolCronList, toolCronUpdate,
+		toolCronDelete, toolRunCommand, toolTaskOutput, toolTaskKill,
+	}
+}
+
+// SubagentDefs 按子代理类型筛选工具集：
+//   - explore：只保留只读工具（复用 IsWriteCapable 过滤，含只读 MCP）
+//   - general-purpose：全量，但剔除 task 本身（防止子代理再派子代理的无限递归；
+//     深度上限在最外层控制，这里直接从源头去掉递归入口）
+func SubagentDefs(defs []ToolDef, kind string) []ToolDef {
+	out := make([]ToolDef, 0, len(defs))
+	for _, d := range defs {
+		name := d.Function.Name
+		if d.FromMCP != "" {
+			name = d.MCPTool
+		}
+		if name == "task" {
+			continue
+		}
+		if kind == "explore" && IsWriteCapable(name) {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 // ToolDef 是发给上游 OpenAI 接口的 tools 数组元素。
@@ -95,16 +177,33 @@ func IsWriteCapable(name string) bool {
 		return false
 	}
 	switch n {
-	case "write_file", "run_command":
+	case "write_file", "run_command", "task_kill":
 		return true
+	case "cron_create", "cron_update", "cron_delete":
+		// 调度类副作用：plan 模式过滤，ask 模式审批
+		return true
+	case "todo_write", "memory_append":
+		// 只写智能体自己的内部状态（会话待办 / 长期记忆文件），不碰用户项目文件：
+		// 计划模式下同样可用，不算写操作。
+		return false
 	}
+	// 关键词按「词边界」匹配而非裸子串：MCP 工具名用下划线分词，
+	// 裸 Contains 会把 skill_read（命中 kill）、describe_branch（命中 branch）、
+	// list_tags（命中 tag）这类只读工具误判为写操作。
 	for _, kw := range []string{
 		"write", "edit", "create", "mkdir", "move", "rename", "delete", "remove",
 		"patch", "append", "insert", "replace", "copy", "truncate", "chmod",
 		"chown", "symlink", "upload", "save", "persist", "update", "mkfile",
 		"put_", "exec", "run_", "shell", "terminal",
+		// 版本控制类：commit/push/merge/reset 等会改动仓库状态或远端，
+		// 必须算写操作（否则计划模式会暴露它们、ask 模式也不弹审批）
+		"commit", "push", "merge", "rebase", "reset", "checkout",
+		"stash", "tag", "add_", "restore", "revert", "cherry", "clone",
+		// 其他常见改动动词
+		"install", "uninstall", "publish", "deploy", "kill", "stop", "start",
+		"restart", "set_", "modify", "change", "alter", "clear", "wipe",
 	} {
-		if strings.Contains(n, kw) {
+		if wordContains(n, kw) {
 			return true
 		}
 	}
@@ -116,6 +215,26 @@ func IsWriteCapable(name string) bool {
 		}
 	}
 	return false
+}
+
+// wordContains 判断工具名是否包含关键词的「完整词」。
+// 工具名按 _ / - / . 分词；关键词若以 _ 结尾（如 "put_"）则按前缀匹配。
+// 这样 skill_read 不会命中 kill、describe_branch 不会命中 branch。
+func wordContains(name, kw string) bool {
+	// 前缀型关键词（结尾带下划线）：要求出现在某个词的开头
+	if strings.HasSuffix(kw, "_") {
+		return strings.HasPrefix(name, kw) || strings.Contains(name, "_"+kw)
+	}
+	parts := strings.FieldsFunc(name, func(r rune) bool {
+		return r == '_' || r == '-' || r == '.'
+	})
+	for _, p := range parts {
+		if p == kw {
+			return true
+		}
+	}
+	// 无分隔符的名字（如 writefile / deletefile）按前缀或后缀判定
+	return name == kw || strings.HasPrefix(name, kw) || strings.HasSuffix(name, kw)
 }
 
 // ---------- 路径安全 ----------
@@ -148,7 +267,23 @@ func (e *Env) resolveWrite(p string) (string, error) {
 	if p == "" {
 		return "", fmt.Errorf("路径不能为空")
 	}
+	if err := rejectNonPathScheme(p); err != nil {
+		return "", err
+	}
 	return safeJoin(e.Workspace, p)
+}
+
+// rejectNonPathScheme 拒绝把 URL/协议前缀当路径的输入。
+// 这类输入在 Windows 上 filepath.IsAbs 为 false，会被 Join 成
+// "workspaceile:\etc\passwd" 这种既非用户本意、又难排查的怪路径。
+func rejectNonPathScheme(p string) error {
+	lower := strings.ToLower(p)
+	for _, scheme := range []string{"file://", "http://", "https://", "ftp://", "data:", "javascript:"} {
+		if strings.HasPrefix(lower, scheme) {
+			return fmt.Errorf("路径不能是 URL（%q 看起来是链接而非文件路径）：请给出项目内的相对路径或绝对路径", p)
+		}
+	}
+	return nil
 }
 
 // safeJoin 把用户相对路径安全地拼到 root 下，拒绝一切逃逸（..、绝对路径注入、盘符），

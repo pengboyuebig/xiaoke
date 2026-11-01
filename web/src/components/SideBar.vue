@@ -1,7 +1,10 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import type { Agent, Project, SessionMeta } from '../types'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import type { Agent, LLMProfileView, Project, SessionMeta } from '../types'
+import { api } from '../lib/api'
 import AvatarBadge from './AvatarBadge.vue'
+import Icon from './Icon.vue'
+import SessionItem from './SessionItem.vue'
 
 const props = defineProps<{
   sessions: SessionMeta[]
@@ -12,40 +15,139 @@ const props = defineProps<{
   currentAgentId: string
   mode: string
   model: string
+  /** 模型配置档案：底部快速切换菜单用 */
+  profiles?: LLMProfileView[]
+  activeProfile?: string
 }>()
+
+// 模型快速切换菜单（foot 区弹出）
+const modelMenuOpen = ref(false)
+const modelMenuWrap = ref<HTMLElement | null>(null)
+function onDocClick(e: MouseEvent) {
+  if (!modelMenuOpen.value) return
+  if (modelMenuWrap.value && !modelMenuWrap.value.contains(e.target as Node)) modelMenuOpen.value = false
+}
+onMounted(() => document.addEventListener('mousedown', onDocClick))
+onUnmounted(() => document.removeEventListener('mousedown', onDocClick))
+function pickModel(id: string) {
+  modelMenuOpen.value = false
+  if (id !== props.activeProfile) emit('activateModel', id)
+}
 
 const emit = defineEmits<{
   select: [id: string]
   newChat: []
+  rename: [id: string, title: string]
   remove: [id: string]
   selectProject: [id: string]
   newProject: []
+  /** 在指定项目下新建一个会话（同一窗口内） */
+  newSession: [projectId: string]
   removeProject: [id: string]
   selectAgent: [id: string]
   openSettings: []
+  /** 分叉会话：复制全部消息为新会话 */
+  fork: [id: string]
+  /** 一键切换模型配置档案 */
+  activateModel: [id: string]
 }>()
 
+
+// 会话搜索：标题/ID 本地过滤；输入 ≥2 字符按回车 → 后端全文搜索消息内容
+//（跨会话找「哪次聊过」，点击命中跳转会话）
+const sessionQuery = ref('')
+const filteredSessions = computed(() => {
+  const q = sessionQuery.value.trim().toLowerCase()
+  if (!q) return props.sessions
+  return props.sessions.filter(
+    (s) => (s.title || '').toLowerCase().includes(q) || s.id.includes(q),
+  )
+})
+
+// ---------- 按项目分组：项目下创建的会话嵌在项目下方 ----------
+/** 项目下的会话最多显示几条（超出的引导到下方「最近会话」） */
+const PROJECT_SESSIONS_LIMIT = 5
+
+/** 一次性算出分组结果：projectId → 该项目下的会话（按更新时间倒序） */
+const sessionsByProject = computed(() => {
+  const map = new Map<string, SessionMeta[]>()
+  for (const s of filteredSessions.value) {
+    if (!s.projectId) continue
+    const arr = map.get(s.projectId)
+    if (arr) arr.push(s)
+    else map.set(s.projectId, [s])
+  }
+  // 每个项目内按更新时间倒序（新建数组再排序，避免改到原列表）
+  for (const arr of map.values()) {
+    arr.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''))
+  }
+  return map
+})
+
+/** 某项目下要展示的会话（截断到上限） */
+function sessionsOfProject(projectId: string): SessionMeta[] {
+  return (sessionsByProject.value.get(projectId) || []).slice(0, PROJECT_SESSIONS_LIMIT)
+}
+
+/** 某项目下会话总数 */
+function countSessionsOfProject(projectId: string): number {
+  return (sessionsByProject.value.get(projectId) || []).length
+}
+
+/** 不属于任何项目的会话（通用对话），在「最近会话」区单独列出 */
+const looseSessions = computed(() => filteredSessions.value.filter((s) => !s.projectId))
+
+/** 项目区块的展开状态：默认全部展开；用户可点项目名收起它的会话 */
+const collapsedProjects = ref<Record<string, boolean>>({})
+function toggleProjectSessions(projectId: string) {
+  collapsedProjects.value = { ...collapsedProjects.value, [projectId]: !collapsedProjects.value[projectId] }
+}
+function isCollapsed(projectId: string): boolean {
+  return !!collapsedProjects.value[projectId]
+}
+
+interface ContentHit {
+  sessionId: string
+  title: string
+  role: string
+  snippet: string
+}
+const contentHits = ref<ContentHit[]>([])
+const searchBusy = ref(false)
+const searchErr = ref('')
+async function searchContent() {
+  const q = sessionQuery.value.trim()
+  if (q.length < 2) return
+  searchBusy.value = true
+  searchErr.value = ''
+  try {
+    const r = await api.search(q)
+    contentHits.value = r.hits
+    if (!r.hits.length) searchErr.value = '没有会话内容命中。'
+  } catch (e) {
+    searchErr.value = (e as Error).message
+  } finally {
+    searchBusy.value = false
+  }
+}
+function clearContentHits() {
+  contentHits.value = []
+  searchErr.value = ''
+}
+watch(sessionQuery, (v) => {
+  if (!v.trim()) clearContentHits()
+})
+function jumpToHit(id: string) {
+  clearContentHits()
+  sessionQuery.value = ''
+  emit('select', id)
+}
 
 // 智能体切换下拉
 const expanding = ref(false)
 const currentAgent = computed<Agent | null>(
   () => props.agents.find((a) => a.id === props.currentAgentId) || props.agents[0] || null,
 )
-
-function fmtTime(iso: string): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return ''
-  const now = new Date()
-  const sameDay = d.toDateString() === now.toDateString()
-  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-  if (sameDay) return hm
-  return `${d.getMonth() + 1}/${d.getDate()} ${hm}`
-}
-
-function projectName(projects: Project[], id?: string): string {
-  if (!id) return ''
-  return projects.find((p) => p.id === id)?.name || ''
-}
 </script>
 
 <template>
@@ -58,7 +160,7 @@ function projectName(projects: Project[], id?: string): string {
           <div class="as-name">{{ currentAgent?.name || '小柯' }}</div>
           <div class="as-sub">点击切换智能体</div>
         </div>
-        <span class="as-caret">▾</span>
+        <span class="as-caret"><Icon name="chevron-down" :size="14" /></span>
       </div>
       <div v-if="expanding" class="as-list">
         <div
@@ -70,74 +172,145 @@ function projectName(projects: Project[], id?: string): string {
         >
           <AvatarBadge :value="a.avatar" :fallback="a.name" :size="26" />
           <span class="as-item-name">{{ a.name }}</span>
-          <span v-if="a.id === currentAgentId" class="as-check">✓</span>
+          <span v-if="a.builtin" class="as-tag" title="内置人格，不可修改">内置</span>
+          <span v-if="a.id === currentAgentId" class="as-check"><Icon name="check" :size="13" /></span>
         </div>
+        <div v-if="props.agents.length <= 1" class="as-hint">可在 设置 → 智能体 里创建更多人格</div>
       </div>
       <span class="brand-status" title="在线"></span>
     </div>
 
     <button class="new-chat" @click="emit('newChat')">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
-        <path d="M12 5v14M5 12h14" />
-      </svg>
+      <Icon name="plus" :size="15" :stroke="2.4" />
       新对话
     </button>
 
     <div class="section-label">
       项目
-      <button class="add-mini" title="新建项目" @click="emit('newProject')">＋</button>
+      <button class="add-mini" title="新建项目" @click="emit('newProject')">
+        <Icon name="plus" :size="12" :stroke="2.2" />
+      </button>
     </div>
     <div class="list short">
-      <div
-        v-for="p in props.projects"
-        :key="p.id"
-        class="item"
-        :class="{ active: p.id === currentProjectId }"
-        :title="p.path"
-        @click="emit('selectProject', p.id)"
-      >
-        <span class="folder">📁</span>
-        <span class="item-title">{{ p.name }}</span>
-        <button class="item-del" title="删除项目（含目录内全部文件）" @click.stop="emit('removeProject', p.id)">
-          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-            <path d="M18 6L6 18M6 6l12 12" />
-          </svg>
-        </button>
-      </div>
+      <template v-for="p in props.projects" :key="p.id">
+        <div
+          class="item"
+          :class="{ active: p.id === currentProjectId }"
+          :title="p.path"
+          @click="emit('selectProject', p.id)"
+        >
+          <span class="folder"><Icon name="folder" :size="15" /></span>
+          <span class="item-title">{{ p.name }}</span>
+          <!-- 该项目的会话条数 + 折叠开关（只有存在会话时才显示） -->
+          <button
+            v-if="countSessionsOfProject(p.id)"
+            class="proj-toggle"
+            :title="isCollapsed(p.id) ? '展开项目下的会话' : '收起项目下的会话'"
+            @click.stop="toggleProjectSessions(p.id)"
+          >
+            <span class="proj-count">{{ countSessionsOfProject(p.id) }}</span>
+            <Icon :name="isCollapsed(p.id) ? 'chevron-down' : 'chevron-up'" :size="11" :stroke="2" />
+          </button>
+          <!-- 在这个项目下新增一个会话（就在当前窗口，立刻出现在下方列表） -->
+          <button
+            class="proj-new-session"
+            title="在这个项目下新建一个会话"
+            @click.stop="emit('newSession', p.id)"
+          >
+            <Icon name="plus" :size="12" :stroke="2.2" />
+          </button>
+          <button class="item-del" title="删除项目（含目录内全部文件）" @click.stop="emit('removeProject', p.id)">
+            <Icon name="x" :size="12" :stroke="2" />
+          </button>
+        </div>
+        <!-- 项目下的会话：缩进显示，表示从属于上方项目 -->
+        <div v-if="!isCollapsed(p.id) && sessionsOfProject(p.id).length" class="proj-sessions">
+          <SessionItem
+            v-for="s in sessionsOfProject(p.id)"
+            :key="s.id"
+            :session="s"
+            :active="s.id === currentId"
+            nested
+            @select="emit('select', $event)"
+            @rename="(id, title) => emit('rename', id, title)"
+            @remove="emit('remove', $event)"
+            @fork="emit('fork', $event)"
+          />
+          <div v-if="countSessionsOfProject(p.id) > PROJECT_SESSIONS_LIMIT" class="proj-more">
+            还有 {{ countSessionsOfProject(p.id) - PROJECT_SESSIONS_LIMIT }} 条，见下方「最近会话」
+          </div>
+        </div>
+      </template>
       <div v-if="!projects.length" class="empty">还没有项目，点「＋」创建一个。</div>
     </div>
 
-    <div class="section-label">最近会话</div>
+    <div class="section-label">
+      最近会话
+      <span class="sess-count">{{ filteredSessions.length }}</span>
+    </div>
+    <input
+      v-model="sessionQuery"
+      class="sess-search"
+      type="search"
+      placeholder="搜索会话…（回车搜内容）"
+      @keydown.enter.prevent="searchContent"
+    />
+    <!-- 全文搜索结果（跨会话搜消息内容） -->
+    <div v-if="contentHits.length || searchErr" class="search-drop">
+      <div v-if="searchErr" class="empty">{{ searchErr }}</div>
+      <button v-for="(h, hi) in contentHits" :key="hi" class="hit-item" :title="h.snippet" @click="jumpToHit(h.sessionId)">
+        <span class="hit-title">{{ h.title || '新对话' }}</span>
+        <span class="hit-snippet">{{ h.role === 'user' ? '🧑' : '🤖' }} {{ h.snippet }}</span>
+      </button>
+    </div>
     <div class="list">
-      <div
-        v-for="s in sessions"
+      <!-- 通用对话（不属于任何项目）-->
+      <SessionItem
+        v-for="s in looseSessions"
         :key="s.id"
-        class="item"
-        :class="{ active: s.id === currentId }"
-        @click="emit('select', s.id)"
-      >
-        <span v-if="projectName(projects, s.projectId)" class="proj-badge" :title="'项目：' + projectName(projects, s.projectId)">
-          {{ projectName(projects, s.projectId).slice(0, 4) }}
-        </span>
-        <span class="item-title">{{ s.title || '新对话' }}</span>
-        <span class="item-time">{{ fmtTime(s.updatedAt) }}</span>
-        <button class="item-del" title="删除会话" @click.stop="emit('remove', s.id)">
-          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-            <path d="M18 6L6 18M6 6l12 12" />
-          </svg>
-        </button>
-      </div>
-      <div v-if="!sessions.length" class="empty">还没有会话。</div>
+        :session="s"
+        :active="s.id === currentId"
+        @select="emit('select', $event)"
+        @rename="(id, title) => emit('rename', id, title)"
+        @remove="emit('remove', $event)"
+        @fork="emit('fork', $event)"
+      />
+      <div v-if="!filteredSessions.length && sessionQuery.trim()" class="empty">没有匹配「{{ sessionQuery.trim() }}」的会话。</div>
+      <div v-else-if="!sessions.length" class="empty">还没有会话。</div>
+      <div v-else-if="!looseSessions.length" class="empty">会话都已归到上方各自的项目下。</div>
     </div>
 
-    <div class="foot">
-      <span class="mode-dot" :class="mode === 'mock' ? 'amber' : 'green'"></span>
-      <span class="foot-text">{{ mode === 'mock' ? '演示模式' : '在线模型' }} · {{ model || '—' }}</span>
+    <div ref="modelMenuWrap" class="foot">
+      <button
+        class="foot-btn"
+        :title="(props.profiles?.length || 0) > 1 ? '点击切换模型' : '当前模型'"
+        @click="modelMenuOpen = !modelMenuOpen"
+      >
+        <span class="mode-dot" :class="mode === 'mock' ? 'amber' : 'green'"></span>
+        <span class="foot-text">{{ mode === 'mock' ? '演示模式' : '在线模型' }} · {{ model || '—' }}</span>
+      </button>
+      <!-- 模型档案快速切换 -->
+      <div v-if="modelMenuOpen" class="model-menu">
+        <div v-if="!(props.profiles?.length)" class="mm-empty">还没有配置档案——去设置把当前模型保存为档案。</div>
+        <button
+          v-for="p in props.profiles || []"
+          :key="p.id"
+          class="mm-opt"
+          :class="{ active: p.id === props.activeProfile }"
+          @click="pickModel(p.id)"
+        >
+          <span class="mm-main">
+            <b>{{ p.name }}</b>
+            <i>{{ p.model || '（未设模型）' }}</i>
+          </span>
+          <span v-if="p.id === props.activeProfile" class="mm-check"><Icon name="check" :size="13" /></span>
+        </button>
+        <button class="mm-manage" @click="modelMenuOpen = false; emit('openSettings')">
+          <Icon name="settings" :size="12" /> 管理配置…
+        </button>
+      </div>
       <button class="gear" title="设置" @click="emit('openSettings')">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="3" />
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-        </svg>
+        <Icon name="settings" :size="16" />
       </button>
     </div>
   </aside>
@@ -147,37 +320,146 @@ function projectName(projects: Project[], id?: string): string {
 .sidebar {
   width: var(--sidebar-w);
   flex-shrink: 0;
-  background: var(--bg-surface);
-  border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  padding: 14px 12px;
-  gap: 12px;
+  gap: 14px;
+  padding: 16px 14px 12px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), transparent 26%),
+    rgba(9, 10, 14, 0.72);
+  border-right: 1px solid var(--border);
+  backdrop-filter: blur(22px);
+  position: relative;
+}
+
+.sidebar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: -1px;
+  width: 1px;
+  height: 180px;
+  background: linear-gradient(180deg, rgba(255, 154, 61, 0.35), transparent);
+  opacity: 0.55;
+}
+
+
+
+.item-rename {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border-accent);
+  background: var(--bg-inset);
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+}
+
+/* ---------- 全文搜索下拉 ---------- */
+.search-drop {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 0 8px;
+  padding: 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: linear-gradient(180deg, #1c202a 0%, #14171f 100%);
+  box-shadow: var(--shadow);
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.hit-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 9px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+
+.hit-item:hover {
+  background: rgba(255, 154, 61, 0.09);
+}
+
+.hit-title {
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hit-snippet {
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sess-search {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text);
+  outline: none;
+  transition: border-color var(--dur) var(--ease);
+}
+
+.sess-search:focus {
+  border-color: var(--border-accent);
+}
+
+.sess-search::placeholder {
+  color: var(--text-faint);
+}
+
+.sess-count {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---------- 智能体切换器 ---------- */
 .agent-switch {
   position: relative;
-  background: var(--bg);
+  background: linear-gradient(150deg, rgba(32, 37, 48, 0.96), rgba(17, 20, 27, 0.98));
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   cursor: pointer;
-  transition: border-color 0.15s ease;
+  box-shadow: var(--shadow-sm), var(--ring-inset);
+  transition:
+    border-color var(--dur) var(--ease),
+    transform var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
 }
 
 .agent-switch:hover {
   border-color: var(--border-strong);
+  transform: translateY(-1px);
 }
 
 .agent-switch.open {
-  border-color: var(--accent);
+  border-color: var(--border-accent);
+  box-shadow: var(--shadow-soft), 0 0 0 3px rgba(255, 154, 61, 0.08);
 }
 
 .as-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 9px 11px;
+  gap: 11px;
+  padding: 12px;
 }
 
 .as-meta {
@@ -188,25 +470,27 @@ function projectName(projects: Project[], id?: string): string {
 .as-name {
   font-size: 15px;
   font-weight: 700;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.01em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .as-sub {
-  font-size: 11px;
+  margin-top: 1px;
+  font-size: 10.5px;
   color: var(--text-faint);
 }
 
 .as-caret {
+  display: flex;
   color: var(--text-faint);
-  font-size: 11px;
-  transition: transform 0.15s ease;
+  transition: transform var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 
 .agent-switch.open .as-caret {
   transform: rotate(180deg);
+  color: var(--accent);
 }
 
 .as-list {
@@ -215,21 +499,21 @@ function projectName(projects: Project[], id?: string): string {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-height: 220px;
+  max-height: 240px;
   overflow-y: auto;
 }
 
 .as-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 9px;
-  border-radius: var(--radius-sm);
-  transition: background 0.12s ease;
+  gap: 9px;
+  padding: 8px 9px;
+  border-radius: 10px;
+  transition: background 0.16s ease;
 }
 
 .as-item:hover {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .as-item.active {
@@ -246,64 +530,104 @@ function projectName(projects: Project[], id?: string): string {
 }
 
 .as-check {
+  display: flex;
   color: var(--accent);
-  font-size: 12px;
+}
+
+.as-tag {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+
+.as-hint {
+  padding: 8px 9px 4px;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .brand-status {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--ok);
-  box-shadow: 0 0 6px var(--ok);
+  box-shadow: 0 0 0 4px rgba(74, 222, 128, 0.08), 0 0 12px rgba(74, 222, 128, 0.65);
   position: absolute;
-  top: 12px;
-  right: 11px;
+  top: 14px;
+  right: 14px;
 }
 
 .new-chat {
+  position: relative;
+  overflow: hidden;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 9px 12px;
-  background: var(--accent);
+  gap: 7px;
+  padding: 11px 14px;
+  background: var(--accent-gradient);
   color: var(--accent-text);
   border: none;
   border-radius: var(--radius);
-  font-weight: 600;
-  transition: background 0.15s ease;
+  font-size: 13.5px;
+  font-weight: 700;
+  box-shadow: var(--shadow-accent), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  transition: transform var(--dur) var(--ease), filter var(--dur) var(--ease);
+}
+
+.new-chat::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.3) 50%, transparent 80%);
+  transform: translateX(-130%);
+  transition: transform 0.6s var(--ease);
 }
 
 .new-chat:hover {
-  background: var(--accent-hover);
+  transform: translateY(-1px);
+  filter: brightness(1.04);
+}
+
+.new-chat:hover::after {
+  transform: translateX(130%);
 }
 
 .section-label {
-  font-size: 11px;
-  color: var(--text-faint);
-  letter-spacing: 1px;
-  padding: 0 6px;
-  margin-top: 4px;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  padding: 0 8px;
+  margin-top: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-faint);
 }
 
 .add-mini {
-  border: 1px solid var(--border);
-  background: none;
-  color: var(--text-muted);
-  border-radius: 4px;
-  width: 18px;
-  height: 18px;
-  line-height: 1;
-  font-size: 12px;
+  width: 20px;
+  height: 20px;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-faint);
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
 .add-mini:hover {
   color: var(--accent);
-  border-color: var(--accent);
+  border-color: var(--border);
+  background: var(--accent-soft);
 }
 
 .list {
@@ -312,51 +636,127 @@ function projectName(projects: Project[], id?: string): string {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  padding-right: 2px;
 }
 
 .list.short {
   flex: 0 0 auto;
-  max-height: 168px;
+  max-height: 170px;
 }
 
 .item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  border-radius: var(--radius-sm);
+  gap: 9px;
+  padding: 9px 10px;
+  border-radius: 10px;
   cursor: pointer;
   color: var(--text-muted);
   border: 1px solid transparent;
-  transition: background 0.12s ease, color 0.12s ease;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 
 .item:hover {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.045);
   color: var(--text);
 }
 
 .item.active {
-  background: var(--accent-soft);
-  border-color: var(--border);
+  background: linear-gradient(90deg, var(--accent-soft), rgba(255, 154, 61, 0.025));
+  border-color: rgba(255, 154, 61, 0.16);
   color: var(--text);
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .folder {
-  font-size: 13px;
+  display: flex;
+  color: var(--accent);
+  opacity: 0.9;
 }
 
 .proj-badge {
   flex-shrink: 0;
-  font-size: 10px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
   color: var(--accent);
-  background: var(--accent-soft);
-  border-radius: 4px;
+  background: rgba(255, 154, 61, 0.1);
+  border: 1px solid rgba(255, 154, 61, 0.16);
+  border-radius: 5px;
   padding: 1px 5px;
-  max-width: 52px;
+  max-width: 54px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 项目下的会话：缩进 + 左侧竖线，视觉上从属于上方项目 */
+.proj-sessions {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 1px 0 4px 14px;
+  padding-left: 10px;
+  border-left: 1px solid var(--border);
+}
+
+.proj-more {
+  padding: 5px 10px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+/* 项目行的会话条数 + 折叠开关 */
+.proj-toggle {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 5px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-faint);
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.proj-toggle:hover {
+  color: var(--accent);
+  border-color: var(--border);
+  background: var(--accent-soft);
+}
+
+.proj-count {
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 项目行：新建会话（hover 才出现，避免平时太挤） */
+.proj-new-session {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  border-radius: 5px;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, visibility 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.item:hover .proj-new-session {
+  opacity: 1;
+  visibility: visible;
+}
+
+.proj-new-session:hover {
+  color: var(--accent);
+  background: rgba(255, 154, 61, 0.12);
 }
 
 .item-title {
@@ -365,63 +765,218 @@ function projectName(projects: Project[], id?: string): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 13px;
+  font-size: 12.5px;
 }
 
 .item-time {
-  font-size: 11px;
-  color: var(--text-faint);
   flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.item-export {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--text-faint);
+  border-radius: 5px;
+  text-decoration: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, visibility 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.item:hover .item-export {
+  opacity: 1;
+  visibility: visible;
+}
+
+.item-export:hover {
+  color: var(--accent);
+  background: rgba(255, 154, 61, 0.12);
 }
 
 .item-del {
   flex-shrink: 0;
-  display: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
   border: none;
   background: none;
   color: var(--text-faint);
-  padding: 2px;
-  border-radius: 4px;
+  border-radius: 5px;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, visibility 0.15s ease, color 0.15s ease, background 0.15s ease;
 }
 
 .item:hover .item-del {
-  display: flex;
+  opacity: 1;
+  visibility: visible;
 }
 
 .item-del:hover {
   color: var(--danger);
-  background: rgba(255, 107, 107, 0.12);
+  background: var(--danger-soft);
 }
 
 .empty {
-  padding: 8px 6px;
+  padding: 9px 8px;
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: 11.5px;
+  line-height: 1.6;
 }
 
-.foot {
+/* ---------- 底部模型快速切换 ---------- */
+.foot-btn {
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 8px 6px 2px;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: none;
+  border-radius: 9px;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s ease;
+}
+
+.foot-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.model-menu {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 10px;
+  right: 10px;
+  background: linear-gradient(180deg, #1c202a 0%, #14171f 100%);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 40;
+}
+
+.mm-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 9px;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+
+.mm-opt:hover {
+  background: rgba(255, 154, 61, 0.09);
+}
+
+.mm-opt.active {
+  background: linear-gradient(135deg, rgba(255, 154, 61, 0.14), rgba(255, 154, 61, 0.05));
+}
+
+.mm-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.mm-main b {
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mm-main i {
+  font-style: normal;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mm-check {
+  display: flex;
+  color: var(--accent);
+}
+
+.mm-empty {
+  padding: 9px 10px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  line-height: 1.6;
+}
+
+.mm-manage {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 3px;
+  padding: 7px 10px;
+  border: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 10px 10px;
+  background: none;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+
+.mm-manage:hover {
+  color: var(--accent);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.foot {
+  position: relative; /* 模型切换菜单的定位锚点 */
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 11px 6px 2px;
   border-top: 1px solid var(--border);
 }
 
-
 .gear {
-  border: none;
+  border: 1px solid transparent;
   background: none;
   color: var(--text-faint);
-  padding: 5px;
-  border-radius: var(--radius-sm);
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 9px;
   display: flex;
+  align-items: center;
+  justify-content: center;
   margin-left: auto;
-  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
 .gear:hover {
   color: var(--accent);
-  background: var(--bg-surface-2);
+  border-color: var(--border);
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .mode-dot {
@@ -433,14 +988,16 @@ function projectName(projects: Project[], id?: string): string {
 
 .mode-dot.green {
   background: var(--ok);
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.55);
 }
 
 .mode-dot.amber {
   background: var(--warn);
+  box-shadow: 0 0 8px rgba(251, 191, 36, 0.45);
 }
 
 .foot-text {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;

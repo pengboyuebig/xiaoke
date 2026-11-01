@@ -25,6 +25,8 @@ export interface Message {
 
 /** 流式过程中的工具活动（live 状态，落库后由服务端消息接管） */
 export interface ToolActivity {
+  /** 调用 ID（后端 SSE 事件带）：并行执行时按它配对结果 */
+  id?: string
   name: string
   args?: string
   done: boolean
@@ -32,6 +34,8 @@ export interface ToolActivity {
   preview?: string
   error?: string
   ms?: number
+  /** 编辑 diff（tool_result 事件携带，仅本次流式会话内可见） */
+  diff?: string
 }
 
 /** 同一回合的工具调用与结果（按 toolCallId 配对） */
@@ -41,6 +45,8 @@ export interface ToolPair {
   arguments: string
   result?: string
   ok?: boolean
+  /** 编辑 diff（tool_result 事件携带，流式期间可见） */
+  diff?: string
 }
 
 /** 前端把连续的 assistant/tool 消息合并后的渲染分组 */
@@ -70,6 +76,10 @@ export interface Turn {
   /** 末条消息时间（回合结束）；流式中为空 */
   endTime?: string
   streaming?: boolean
+  /** 用户中途停止生成（无正文时显示「已停止」而不是「没有收到内容」） */
+  stopped?: boolean
+  /** 回合起始 user 消息在 messages 里的下标（回退「重来」定位用） */
+  msgIndex?: number
 }
 
 export interface SessionMeta {
@@ -82,6 +92,30 @@ export interface SessionMeta {
   messageCount: number
 }
 
+/** 会话待办（todo_write 工具维护，随会话持久化） */
+export interface Todo {
+  content: string
+  status: 'pending' | 'in_progress' | 'completed'
+}
+
+/** 回收站里的一条记录（删除会话时保留的副本） */
+export interface TrashItem {
+  /** 目录名，恢复/彻底删除时用 */
+  dir: string
+  id: string
+  title: string
+  messageCount: number
+  deletedAt: string
+  sizeBytes: number
+}
+
+/** 批量恢复/彻底删除的结果 */
+export interface TrashBatchResult {
+  ok: number
+  failed: number
+  errors?: string[]
+}
+
 export interface Session {
   id: string
   title: string
@@ -90,6 +124,10 @@ export interface Session {
   createdAt: string
   updatedAt: string
   messages: Message[]
+  todos?: Todo[]
+  promptTokens?: number
+  completionTokens?: number
+  requests?: number
 }
 
 export interface ListResponse {
@@ -116,6 +154,32 @@ export interface Project {
   createdAt: string
 }
 
+/** 目录浏览接口返回（新建项目的文件夹选择器用） */
+export interface FsDirEntry {
+  name: string
+  path: string
+}
+
+export interface FsDirsResp {
+  path: string
+  name: string
+  /** 上级目录绝对路径；空 = 已到顶 */
+  parent: string
+  dirs: FsDirEntry[]
+  /** 是否因 500 条上限被截断 */
+  truncated: boolean
+  /** 可快速跳转的根（Windows 盘符） */
+  roots: string[]
+}
+
+/** 按文件夹名查找的结果（拖拽文件夹用） */
+export interface FindDirResp {
+  query: string
+  dirs: FsDirEntry[]
+  /** 是否因搜索预算/上限提前结束（结果可能不全） */
+  truncated: boolean
+}
+
 // ---------- 智能体 ----------
 
 export interface Agent {
@@ -125,6 +189,8 @@ export interface Agent {
   avatar?: string // /assets/... 或 emoji
   systemPrompt?: string
   tools: boolean
+  /** 内置人格（小柯）：对用户隐藏，不可编辑或删除 */
+  builtin?: boolean
   createdAt: string
   updatedAt: string
 }
@@ -139,6 +205,22 @@ export interface Skill {
   enabled: boolean
   createdAt: string
   updatedAt: string
+}
+
+/** 定时任务（cron_create 族工具维护，无人值守执行） */
+export interface Automation {
+  id: string
+  title: string
+  cron: string
+  prompt: string
+  projectId?: string
+  enabled: boolean
+  maxRuns?: number
+  runCount: number
+  nextRunAt?: string
+  lastRunAt?: string
+  createdAt: string
+  lastError?: string
 }
 
 export interface TreeItem {
@@ -165,15 +247,64 @@ export interface SettingsView {
     apiKeySet: boolean
     apiKeyTail: string
     model: string
+    smallModel: string
     temperature: number
     maxHistory: number
+    maxTokens: number
+    contextWindow: number
   }
   mcpServers: MCPServerCfg[]
   readDirs: string[]
   projectsRoot: string
   projectsRootEffective: string
   maxToolSteps: number
+  /** 单次回复的总工具轮数预算（含续跑段）；0 = 不续跑 */
+  maxTotalSteps: number
   commandAllowlist: string[]
+  autoCompact: boolean
+  compactKeepCount: number
+  commandTimeoutSec: number
+  permissions: PermissionRule[]
+  commands: CustomCommand[]
+  /** 模型配置档案（apiKey 脱敏：只给 apiKeySet + 尾4位） */
+  profiles: LLMProfileView[]
+  activeProfile: string
+}
+
+/** 模型配置档案视图（key 脱敏） */
+export interface LLMProfileView {
+  id: string
+  name: string
+  mode: string // mock | openai
+  baseURL: string
+  apiKeySet: boolean
+  apiKeyTail?: string
+  model: string
+  smallModel?: string
+}
+
+/** 保存/编辑档案时的提交形态（apiKey 空 = 保持原值） */
+export interface LLMProfilePayload {
+  id: string
+  name: string
+  mode: string
+  baseURL: string
+  apiKey: string
+  model: string
+  smallModel?: string
+}
+
+/** 一条权限规则：工具名与资源模式支持 * ? 通配，按书写顺序取最后命中 */
+export interface PermissionRule {
+  tool: string
+  pattern?: string
+  effect: 'allow' | 'ask' | 'deny'
+}
+
+/** 斜杠命令模板：$ARGUMENTS=全部参数，$1..$9=位置参数 */
+export interface CustomCommand {
+  name: string
+  template: string
 }
 
 export interface MCPStatus {
@@ -196,12 +327,23 @@ export interface SettingsPayload {
     baseURL: string
     apiKey: string
     model: string
+    smallModel: string
     temperature: number
     maxHistory: number
+    maxTokens: number
+    contextWindow: number
   }
   mcpServers: MCPServerCfg[]
   readDirs: string[]
   projectsRoot: string
   maxToolSteps: number
+  /** 单次回复的总工具轮数预算（含续跑段）；0 = 不续跑 */
+  maxTotalSteps: number
   commandAllowlist: string[]
+  autoCompact: boolean
+  compactKeepCount: number
+  commandTimeoutSec: number
+  permissions: PermissionRule[]
+  commands: CustomCommand[]
+  llmProfiles: LLMProfilePayload[]
 }

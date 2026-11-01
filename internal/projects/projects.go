@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"xiaoke/internal/tools"
 )
 
 var ErrNotFound = errors.New("project not found")
@@ -218,8 +220,7 @@ func (m *Manager) Tree(id string) ([]TreeItem, error) {
 		}
 		name := d.Name()
 		if d.IsDir() {
-			switch name {
-			case "node_modules", ".git", "__pycache__", "dist", "build", ".venv", "venv":
+			if tools.SkipDirs[name] {
 				return fs.SkipDir
 			}
 			if strings.Count(rel, string(filepath.Separator)) >= 4 {
@@ -231,6 +232,13 @@ func (m *Manager) Tree(id string) ([]TreeItem, error) {
 		}
 		items = append(items, TreeItem{Path: filepath.ToSlash(rel), IsDir: d.IsDir()})
 		return nil
+	})
+	// 目录优先、各自字母序：文件树层次一目了然
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].IsDir != items[j].IsDir {
+			return items[i].IsDir
+		}
+		return items[i].Path < items[j].Path
 	})
 	return items, nil
 }

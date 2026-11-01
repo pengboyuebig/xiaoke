@@ -9,6 +9,7 @@
 package store
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"crypto/rand"
@@ -16,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -55,6 +57,13 @@ type ToolCallRecord struct {
 	Arguments string `json:"arguments"`
 }
 
+// Todo 是会话级待办（todo_write 工具维护），随会话持久化、切会话还原。
+type Todo struct {
+	Content   string    `json:"content"`
+	Status    string    `json:"status"` // pending | in_progress | completed
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
 type Session struct {
 	ID        string    `json:"id"`
 	Title     string    `json:"title"`
@@ -65,6 +74,23 @@ type Session struct {
 	// LastSeq 是快照已包含到的日志序号（日志合并后写入）
 	LastSeq  int64     `json:"lastSeq,omitempty"`
 	Messages []Message `json:"messages"`
+
+	// Summary 是主动压缩生成的「历史摘要」；SummaryUpTo 之前的消息已被它覆盖。
+	// 摘要存在快照里（随快照合并/迁移一起走），发送上下文时用摘要替代旧消息。
+	Summary     string    `json:"summary,omitempty"`
+	SummaryUpTo time.Time `json:"summaryUpTo,omitempty"`
+
+	// Todos 当前待办清单（整表替换式更新），压缩后仍注入上下文，长任务不丢进度。
+	Todos []Todo `json:"todos,omitempty"`
+
+	// PromptTokens/CompletionTokens/Requests 是会话累计用量（优先取上游真实
+	// usage，缺失时按字节估算兜底），仅作展示，不参与压缩触发。
+	PromptTokens     int64 `json:"promptTokens,omitempty"`
+	CompletionTokens int64 `json:"completionTokens,omitempty"`
+	Requests         int64 `json:"requests,omitempty"`
+	// LastPromptTokens 是上一次请求的真实 prompt tokens（usage 缺失时为估算值）。
+	// 配置了 ContextWindow 时，压缩触发优先用它——比 bytes/4 估算更贴近上游真实约束。
+	LastPromptTokens int64 `json:"lastPromptTokens,omitempty"`
 }
 
 // Meta 是会话列表里展示的摘要（不含消息体）。
@@ -89,6 +115,9 @@ type logEntry struct {
 type Store struct {
 	dir string
 	mu  sync.Mutex
+
+	// backupMu 串行化写备份文件（否则并发备份时清理临时文件会误删对方正在写的 .tmp）
+	backupMu sync.Mutex
 
 	lockMapMu   sync.Mutex
 	sessionLock map[string]*sync.Mutex
@@ -196,7 +225,7 @@ func (s *Store) Create(title, projectID string) (*Session, error) {
 }
 
 // List 返回全部会话的摘要，按更新时间倒序。
-// 优先只读 meta 文件；没有 meta 的旧会话回退到完整加载（不写盘）。
+// 优先只读 meta 文件；没有 meta 的旧会话完整加载一次并补写 meta（一次性迁移）。
 func (s *Store) List() ([]Meta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -226,7 +255,8 @@ func (s *Store) List() ([]Meta, error) {
 		metas = append(metas, m)
 		seen[id] = true
 	}
-	// 兼容没有 meta 的旧会话
+	// 兼容没有 meta 的旧会话：完整加载一次并补写 meta（一次性迁移），
+	// 否则每次列表刷新都要全量读快照+日志，会话越多侧栏越慢。
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".meta.json") {
@@ -240,6 +270,7 @@ func (s *Store) List() ([]Meta, error) {
 		if err != nil {
 			continue // 单个文件损坏不影响列表
 		}
+		_ = s.saveMeta(metaOf(sess))
 		metas = append(metas, metaOf(sess))
 	}
 	sort.Slice(metas, func(i, j int) bool { return metas[i].UpdatedAt.After(metas[j].UpdatedAt) })
@@ -341,6 +372,8 @@ func (s *Store) SetProject(id, projectID string) error {
 	return s.saveMeta(meta)
 }
 
+// Delete 删除会话。删除前先把三个文件复制到 trash 目录，
+// 复制失败则中止删除（宁可删不掉，也不能悄悄丢数据）。
 func (s *Store) Delete(id string) error {
 	if !validID.MatchString(id) {
 		return ErrNotFound
@@ -353,8 +386,435 @@ func (s *Store) Delete(id string) error {
 		}
 		return err
 	}
+	if _, err := s.moveToTrashLocked(id); err != nil {
+		return fmt.Errorf("删除前备份失败，已取消删除: %w", err)
+	}
+	s.pruneTrashLocked()
 	for _, p := range []string{s.logPath(id), s.metaPath(id), s.path(id)} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// TrashDir 是删除会话时保留副本的目录（位于会话目录下的 trash/）。
+func (s *Store) TrashDir() string { return filepath.Join(s.dir, "trash") }
+
+// maxTrashEntries 回收站目录数上限：到顶后删最旧的。
+// 30 天自动清理之外的第二道保险——短时间大量删会话也不会把磁盘吃穿。
+const maxTrashEntries = 50
+
+// pruneTrashLocked 回收站条数超限时按修改时间删最旧。调用方需持有 s.mu。
+func (s *Store) pruneTrashLocked() {
+	entries, err := os.ReadDir(s.TrashDir())
+	if err != nil || len(entries) <= maxTrashEntries {
+		return
+	}
+	type item struct {
+		name string
+		mod  time.Time
+	}
+	items := []item{}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			items = append(items, item{e.Name(), info.ModTime()})
+		}
+	}
+	if len(items) <= maxTrashEntries {
+		return
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].mod.Before(items[j].mod) })
+	for i := 0; i < len(items)-maxTrashEntries; i++ {
+		_ = os.RemoveAll(filepath.Join(s.TrashDir(), items[i].name))
+	}
+}
+
+// moveToTrashLocked 把会话文件复制到 trash/<id>-<时间戳>/。调用方需持有 s.mu。
+func (s *Store) moveToTrashLocked(id string) (string, error) {
+	dst := filepath.Join(s.TrashDir(), id+"-"+time.Now().Format("20060102-150405"))
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return "", err
+	}
+	copied := 0
+	for _, p := range []string{s.path(id), s.logPath(id), s.metaPath(id)} {
+		if err := copyFile(p, filepath.Join(dst, filepath.Base(p))); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // 日志/摘要可能本来就没有
+			}
+			return "", err
+		}
+		copied++
+	}
+	if copied == 0 {
+		return "", fmt.Errorf("没有可备份的文件")
+	}
+	return dst, nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// trashName 匹配回收站目录名 <id>-<YYYYMMDD>-<HHMMSS>。
+var trashName = regexp.MustCompile(`^([0-9a-f]{16})-(\d{8}-\d{6})$`)
+
+// ErrTrashNotFound 表示回收站里没有这个目录。
+var ErrTrashNotFound = errors.New("回收站里没有这条记录")
+
+// ErrSessionExists 表示同 ID 的会话仍在，不能覆盖恢复。
+var ErrSessionExists = errors.New("该会话仍然存在，无需恢复")
+
+// TrashItem 是回收站里的一条记录。
+type TrashItem struct {
+	Dir          string    `json:"dir"`   // 目录名（恢复/彻底删除时用）
+	ID           string    `json:"id"`    // 原会话 ID
+	Title        string    `json:"title"` // 快照里的标题（可能为空）
+	MessageCount int       `json:"messageCount"`
+	DeletedAt    time.Time `json:"deletedAt"` // 取自目录名时间戳
+	SizeBytes    int64     `json:"sizeBytes"`
+}
+
+// ListTrash 列出回收站记录，按删除时间倒序（最近的在前）。
+func (s *Store) ListTrash() ([]TrashItem, error) {
+	entries, err := os.ReadDir(s.TrashDir())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []TrashItem{}, nil
+		}
+		return nil, err
+	}
+	items := []TrashItem{}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		m := trashName.FindStringSubmatch(e.Name())
+		if m == nil {
+			continue
+		}
+		item := TrashItem{Dir: e.Name(), ID: m[1]}
+		if t, err := time.ParseInLocation("20060102-150405", m[2], time.Local); err == nil {
+			item.DeletedAt = t
+		}
+		dir := filepath.Join(s.TrashDir(), e.Name())
+		item.MessageCount = countMessagesInDir(dir, item.ID)
+		if data, err := os.ReadFile(filepath.Join(dir, item.ID+".json")); err == nil {
+			var snap Session
+			if json.Unmarshal(data, &snap) == nil {
+				item.Title = snap.Title
+			}
+		}
+		if fs, err := os.ReadDir(dir); err == nil {
+			for _, f := range fs {
+				if info, err := f.Info(); err == nil {
+					item.SizeBytes += info.Size()
+				}
+			}
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].DeletedAt.Equal(items[j].DeletedAt) {
+			return items[i].Dir > items[j].Dir
+		}
+		return items[i].DeletedAt.After(items[j].DeletedAt)
+	})
+	return items, nil
+}
+
+// countMessagesInDir 统计回收站副本的消息数：快照 + 未合并日志。
+// 删除时快照可能还没合并日志，只看快照会漏掉最近的消息。
+func countMessagesInDir(dir, id string) int {
+	n := 0
+	if data, err := os.ReadFile(filepath.Join(dir, id+".json")); err == nil {
+		var snap Session
+		if json.Unmarshal(data, &snap) == nil {
+			n = len(snap.Messages)
+		}
+	}
+	f, err := os.Open(filepath.Join(dir, id+".log"))
+	if err != nil {
+		return n
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), maxLogLine)
+	for sc.Scan() {
+		if strings.TrimSpace(sc.Text()) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// RestoreTrash 把回收站里的一条记录恢复到会话目录。
+// 同 ID 会话仍存在时拒绝覆盖（返回 ErrSessionExists）。
+func (s *Store) RestoreTrash(dirName string) (string, error) {
+	m := trashName.FindStringSubmatch(dirName)
+	if m == nil {
+		return "", ErrTrashNotFound
+	}
+	id := m[1]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	src := filepath.Join(s.TrashDir(), dirName)
+	if _, err := os.Stat(filepath.Join(src, id+".json")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", ErrTrashNotFound
+		}
+		return "", err
+	}
+	if _, err := os.Stat(s.path(id)); err == nil {
+		return "", ErrSessionExists
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	// 快照必须成功；日志/摘要缺失不算错误
+	if err := copyFile(filepath.Join(src, id+".json"), s.path(id)); err != nil {
+		return "", err
+	}
+	for _, name := range []string{id + ".log", id + ".meta.json"} {
+		if err := copyFile(filepath.Join(src, name), filepath.Join(s.dir, name)); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	_ = os.RemoveAll(src)
+	return id, nil
+}
+
+// PurgeTrash 彻底删除回收站里的一条记录。
+func (s *Store) PurgeTrash(dirName string) error {
+	if trashName.FindStringSubmatch(dirName) == nil {
+		return ErrTrashNotFound
+	}
+	src := filepath.Join(s.TrashDir(), dirName)
+	if _, err := os.Stat(src); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ErrTrashNotFound
+		}
+		return err
+	}
+	return os.RemoveAll(src)
+}
+
+// PurgeTrashBatch 批量彻底删除。单条失败不中断其余删除，
+// 返回成功条数与逐条错误（供界面汇总提示）。
+func (s *Store) PurgeTrashBatch(dirNames []string) (ok int, errs []error) {
+	for _, dir := range dirNames {
+		if err := s.PurgeTrash(dir); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", dir, err))
+			continue
+		}
+		ok++
+	}
+	return ok, errs
+}
+
+// PurgeTrashOlderThan 清理超过 d 的回收站记录，返回清理条数。
+// d<=0 表示不清理（避免误把保留期写成 0 导致全删）。
+func (s *Store) PurgeTrashOlderThan(d time.Duration) (int, error) {
+	if d <= 0 {
+		return 0, nil
+	}
+	items, err := s.ListTrash()
+	if err != nil {
+		return 0, err
+	}
+	cutoff := time.Now().Add(-d)
+	n := 0
+	for _, it := range items {
+		if it.DeletedAt.IsZero() || it.DeletedAt.After(cutoff) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(s.TrashDir(), it.Dir)); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
+
+// Export 返回完整会话的 JSON（快照 + 未合并日志），用于单会话导出。
+func (s *Store) Export(id string) ([]byte, error) {
+	sess, err := s.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	return json.MarshalIndent(sess, "", "  ")
+}
+
+// backupManifest 是整包备份里的说明文件，便于人工核对。
+type backupManifest struct {
+	CreatedAt time.Time `json:"createdAt"`
+	Count     int       `json:"count"`
+	Sessions  []string  `json:"sessions"`
+}
+
+// WriteBackup 把全部会话文件打包成 zip 写到 w（不包含 trash/）。
+func (s *Store) WriteBackup(w io.Writer) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return err
+	}
+	zw := zip.NewWriter(w)
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			continue
+		}
+		id := ""
+		switch {
+		case strings.HasSuffix(name, ".meta.json"):
+			id = strings.TrimSuffix(name, ".meta.json")
+		case strings.HasSuffix(name, ".json"):
+			id = strings.TrimSuffix(name, ".json")
+		case strings.HasSuffix(name, ".log"):
+			id = strings.TrimSuffix(name, ".log")
+		}
+		if !validID.MatchString(id) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(s.dir, name))
+		if err != nil {
+			return err
+		}
+		fw, err := zw.Create(name)
+		if err != nil {
+			return err
+		}
+		if _, err := fw.Write(data); err != nil {
+			return err
+		}
+	}
+	ids := s.listIDsLocked(entries)
+	manifest, err := json.MarshalIndent(backupManifest{
+		CreatedAt: time.Now(), Count: len(ids), Sessions: ids,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	mw, err := zw.Create("manifest.json")
+	if err != nil {
+		return err
+	}
+	if _, err := mw.Write(manifest); err != nil {
+		return err
+	}
+	return zw.Close()
+}
+
+// listIDsLocked 列出目录里所有合法会话 ID（快照存在才算）。调用方需持有 s.mu。
+func (s *Store) listIDsLocked(entries []os.DirEntry) []string {
+	ids := []string{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || strings.HasSuffix(e.Name(), ".meta.json") {
+			continue
+		}
+		id := strings.TrimSuffix(e.Name(), ".json")
+		if validID.MatchString(id) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// Backup 在 dir 下生成 sessions-<时间戳>.zip，并只保留最近 keep 份（keep<=0 表示不清理）。
+func (s *Store) Backup(dir string, keep int) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	cleanStaleTemps(dir) // 上次进程被强杀可能留下半截 .tmp
+	name := "sessions-" + time.Now().Format("20060102-150405") + ".zip"
+	path := filepath.Join(dir, name)
+	// 同一秒内重复备份时避免覆盖
+	for i := 2; ; i++ {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		path = filepath.Join(dir, fmt.Sprintf("sessions-%s-%d.zip", time.Now().Format("20060102-150405"), i))
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return "", err
+	}
+	if err := s.WriteBackup(f); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if keep > 0 {
+		_ = pruneBackups(dir, keep) // 清理失败不影响本次备份
+	}
+	return path, nil
+}
+
+// cleanStaleTemps 清理上次被强杀留下的半截备份临时文件。
+func cleanStaleTemps(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasPrefix(n, "sessions-") || !strings.HasSuffix(n, ".zip.tmp") {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, n))
+	}
+}
+
+// pruneBackups 只保留最近 keep 份备份（按文件名里的时间戳排序）。
+func pruneBackups(dir string, keep int) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	names := []string{}
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasPrefix(n, "sessions-") || !strings.HasSuffix(n, ".zip") {
+			continue
+		}
+		names = append(names, n)
+	}
+	if len(names) <= keep {
+		return nil
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	for _, n := range names[keep:] {
+		if err := os.Remove(filepath.Join(dir, n)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
@@ -464,6 +924,133 @@ func (s *Store) compactLocked(id string) error {
 		return err
 	}
 	// 删除失败不阻断：快照的 LastSeq 会让旧日志条目在读取时被跳过
+	_ = os.Remove(s.logPath(id))
+	return s.saveMeta(metaOf(sess))
+}
+
+// SetTitle 设置会话标题（写 meta 即可：加载侧以 meta 为准）。
+// 已有标题时不覆盖——自动命名只补空白，用户改过就尊重。
+func (s *Store) SetTitle(id, title string) error {
+	if !validID.MatchString(id) {
+		return ErrNotFound
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return nil
+	}
+	if rs := []rune(title); len(rs) > 32 {
+		title = string(rs[:32])
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.loadMeta(id)
+	if err != nil {
+		// 无 meta 的旧会话：先补一份再改
+		sess, lerr := s.loadFullLocked(id)
+		if lerr != nil {
+			return lerr
+		}
+		m = metaOf(sess)
+	}
+	if strings.TrimSpace(m.Title) != "" {
+		return nil
+	}
+	m.Title = title
+	m.UpdatedAt = time.Now()
+	return s.saveMeta(m)
+}
+
+// RenameTitle 强制重命名会话（与 SetTitle 的「只补空白」不同，这是用户主动改名）。
+// 允许改名后跟随自动命名：传空串表示清空标题，下次对话会重新自动命名。
+func (s *Store) RenameTitle(id, title string) error {
+	if !validID.MatchString(id) {
+		return ErrNotFound
+	}
+	title = strings.TrimSpace(title)
+	if rs := []rune(title); len(rs) > 64 {
+		title = string(rs[:64])
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.loadMeta(id)
+	if err != nil {
+		sess, lerr := s.loadFullLocked(id)
+		if lerr != nil {
+			return lerr
+		}
+		m = metaOf(sess)
+	}
+	m.Title = title
+	m.UpdatedAt = time.Now()
+	return s.saveMeta(m)
+}
+
+// SetSummary 持久化「历史摘要」：把摘要写进快照并收敛日志，
+// 保证重启后摘要与消息边界（SummaryUpTo）一起还原。
+func (s *Store) SetSummary(id string, summary string, upTo time.Time) error {
+	if !validID.MatchString(id) {
+		return ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, err := s.loadFullLocked(id)
+	if err != nil {
+		return err
+	}
+	sess.Summary = summary
+	sess.SummaryUpTo = upTo
+	if err := s.saveSnapshot(sess); err != nil {
+		return err
+	}
+	// 消息体已随快照落盘（导出/回收站仍能看到完整历史），日志收敛掉避免双份；
+	// 读取侧按 SummaryUpTo 过滤摘要覆盖范围。
+	_ = os.Remove(s.logPath(id))
+	return s.saveMeta(metaOf(sess))
+}
+
+// SetTodos 整表替换会话待办（todo_write 工具的持久化入口）。
+func (s *Store) SetTodos(id string, todos []Todo) error {
+	if !validID.MatchString(id) {
+		return ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, err := s.loadFullLocked(id)
+	if err != nil {
+		return err
+	}
+	sess.Todos = todos
+	sess.UpdatedAt = time.Now()
+	if err := s.saveSnapshot(sess); err != nil {
+		return err
+	}
+	_ = os.Remove(s.logPath(id))
+	return s.saveMeta(metaOf(sess))
+}
+
+// AddUsage 累计会话用量（每次对话请求结束时调用一次）。
+// prompt/completion 是本轮所有上游调用的累加（用于展示与统计）；
+// lastPrompt 是「最后一次上游调用」的 prompt tokens——压缩触发用这个值代表
+// 当前上下文的真实大小（传 0 表示未知，保留旧值，避免用累加值污染水位）。
+func (s *Store) AddUsage(id string, prompt, completion, lastPrompt int64) error {
+	if !validID.MatchString(id) {
+		return ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, err := s.loadFullLocked(id)
+	if err != nil {
+		return err
+	}
+	sess.PromptTokens += prompt
+	sess.CompletionTokens += completion
+	sess.Requests++
+	if lastPrompt > 0 {
+		sess.LastPromptTokens = lastPrompt
+	}
+	if err := s.saveSnapshot(sess); err != nil {
+		return err
+	}
 	_ = os.Remove(s.logPath(id))
 	return s.saveMeta(metaOf(sess))
 }

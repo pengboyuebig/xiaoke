@@ -1,33 +1,146 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import Icon from './Icon.vue'
+import type { CustomCommand, LLMProfileView } from '../types'
 
-const props = defineProps<{ busy: boolean; reasoning: string; mode?: string }>()
 const emit = defineEmits<{
   send: [content: string]
   stop: []
   'update:reasoning': [v: string]
-  setMode: [m: 'plan' | 'build']
+  setMode: [m: 'plan' | 'build' | 'ask']
+  activateModel: [id: string]
 }>()
 
 const text = ref('')
 const ta = ref<HTMLTextAreaElement | null>(null)
 
+// 草稿按会话保存：切会话/误刷新不丢输入。上限 20 条草稿防 localStorage 膨胀。
+const DRAFT_PREFIX = 'xiaoke-draft:'
+const DRAFT_MAX = 20
+const props = defineProps<{
+  busy: boolean
+  reasoning: string
+  mode?: string
+  sessionId?: string
+  /** 自定义斜杠命令（设置 → 高级维护）；busy 时发送自动进入队列 */
+  commands?: CustomCommand[]
+  /** 本会话累计 token 用量（服务端会话快照累计，切会话随会话还原） */
+  sessionUsage?: { prompt: number; completion: number; requests: number } | null
+  /** 模型配置档案：输入框左下角快捷切换 */
+  profiles?: LLMProfileView[]
+  activeProfile?: string
+  modelName?: string
+  /** 当前智能体名（「正在输入」指示器里显示，空 = 小柯） */
+  agentName?: string
+  /** 是否在当前查看的会话里正在生成（决定指示器显不显示；与 busy 分开） */
+  typing?: boolean
+}>()
+
+function loadDraft(sid?: string) {
+  if (!sid) return ''
+  try {
+    return localStorage.getItem(DRAFT_PREFIX + sid) || ''
+  } catch {
+    return ''
+  }
+}
+function saveDraft(sid: string | undefined, value: string) {
+  if (!sid) return
+  try {
+    if (value) localStorage.setItem(DRAFT_PREFIX + sid, value)
+    else localStorage.removeItem(DRAFT_PREFIX + sid)
+    // 粗略防膨胀：草稿键过多时按 key 序清理一批（非精确 LRU，够用即可）
+    const keys: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i)
+      if (k?.startsWith(DRAFT_PREFIX)) keys.push(k)
+    }
+    if (keys.length > DRAFT_MAX) {
+      keys.sort()
+      for (const k of keys.slice(0, keys.length - DRAFT_MAX)) localStorage.removeItem(k)
+    }
+  } catch {
+    /* 存储满/隐私模式：忽略 */
+  }
+}
+watch(
+  () => props.sessionId,
+  (sid, prev) => {
+    if (prev && text.value.trim()) saveDraft(prev, text.value)
+    text.value = loadDraft(sid)
+  },
+  { immediate: true },
+)
+watch(text, (v) => saveDraft(props.sessionId, v))
+
 // 输入框左侧的工作模式切换
 const modeMenuOpen = ref(false)
 const modeWrap = ref<HTMLElement | null>(null)
+// 模型档案快捷切换（模式按钮旁）
+const modelMenuOpen = ref(false)
+const modelWrap = ref<HTMLElement | null>(null)
+const activeModelLabel = computed(() => {
+  const p = (props.profiles || []).find((x) => x.id === props.activeProfile)
+  return p?.name || props.modelName || '模型'
+})
 const isPlan = () => props.mode === 'plan'
-function pickMode(m: 'plan' | 'build') {
+const isAsk = () => props.mode === 'ask'
+function pickMode(m: 'plan' | 'build' | 'ask') {
   emit('setMode', m)
   modeMenuOpen.value = false
 }
 
+/** 三个弹出菜单互斥：同一时刻只允许一个打开（否则层叠遮挡、点击外部的判断也会打架） */
+function closeMenus(except?: 'mode' | 'model' | 'level') {
+  if (except !== 'mode') modeMenuOpen.value = false
+  if (except !== 'model') modelMenuOpen.value = false
+  if (except !== 'level') levelMenuOpen.value = false
+}
+function toggleMenu(which: 'mode' | 'model' | 'level') {
+  const open = { mode: modeMenuOpen, model: modelMenuOpen, level: levelMenuOpen }[which]
+  const next = !open.value
+  closeMenus(which)
+  open.value = next
+}
+function pickModel(id: string) {
+  modelMenuOpen.value = false
+  if (id !== props.activeProfile) emit('activateModel', id)
+}
+
+/** Esc 关闭所有弹出菜单（键盘可达性） */
+function onKeydownEsc(e: KeyboardEvent) {
+  if (e.key === 'Escape') closeMenus()
+}
+
 // 点击面板外部关闭
 function onDocClick(e: MouseEvent) {
-  if (!modeMenuOpen.value) return
-  if (modeWrap.value && !modeWrap.value.contains(e.target as Node)) modeMenuOpen.value = false
+  if (modeMenuOpen.value && modeWrap.value && !modeWrap.value.contains(e.target as Node)) modeMenuOpen.value = false
+  if (modelMenuOpen.value && modelWrap.value && !modelWrap.value.contains(e.target as Node)) modelMenuOpen.value = false
+  if (levelMenuOpen.value && levelWrap.value && !levelWrap.value.contains(e.target as Node)) levelMenuOpen.value = false
 }
-onMounted(() => document.addEventListener('mousedown', onDocClick))
-onUnmounted(() => document.removeEventListener('mousedown', onDocClick))
+onMounted(() => {
+  document.addEventListener('mousedown', onDocClick)
+  document.addEventListener('keydown', onKeydownEsc)
+})
+onUnmounted(() => {
+  document.removeEventListener('mousedown', onDocClick)
+  document.removeEventListener('keydown', onKeydownEsc)
+})
+
+/** 大数字紧凑显示：1.2 万 / 12 万 / 1.2 亿 */
+function fmtTokens(n: number): string {
+  if (!n) return '0'
+  if (n < 10000) return String(n)
+  if (n < 100000000) {
+    const w = n / 10000
+    return (w >= 100 ? Math.round(w) : w.toFixed(1).replace(/\.0$/, '')) + ' 万'
+  }
+  return (n / 100000000).toFixed(1).replace(/\.0$/, '') + ' 亿'
+}
+const totalTokens = computed(() => {
+  const u = props.sessionUsage
+  return u ? (u.prompt || 0) + (u.completion || 0) : 0
+})
 
 // 思考程度选项（none 不注入请求体；其余映射为 reasoning_effort）
 const LEVELS = [
@@ -47,56 +160,186 @@ function resize() {
 }
 watch(text, resize)
 
+// ---------- 斜杠命令补全 ----------
+// 输入以 / 开头（单行）时展示命令菜单；发送时精确匹配命令名 → 模板展开后发送。
+const slashOpen = computed(() => text.value.startsWith('/') && !text.value.includes('\n'))
+const slashMatches = computed<CustomCommand[]>(() => {
+  if (!slashOpen.value) return []
+  const q = text.value.slice(1).split(/\s/)[0].toLowerCase()
+  return (props.commands || []).filter((c) => c.name.toLowerCase().startsWith(q)).slice(0, 6)
+})
+const slashActive = ref(0)
+watch(slashMatches, (m) => {
+  if (slashActive.value >= m.length) slashActive.value = 0
+})
+
+/** 模板展开：$ARGUMENTS=全部参数文本，$1..$9=按空白分词的位置参数 */
+function expandCommand(c: CustomCommand, input: string): string {
+  const rest = input.slice(1 + c.name.length).trim()
+  const parts = rest.split(/\s+/).filter(Boolean)
+  return c.template
+    .replace(/\$ARGUMENTS/g, rest)
+    .replace(/\$(\d)/g, (_m, d: string) => parts[Number(d) - 1] ?? '')
+}
+
+function pickSlash(c: CustomCommand) {
+  const expanded = expandCommand(c, text.value).trim()
+  text.value = ''
+  saveDraft(props.sessionId, '')
+  if (expanded) emit('send', expanded)
+}
+
+/** 悬停提示：展示完整模板（过长截断） */
+function expandHint(c: CustomCommand): string {
+  return c.template.length > 120 ? c.template.slice(0, 120) + '…' : c.template
+}
+
 function submit() {
   const content = text.value.trim()
-  if (!content || props.busy) return
+  if (!content) return
+  // 斜杠菜单打开时：Enter/点击=展开发送（精确匹配命令名）
+  if (content.startsWith('/') && slashMatches.value.length) {
+    const first = content.slice(1).split(/\s/)[0].toLowerCase()
+    const exact = slashMatches.value.find((c) => c.name.toLowerCase() === first)
+    if (exact) {
+      pickSlash(exact)
+      return
+    }
+    // 无精确匹配：把首个候选补全成 "/name " 继续编辑（Tab 语义并入 Enter）
+    if (slashMatches.value.length === 1 && !content.includes(' ')) {
+      text.value = '/' + slashMatches.value[0].name + ' '
+      return
+    }
+  }
   emit('send', content)
   text.value = ''
+  saveDraft(props.sessionId, '')
 }
 
 function onKeydown(e: KeyboardEvent) {
+  if (slashOpen.value && slashMatches.value.length) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      slashActive.value = (slashActive.value + 1) % slashMatches.value.length
+      return
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      slashActive.value = (slashActive.value - 1 + slashMatches.value.length) % slashMatches.value.length
+      return
+    }
+    if (e.key === 'Tab') {
+      e.preventDefault()
+      text.value = '/' + slashMatches.value[slashActive.value].name + ' '
+      return
+    }
+  }
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault()
     submit()
   }
 }
 
-function onLevelChange(e: Event) {
-  emit('update:reasoning', (e.target as HTMLSelectElement).value)
+// 思考程度：自定义弹出菜单（原生 select 的弹出层在 Windows 上强制浅色，与暗色主题冲突）
+const levelMenuOpen = ref(false)
+const levelWrap = ref<HTMLElement | null>(null)
+const levelLabel = computed(() => LEVELS.find((l) => l.value === props.reasoning)?.label || '关')
+function pickLevel(v: string) {
+  levelMenuOpen.value = false
+  if (v !== props.reasoning) emit('update:reasoning', v)
 }
 </script>
 
 <template>
   <div class="composer-wrap">
+    <!-- 正在输入指示器：贴底常驻，长会话滚到别处也能知道 AI 还在干活 -->
+    <transition name="typing-fade">
+      <div v-if="props.typing" class="typing-bar" role="status" aria-live="polite">
+        <span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="typing-text">{{ props.agentName || '小柯' }}正在输入…</span>
+      </div>
+    </transition>
     <div class="composer">
       <!-- 输入框左侧：工作模式切换（计划 ⇄ 开发） -->
       <div ref="modeWrap" class="mode-wrap">
         <div v-if="modeMenuOpen" class="mode-menu">
           <button class="mode-opt" :class="{ active: isPlan() }" @click="pickMode('plan')">
-            <span class="mo-icon">📋</span>
+            <span class="mo-icon"><Icon name="plan" :size="16" /></span>
             <span class="mo-text">
               <b>计划模式</b>
               <i>先调研出计划，只读不改，确认后才开发</i>
             </span>
-            <span v-if="isPlan()" class="mo-check">✓</span>
+            <span v-if="isPlan()" class="mo-check"><Icon name="check" :size="13" /></span>
           </button>
-          <button class="mode-opt" :class="{ active: !isPlan() }" @click="pickMode('build')">
-            <span class="mo-icon">🛠️</span>
+          <button class="mode-opt" :class="{ active: isAsk() }" @click="pickMode('ask')">
+            <span class="mo-icon"><Icon name="lock" :size="16" /></span>
+            <span class="mo-text">
+              <b>询问模式</b>
+              <i>每一步写操作都先征求你的批准</i>
+            </span>
+            <span v-if="isAsk()" class="mo-check"><Icon name="check" :size="13" /></span>
+          </button>
+          <button class="mode-opt" :class="{ active: !isPlan() && !isAsk() }" @click="pickMode('build')">
+            <span class="mo-icon"><Icon name="build" :size="16" /></span>
             <span class="mo-text">
               <b>开发模式</b>
               <i>完整能力：读写文件、执行命令</i>
             </span>
-            <span v-if="!isPlan()" class="mo-check">✓</span>
+            <span v-if="!isPlan()" class="mo-check"><Icon name="check" :size="13" /></span>
           </button>
         </div>
         <button
           class="mode-btn"
-          :class="isPlan() ? 'plan' : 'build'"
-          :title="isPlan() ? '计划模式：先调研再开发（点击切换）' : '开发模式：完整能力（点击切换）'"
-          @click="modeMenuOpen = !modeMenuOpen"
+          :class="isPlan() ? 'plan' : isAsk() ? 'plan' : 'build'"
+          :title="isPlan() ? '计划模式：先调研再开发（点击切换）' : isAsk() ? '询问模式：每步写操作先征批（点击切换）' : '开发模式：完整能力（点击切换）'"
+          @click="toggleMenu('mode')"
         >
-          <span class="mb-icon">{{ isPlan() ? '📋' : '🛠️' }}</span>
-          <span class="mb-label">{{ isPlan() ? '计划' : '开发' }}</span>
+          <span class="mb-icon"><Icon :name="isPlan() ? 'plan' : isAsk() ? 'lock' : 'build'" :size="15" /></span>
+          <span class="mb-label">{{ isPlan() ? '计划' : isAsk() ? '询问' : '开发' }}</span>
+        </button>
+      </div>
+
+      <!-- 斜杠命令补全（输入 / 时出现） -->
+      <div v-if="slashMatches.length" class="slash-menu">
+        <button
+          v-for="(c, i) in slashMatches"
+          :key="c.name"
+          class="slash-opt"
+          :class="{ active: i === slashActive }"
+          :title="expandHint(c)"
+          @mouseenter="slashActive = i"
+          @click="pickSlash(c)"
+        >
+          <b>/{{ c.name }}</b>
+          <i>{{ c.template.split('\n')[0].slice(0, 60) }}</i>
+        </button>
+      </div>
+
+      <!-- 模型档案快捷切换（模式按钮旁） -->
+      <div ref="modelWrap" class="mode-wrap">
+        <div v-if="modelMenuOpen" class="mode-menu model-menu">
+          <div v-if="!(props.profiles?.length)" class="mo-empty">还没有配置档案——去设置把当前模型保存为档案。</div>
+          <button
+            v-for="p in props.profiles || []"
+            :key="p.id"
+            class="mode-opt slim"
+            :class="{ active: p.id === props.activeProfile }"
+            @click="pickModel(p.id)"
+          >
+            <span class="mo-text">
+              <b>{{ p.name }}</b>
+              <i>{{ p.model || '（未设模型）' }}</i>
+            </span>
+            <span v-if="p.id === props.activeProfile" class="mo-check"><Icon name="check" :size="13" /></span>
+          </button>
+        </div>
+        <button
+          class="mode-btn model-btn"
+          :title="'当前模型：' + activeModelLabel + '（点击切换）'"
+          @click="toggleMenu('model')"
+        >
+          <span class="mb-icon"><Icon name="bot" :size="15" /></span>
+          <span class="mb-label">{{ activeModelLabel }}</span>
         </button>
       </div>
 
@@ -106,53 +349,178 @@ function onLevelChange(e: Event) {
         rows="1"
         :placeholder="props.mode === 'plan'
           ? '计划模式：告诉小柯要调研什么，先出计划再开发…（Enter 发送）'
+          : props.mode === 'ask'
+          ? '询问模式：每步写操作都会先征求你的批准…（Enter 发送）'
           : '问问小柯…（Enter 发送，Shift+Enter 换行）'"
         @keydown="onKeydown"
       ></textarea>
       <button v-if="props.busy" class="btn stop" title="停止生成" @click="emit('stop')">
         <span class="stop-icon"></span>
       </button>
+      <!-- busy 时发送按钮变为「排队」：当前轮结束后自动发出 -->
+      <button
+        v-if="props.busy"
+        class="btn send"
+        title="排队：当前回复结束后自动发送"
+        :disabled="!text.trim()"
+        @click="submit"
+      >
+        <Icon name="list" :size="16" :stroke="2.2" />
+      </button>
       <button v-else class="btn send" title="发送" :disabled="!text.trim()" @click="submit">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 19V5M5 12l7-7 7 7" />
-        </svg>
+        <Icon name="arrow-up" :size="17" :stroke="2.2" />
       </button>
     </div>
     <div class="hint-row">
-      <span class="hint">小柯可能也会犯错，重要信息请自行核实。</span>
+      <div class="hint-left">
+        <span class="hint">小柯可能也会犯错，重要信息请自行核实。</span>
+        <!-- 本会话累计用量：所有请求累加，切会话随会话还原 -->
+        <span
+          v-if="totalTokens > 0"
+          class="usage-chip"
+          :title="`本会话累计：输入 ${props.sessionUsage?.prompt ?? 0} / 输出 ${props.sessionUsage?.completion ?? 0} tokens（共 ${props.sessionUsage?.requests ?? 0} 次请求，上游未返回用量时为估算）`"
+        >
+          <Icon name="clock" :size="11" />
+          本会话 ↑{{ fmtTokens(props.sessionUsage?.prompt || 0) }} ↓{{ fmtTokens(props.sessionUsage?.completion || 0) }}
+        </span>
+      </div>
       <!-- 右下角：思考程度（当前会话的下一条消息生效，浏览器本地记住） -->
-      <label class="level" title="模型思考程度（reasoning_effort），下一条消息生效">
-        <span class="level-icon">🧠</span>
-        <select :value="props.reasoning" @change="onLevelChange">
-          <option v-for="l in LEVELS" :key="l.value" :value="l.value">{{ l.label }}</option>
-        </select>
-      </label>
+      <div ref="levelWrap" class="level" title="模型思考程度（reasoning_effort），下一条消息生效">
+        <div v-if="levelMenuOpen" class="level-menu">
+          <button
+            v-for="l in LEVELS"
+            :key="l.value"
+            class="lv-opt"
+            :class="{ active: l.value === props.reasoning }"
+            @click="pickLevel(l.value)"
+          >
+            <span class="lv-label">{{ l.label }}</span>
+            <span v-if="l.value === props.reasoning" class="lv-check"><Icon name="check" :size="12" /></span>
+          </button>
+        </div>
+        <button class="level-btn" @click="toggleMenu('level')">
+          <span class="level-icon"><Icon name="brain" :size="14" /></span>
+          <span class="lv-current">{{ levelLabel }}</span>
+          <span class="lv-caret"><Icon name="arrow-down" :size="11" :stroke="2" /></span>
+        </button>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
 .composer-wrap {
+  position: relative;
   max-width: var(--content-w);
   width: 100%;
   margin: 0 auto;
-  padding: 0 24px 14px;
+  padding: 0 28px 16px;
+}
+
+.composer-wrap::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -48px;
+  height: 48px;
+  background: linear-gradient(180deg, transparent, rgba(10, 11, 15, 0.72));
+  pointer-events: none;
+}
+
+/* 正在输入指示器：位于输入框正上方，不挤压滚动区高度（浮在渐隐带里） */
+.typing-bar {
+  position: absolute;
+  left: 28px;
+  /* 100% = 输入框上沿；再往上抬一点，落在 composer-wrap::before 的 48px 渐隐带里，
+     不能压到输入框本身 */
+  bottom: calc(100% + 6px);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-glass-strong, rgba(22, 26, 34, 0.9));
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(14px);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  pointer-events: none;
+  z-index: 6;
+}
+
+.typing-text {
+  white-space: nowrap;
+}
+
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.typing-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.3;
+  animation: typingBounce 1.2s infinite ease-in-out;
+}
+
+.typing-dots i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.typing-dots i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes typingBounce {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+.typing-fade-enter-active,
+.typing-fade-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.typing-fade-enter-from,
+.typing-fade-leave-to {
+  opacity: 0;
+  transform: translateY(4px);
 }
 
 .composer {
+  position: relative;
   display: flex;
   align-items: flex-end;
-  gap: 8px;
-  background: var(--bg-surface);
+  gap: 7px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.022));
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 10px 10px 10px 16px;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  border-radius: 20px;
+  padding: 9px;
+  box-shadow: var(--shadow-soft), var(--ring-inset);
+  backdrop-filter: blur(20px);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
 }
 
 .composer:focus-within {
-  border-color: var(--accent);
-  box-shadow: var(--focus-ring);
+  border-color: rgba(255, 154, 61, 0.35);
+  box-shadow:
+    0 0 0 3px rgba(255, 154, 61, 0.09),
+    0 18px 44px rgba(0, 0, 0, 0.35),
+    var(--ring-inset);
 }
 
 /* ---------- 输入框左侧：工作模式 ---------- */
@@ -165,84 +533,101 @@ function onLevelChange(e: Event) {
 .mode-btn {
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 7px 11px;
-  border-radius: 999px;
+  gap: 6px;
+  padding: 8px 11px;
+  border-radius: 12px;
   border: 1px solid var(--border);
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.045);
   color: var(--text-muted);
   font-size: 12px;
   cursor: pointer;
   white-space: nowrap;
-  transition: all 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease;
 }
 
 .mode-btn:hover {
   border-color: var(--border-strong);
   color: var(--text);
+  background: rgba(255, 255, 255, 0.07);
 }
 
 .mode-btn.plan {
-  border-color: color-mix(in srgb, #56c2e6 45%, transparent);
-  background: rgba(86, 194, 230, 0.1);
-  color: #56c2e6;
+  border-color: rgba(103, 232, 249, 0.28);
+  background: rgba(103, 232, 249, 0.09);
+  color: var(--cyan);
 }
 
 .mode-btn.build {
-  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  border-color: rgba(255, 154, 61, 0.26);
   background: var(--accent-soft);
   color: var(--accent);
 }
 
 .mb-icon {
-  font-size: 13px;
+  display: flex;
 }
 
 .mb-label {
   font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
 .mode-menu {
   position: absolute;
   bottom: calc(100% + 10px);
   left: 0;
-  width: 268px;
-  background: var(--bg-surface);
+  width: 290px;
+  background: linear-gradient(180deg, #1c202a 0%, #14171f 100%);
   border: 1px solid var(--border-strong);
-  border-radius: var(--radius-lg);
+  border-radius: 16px;
   box-shadow: var(--shadow);
   padding: 6px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
   z-index: 30;
 }
 
 .mode-opt {
   display: flex;
   align-items: flex-start;
-  gap: 9px;
-  padding: 9px 10px;
-  border-radius: var(--radius-sm);
+  gap: 10px;
+  padding: 11px;
+  border-radius: 11px;
   border: 1px solid transparent;
   background: none;
   cursor: pointer;
   text-align: left;
-  transition: background 0.12s ease;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
 
 .mode-opt:hover {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.055);
 }
 
 .mode-opt.active {
-  background: var(--accent-soft);
-  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  background: linear-gradient(135deg, rgba(255, 154, 61, 0.12), rgba(255, 154, 61, 0.04));
+  border-color: rgba(255, 154, 61, 0.18);
 }
 
 .mo-icon {
-  font-size: 15px;
-  margin-top: 1px;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.mode-opt.active .mo-icon {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .mo-text {
@@ -266,20 +651,24 @@ function onLevelChange(e: Event) {
 }
 
 .mo-check {
+  display: flex;
   color: var(--accent);
-  font-size: 13px;
+  margin-top: 5px;
 }
 
 textarea {
   flex: 1;
+  min-width: 0;
   background: none;
   border: none;
   outline: none;
   resize: none;
   color: var(--text);
-  line-height: 1.55;
-  padding: 4px 0;
-  max-height: 150px;
+  font-size: 14px;
+  line-height: 1.6;
+  padding: 8px 4px 7px;
+  min-height: 36px;
+  max-height: 160px;
 }
 
 textarea::placeholder {
@@ -288,49 +677,132 @@ textarea::placeholder {
 
 .btn {
   flex-shrink: 0;
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
+  width: 38px;
+  height: 38px;
+  border-radius: 13px;
   border: none;
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background 0.15s ease, transform 0.1s ease;
+  transition: transform 0.12s ease, filter 0.15s ease, background 0.15s ease;
 }
 
 .btn.send {
-  background: var(--accent);
+  background: var(--accent-gradient);
   color: var(--accent-text);
+  box-shadow: var(--shadow-accent), inset 0 1px 0 rgba(255, 255, 255, 0.35);
 }
 
 .btn.send:hover:not(:disabled) {
-  background: var(--accent-hover);
+  filter: brightness(1.05);
+  transform: translateY(-1px);
 }
 
 .btn.send:active {
-  transform: scale(0.94);
+  transform: scale(0.95);
 }
 
 .btn.send:disabled {
-  background: var(--bg-surface-2);
+  background: rgba(255, 255, 255, 0.05);
   color: var(--text-faint);
+  box-shadow: none;
   cursor: not-allowed;
 }
 
 .btn.stop {
-  background: var(--bg-surface-2);
-  border: 1px solid var(--border-strong);
+  background: rgba(251, 113, 133, 0.1);
+  border: 1px solid rgba(251, 113, 133, 0.25);
 }
 
 .btn.stop:hover {
-  border-color: var(--danger);
+  background: rgba(251, 113, 133, 0.16);
+  border-color: rgba(251, 113, 133, 0.45);
 }
 
 .stop-icon {
-  width: 11px;
-  height: 11px;
+  width: 10px;
+  height: 10px;
   background: var(--danger);
   border-radius: 2px;
+}
+
+/* ---------- 斜杠命令补全 ---------- */
+.model-menu {
+  width: 250px;
+  left: 0;
+  right: auto;
+}
+
+.mo-empty {
+  padding: 9px 11px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  line-height: 1.6;
+}
+
+.mode-opt.slim {
+  padding: 8px 11px;
+}
+
+.model-btn {
+  max-width: 120px;
+}
+
+.model-btn .mb-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 74px;
+}
+
+.slash-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  background: linear-gradient(180deg, #1c202a 0%, #14171f 100%);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 30;
+}
+
+.slash-opt {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 9px;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+
+.slash-opt.active,
+.slash-opt:hover {
+  background: rgba(255, 154, 61, 0.1);
+}
+
+.slash-opt b {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.slash-opt i {
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* 底部行：左侧免责提示，右侧思考程度选择器 */
@@ -339,45 +811,150 @@ textarea::placeholder {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-top: 8px;
+  margin-top: 9px;
+  padding: 0 4px;
+}
+
+.hint-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
 .hint {
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: 10.5px;
 }
 
+.usage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: default;
+}
+
+/* 思考程度：自定义下拉（原生 select 弹出层在 Windows 上强制浅色，与暗色主题冲突） */
 .level {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.level-btn {
   display: flex;
   align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  color: var(--text-muted);
-  flex-shrink: 0;
+  gap: 6px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  font-size: 11px;
   cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.level-btn:hover {
+  border-color: var(--border-strong);
+  background: rgba(255, 255, 255, 0.07);
 }
 
 .level-icon {
-  font-size: 13px;
+  display: flex;
+  color: var(--text-faint);
 }
 
-.level select {
-  background: var(--bg-surface);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 3px 10px;
-  font-size: 12px;
+.lv-current {
+  color: var(--text-muted);
+  min-width: 1.5em;
+  text-align: center;
+}
+
+.lv-caret {
+  display: flex;
+  color: var(--text-faint);
+}
+
+.level-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  min-width: 110px;
+  background: linear-gradient(180deg, #1c202a 0%, #14171f 100%);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 40;
+}
+
+.lv-opt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--text-muted);
+  font-size: 11.5px;
   cursor: pointer;
-  outline: none;
+  text-align: left;
+  transition: background 0.12s ease, color 0.12s ease;
 }
 
-.level select:hover {
-  border-color: var(--accent);
+.lv-opt:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
 }
 
-.level select:focus {
-  border-color: var(--accent);
-  box-shadow: var(--focus-ring);
+.lv-opt.active {
+  background: rgba(255, 154, 61, 0.12);
+  color: var(--accent);
+}
+
+.lv-label {
+  flex: 1;
+}
+
+.lv-check {
+  display: flex;
+  color: var(--accent);
+}
+
+@media (max-width: 760px) {
+  .composer-wrap {
+    padding: 0 14px 12px;
+  }
+
+  .mode-btn {
+    padding: 8px 10px;
+  }
+
+  .mb-label {
+    display: none;
+  }
+
+  .hint {
+    display: none;
+  }
+
+  .hint-row {
+    justify-content: flex-end;
+  }
 }
 </style>
