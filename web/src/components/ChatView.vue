@@ -42,13 +42,32 @@ const pinned = ref(true)
 // 头像由 Go 后端的 /assets 提供，动态绑定避免 Vite 构建期解析
 const AVATAR = '/assets/avatar.png'
 
+// ---- 滚动跟随状态（声明在前，供下方 scrollToBottom/stick 使用，避免 TDZ） ----
+/** 用户停止滚动多久后自动恢复贴底跟随 */
+const RESUME_FOLLOW_MS = 10_000
+let resumeTimer: number | undefined
+/** 自动滚动期间忽略 scroll 事件，避免把程序滚动误判成用户操作 */
+let autoScrolling = false
+
+function clearResumeTimer() {
+  if (resumeTimer !== undefined) {
+    window.clearTimeout(resumeTimer)
+    resumeTimer = undefined
+  }
+}
+
 // ---- 回到底部 ----
 function scrollToBottom() {
+  clearResumeTimer()
+  autoScrolling = true
   // 直接写 scrollTop 在部分 WebView 会被拦截，用 scrollIntoView 更可靠
   const end = threadEnd.value
   if (end) end.scrollIntoView({ block: 'end', behavior: 'instant' })
   else if (scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight
   pinned.value = true
+  requestAnimationFrame(() => {
+    autoScrolling = false
+  })
 }
 
 // ---- 批准时自定义实现方式 ----
@@ -77,7 +96,10 @@ function onDocClickJump(e: MouseEvent) {
   if (jumpWrap.value && !jumpWrap.value.contains(e.target as Node)) jumpOpen.value = false
 }
 onMounted(() => document.addEventListener('mousedown', onDocClickJump))
-onUnmounted(() => document.removeEventListener('mousedown', onDocClickJump))
+onUnmounted(() => {
+  document.removeEventListener('mousedown', onDocClickJump)
+  clearResumeTimer()
+})
 
 // 我的提问列表（与 DOM 中 .msg.user 的渲染顺序一一对应）
 const questionList = computed(() => {
@@ -126,21 +148,58 @@ const greetingForAgent = () => {
   return g.replace(/\*\*小柯\*\*/, `**${agentName()}**`)
 }
 
-// 用户手动上翻时停止自动跟随（同时控制「回到底部」按钮）
+// 用户手动上翻时停止自动跟随（同时控制「回到底部」按钮）。
+// 停手 10 秒后自动恢复跟随——用户只是回看，不是要一直脱离。
+/** 用户停止滚动 10 秒后重新贴底跟随（仅在 AI 仍在输出时生效） */
+function scheduleResumeFollow() {
+  clearResumeTimer()
+  if (!props.streaming) return
+  resumeTimer = window.setTimeout(() => {
+    resumeTimer = undefined
+    // 只有仍在生成时才自动回到跟随状态；已结束就尊重用户停留的位置
+    if (props.streaming) {
+      pinned.value = true
+      stick()
+    }
+  }, RESUME_FOLLOW_MS)
+}
+
 function onScroll() {
+  if (autoScrolling) return // 程序滚动，不算用户操作
   const el = scroller.value
   if (!el) return
-  pinned.value = el.scrollHeight - el.scrollTop - el.clientHeight < 90
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 90
+  if (atBottom) {
+    // 贴底：清掉待恢复的计时器（用户已经自己回来了）
+    clearResumeTimer()
+  } else {
+    // 未贴底：每次滚动都重置 10 秒计时——用户还在看，就别抢滚动条
+    scheduleResumeFollow()
+  }
+  pinned.value = atBottom
 }
+
+// 生成结束时清掉待恢复的计时器（下一轮开始由 watch 重新贴底）
+watch(
+  () => props.streaming,
+  (s) => {
+    if (!s) clearResumeTimer()
+  },
+)
 
 async function stick() {
   if (!pinned.value) return
   await nextTick()
+  autoScrolling = true
   // 用 threadEnd.scrollIntoView 而不是直接写 scrollTop：
   // 长会话首次渲染高度会分几帧增长，直接写 scrollHeight 容易停在半路
   const end = threadEnd.value
   if (end) end.scrollIntoView({ block: 'end', behavior: 'instant' })
   else if (scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight
+  // scroll 事件在下一帧才派发，延后清除标志
+  requestAnimationFrame(() => {
+    autoScrolling = false
+  })
 }
 
 // 依赖均为基本类型，避免返回新数组导致监听器永不触发

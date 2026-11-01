@@ -30,6 +30,8 @@ const props = defineProps<{
   profiles?: LLMProfileView[]
   activeProfile?: string
   modelName?: string
+  /** 当前智能体名（「正在输入」指示器里显示，空 = 小柯） */
+  agentName?: string
 }>()
 
 function loadDraft(sid?: string) {
@@ -248,6 +250,13 @@ function pickLevel(v: string) {
 
 <template>
   <div class="composer-wrap">
+    <!-- 正在输入指示器：贴底常驻，长会话滚到别处也能知道 AI 还在干活 -->
+    <transition name="typing-fade">
+      <div v-if="props.busy" class="typing-bar" role="status" aria-live="polite">
+        <span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="typing-text">{{ props.agentName || '小柯' }}正在输入…</span>
+      </div>
+    </transition>
     <div class="composer">
       <!-- 输入框左侧：工作模式切换（计划 ⇄ 开发） -->
       <div ref="modeWrap" class="mode-wrap">
@@ -415,6 +424,79 @@ function pickLevel(v: string) {
   height: 48px;
   background: linear-gradient(180deg, transparent, rgba(10, 11, 15, 0.72));
   pointer-events: none;
+}
+
+/* 正在输入指示器：位于输入框正上方，不挤压滚动区高度（浮在渐隐带里） */
+.typing-bar {
+  position: absolute;
+  left: 28px;
+  /* 100% = 输入框上沿；再往上抬一点，落在 composer-wrap::before 的 48px 渐隐带里，
+     不能压到输入框本身 */
+  bottom: calc(100% + 6px);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-glass-strong, rgba(22, 26, 34, 0.9));
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(14px);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  pointer-events: none;
+  z-index: 6;
+}
+
+.typing-text {
+  white-space: nowrap;
+}
+
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.typing-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.3;
+  animation: typingBounce 1.2s infinite ease-in-out;
+}
+
+.typing-dots i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.typing-dots i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes typingBounce {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+.typing-fade-enter-active,
+.typing-fade-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.typing-fade-enter-from,
+.typing-fade-leave-to {
+  opacity: 0;
+  transform: translateY(4px);
 }
 
 .composer {

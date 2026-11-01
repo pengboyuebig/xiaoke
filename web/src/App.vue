@@ -870,6 +870,7 @@ function onSettingsClosed() {
             :active-profile="activeProfile"
             :model-name="model"
             :session-usage="sessionUsage"
+            :agent-name="currentAgent?.name"
             @activate-model="activateModel"
             @send="handleSend"
             @stop="handleStop"
