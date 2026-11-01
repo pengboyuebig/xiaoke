@@ -302,7 +302,7 @@ func TestCompactTriggeredByRealUsage(t *testing.T) {
 		_ = st.Append(sess.ID, store.Message{Role: "user", Content: strings.Repeat("消", 50), CreatedAt: base})
 		_ = st.Append(sess.ID, store.Message{Role: "assistant", Content: strings.Repeat("回", 40), CreatedAt: base})
 	}
-	_ = st.AddUsage(sess.ID, 9000, 100) // LastPromptTokens=9000
+	_ = st.AddUsage(sess.ID, 9000, 100, 9000) // LastPromptTokens=9000
 	full, _ := st.Get(sess.ID)
 	if full.LastPromptTokens != 9000 {
 		t.Fatalf("前置：LastPromptTokens 应落库: %d", full.LastPromptTokens)
@@ -315,7 +315,7 @@ func TestCompactTriggeredByRealUsage(t *testing.T) {
 		t.Fatalf("真实 usage 超水位应触发压缩: calls=%d", calls)
 	}
 	// 对照：真实 usage 不足时不触发（字节估算同样不足）
-	_ = st.AddUsage(sess.ID, 100, 10)
+	_ = st.AddUsage(sess.ID, 100, 10, 100)
 	compactLastTry = map[string]time.Time{}
 	full2, _ := st.Get(sess.ID)
 	calls2 := 0

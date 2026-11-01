@@ -54,8 +54,8 @@ type Settings struct {
 // LLMProfile 是一份可一键切换的模型配置档案。
 type LLMProfile struct {
 	ID         string `json:"id"`
-	Name       string `json:"name"`       // 显示名，如「DeepSeek 官方」
-	Mode       string `json:"mode"`       // mock | openai（激活时连同运行模式一起切）
+	Name       string `json:"name"` // 显示名，如「DeepSeek 官方」
+	Mode       string `json:"mode"` // mock | openai（激活时连同运行模式一起切）
 	BaseURL    string `json:"baseURL"`
 	APIKey     string `json:"apiKey,omitempty"` // 脱敏下发：前端只见 尾4位，空串=保持
 	Model      string `json:"model"`

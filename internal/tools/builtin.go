@@ -1657,7 +1657,7 @@ func startBackgroundCommand(command string, args []string, cwd string, onDone fu
 
 // BackgroundTaskResult 供 chat 层实现「后台任务完成唤醒」：返回命令行、
 // 输出尾部（4KB）与状态（completed/failed/running）。ok=false 表示任务不存在
-//（可能已被注册表清理）。
+// （可能已被注册表清理）。
 func BackgroundTaskResult(id string) (cmdline, output, state string, ok bool) {
 	bgMu.Lock()
 	t, exist := bgTasks[id]
@@ -1682,7 +1682,8 @@ func BackgroundTaskResult(id string) (cmdline, output, state string, ok bool) {
 }
 
 // getBackgroundTask 查任务（不存在报错并列出当前任务）。
-func getBackgroundTask(id string) (*backgroundTask, error) {	bgMu.Lock()
+func getBackgroundTask(id string) (*backgroundTask, error) {
+	bgMu.Lock()
 	defer bgMu.Unlock()
 	t, ok := bgTasks[id]
 	if !ok {

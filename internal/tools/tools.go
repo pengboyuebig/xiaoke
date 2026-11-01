@@ -187,13 +187,23 @@ func IsWriteCapable(name string) bool {
 		// 计划模式下同样可用，不算写操作。
 		return false
 	}
+	// 关键词按「词边界」匹配而非裸子串：MCP 工具名用下划线分词，
+	// 裸 Contains 会把 skill_read（命中 kill）、describe_branch（命中 branch）、
+	// list_tags（命中 tag）这类只读工具误判为写操作。
 	for _, kw := range []string{
 		"write", "edit", "create", "mkdir", "move", "rename", "delete", "remove",
 		"patch", "append", "insert", "replace", "copy", "truncate", "chmod",
 		"chown", "symlink", "upload", "save", "persist", "update", "mkfile",
 		"put_", "exec", "run_", "shell", "terminal",
+		// 版本控制类：commit/push/merge/reset 等会改动仓库状态或远端，
+		// 必须算写操作（否则计划模式会暴露它们、ask 模式也不弹审批）
+		"commit", "push", "merge", "rebase", "reset", "checkout",
+		"stash", "tag", "add_", "restore", "revert", "cherry", "clone",
+		// 其他常见改动动词
+		"install", "uninstall", "publish", "deploy", "kill", "stop", "start",
+		"restart", "set_", "modify", "change", "alter", "clear", "wipe",
 	} {
-		if strings.Contains(n, kw) {
+		if wordContains(n, kw) {
 			return true
 		}
 	}
@@ -205,6 +215,26 @@ func IsWriteCapable(name string) bool {
 		}
 	}
 	return false
+}
+
+// wordContains 判断工具名是否包含关键词的「完整词」。
+// 工具名按 _ / - / . 分词；关键词若以 _ 结尾（如 "put_"）则按前缀匹配。
+// 这样 skill_read 不会命中 kill、describe_branch 不会命中 branch。
+func wordContains(name, kw string) bool {
+	// 前缀型关键词（结尾带下划线）：要求出现在某个词的开头
+	if strings.HasSuffix(kw, "_") {
+		return strings.HasPrefix(name, kw) || strings.Contains(name, "_"+kw)
+	}
+	parts := strings.FieldsFunc(name, func(r rune) bool {
+		return r == '_' || r == '-' || r == '.'
+	})
+	for _, p := range parts {
+		if p == kw {
+			return true
+		}
+	}
+	// 无分隔符的名字（如 writefile / deletefile）按前缀或后缀判定
+	return name == kw || strings.HasPrefix(name, kw) || strings.HasSuffix(name, kw)
 }
 
 // ---------- 路径安全 ----------

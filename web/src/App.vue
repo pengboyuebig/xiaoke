@@ -456,6 +456,10 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
   // 新一轮开始：旧的批准条作废；记录本次发送的模式
   clearApproval()
   const sentMode = workMode.value
+  // 上下文快照：await 期间用户可能切换项目/智能体/模式，续发排队消息时不能
+  // 用切换后的新值（会把消息发到错误项目）
+  const sentProjectId = currentProjectId.value
+  const sentAgentId = currentAgent.value?.id || ''
   messages.value.push({ role: 'user', content, hidden: opts?.hidden === true })
   streaming.value = true
   streamingText.value = ''
@@ -465,17 +469,17 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
   try {
     let sessionId = currentId.value
     if (!sessionId) {
-      const s = await api.createSession(currentProjectId.value, currentAgent.value?.id)
+      const s = await api.createSession(sentProjectId, sentAgentId)
       sessionId = s.id
       rememberSession(s.id)
     }
     const r = await api.chat({
       sessionId,
       content,
-      projectId: currentProjectId.value,
-      agentId: currentAgent.value?.id || '',
+      projectId: sentProjectId,
+      agentId: sentAgentId,
       reasoning: reasoning.value,
-      mode: workMode.value,
+      mode: sentMode,
       approve: opts?.hidden === true,
       signal: controller.signal,
       onDelta: (t) => {

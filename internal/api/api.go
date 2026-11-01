@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"time"
 
@@ -207,7 +208,7 @@ func (h *Handler) activateProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 // adoptCurrentLLM 处理 POST /api/models/adopt {id?, name?}：把当前生效配置
-//（含真实 Key）收编为档案——id 空 = 新建并激活（未绑定档案/旧版本升级场景）；
+// （含真实 Key）收编为档案——id 空 = 新建并激活（未绑定档案/旧版本升级场景）；
 // id 非空 = 回写该档案（编辑激活档案后生效值同步回去）。
 func (h *Handler) adoptCurrentLLM(w http.ResponseWriter, r *http.Request) {
 	var in struct {
@@ -293,12 +294,17 @@ func fetchModels(ctx context.Context, baseURL, apiKey string) ([]string, error) 
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("请求 %s 失败: %w", url, err)
+		// 脱敏：URL 里可能带 user:pass@ 凭据，错误信息会回显到前端
+		return nil, fmt.Errorf("请求 %s 失败: %w", maskURLCreds(url), maskErrCreds(err, apiKey))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("上游返回 %s: %s", resp.Status, strings.TrimSpace(string(body[:min(len(body), 300)])))
+		snippet := strings.TrimSpace(string(body[:min(len(body), 300)]))
+		if k := strings.TrimSpace(apiKey); k != "" {
+			snippet = strings.ReplaceAll(snippet, k, "***")
+		}
+		return nil, fmt.Errorf("上游返回 %s: %s", resp.Status, snippet)
 	}
 	var wrap struct {
 		Data []struct {
@@ -425,4 +431,29 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// maskURLCreds 去掉 URL 里的 userinfo（user:pass@host → host），避免凭据回显。
+func maskURLCreds(raw string) string {
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.User != nil {
+		u.User = nil
+	}
+	return u.String()
+}
+
+// maskErrCreds 把错误文本里出现的 API Key 替换成 ***（网络库错误偶尔会带上完整 URL）。
+func maskErrCreds(err error, apiKey string) error {
+	if err == nil {
+		return nil
+	}
+	k := strings.TrimSpace(apiKey)
+	if k == "" {
+		return err
+	}
+	msg := strings.ReplaceAll(err.Error(), k, "***")
+	return fmt.Errorf("%s", msg)
 }

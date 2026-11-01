@@ -968,6 +968,10 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 	// 缺失时上游实现按字节估算兜底）。子代理会在工具 goroutine 里调用 streamFn，
 	// 回调可能并发到达——用原子变量累加。
 	var usagePrompt, usageCompletion atomic.Int64
+	// lastPrompt 单独记录「最后一次上游调用」的 prompt tokens（不是本轮累加）：
+	// 压缩触发要用它代表「当前上下文有多大」，累加值在多轮工具循环下会大出数倍，
+	// 会让压缩提前触发。子代理用空 Hooks，不会污染这里。
+	var lastPrompt atomic.Int64
 	hooks := Hooks{
 		OnDelta: func(delta string) {
 			send(map[string]any{"type": "delta", "text": delta})
@@ -975,6 +979,9 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 		OnUsage: func(p, c int64) {
 			usagePrompt.Add(p)
 			usageCompletion.Add(c)
+			if p > 0 {
+				lastPrompt.Store(p)
+			}
 		},
 	}
 	// 上游重试透明化：有人值守时向前端发 retry 事件（横幅提示）；
@@ -1050,7 +1057,7 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 	// 请求结束时落库累计用量（mock 模式的演示用量也计入，方便前端联调）
 	defer func() {
 		if p, c := usagePrompt.Load(), usageCompletion.Load(); p > 0 || c > 0 {
-			_ = h.store.AddUsage(sess.ID, p, c)
+			_ = h.store.AddUsage(sess.ID, p, c, lastPrompt.Load())
 		}
 	}()
 	finish := func() {

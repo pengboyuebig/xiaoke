@@ -1016,8 +1016,10 @@ func (s *Store) SetTodos(id string, todos []Todo) error {
 }
 
 // AddUsage 累计会话用量（每次对话请求结束时调用一次）。
-// lastPrompt 同时覆盖 LastPromptTokens（压缩触发优先用这个真实值）。
-func (s *Store) AddUsage(id string, prompt, completion int64) error {
+// prompt/completion 是本轮所有上游调用的累加（用于展示与统计）；
+// lastPrompt 是「最后一次上游调用」的 prompt tokens——压缩触发用这个值代表
+// 当前上下文的真实大小（传 0 表示未知，保留旧值，避免用累加值污染水位）。
+func (s *Store) AddUsage(id string, prompt, completion, lastPrompt int64) error {
 	if !validID.MatchString(id) {
 		return ErrNotFound
 	}
@@ -1030,7 +1032,9 @@ func (s *Store) AddUsage(id string, prompt, completion int64) error {
 	sess.PromptTokens += prompt
 	sess.CompletionTokens += completion
 	sess.Requests++
-	sess.LastPromptTokens = prompt
+	if lastPrompt > 0 {
+		sess.LastPromptTokens = lastPrompt
+	}
 	if err := s.saveSnapshot(sess); err != nil {
 		return err
 	}

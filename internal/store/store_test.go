@@ -565,17 +565,17 @@ func TestAddUsageAccumulates(t *testing.T) {
 	if err := s.Append(sess.ID, Message{Role: "user", Content: "hi", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AddUsage(sess.ID, 100, 50); err != nil {
+	if err := s.AddUsage(sess.ID, 100, 50, 100); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AddUsage(sess.ID, 200, 80); err != nil {
+	if err := s.AddUsage(sess.ID, 200, 80, 200); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := s.Get(sess.ID)
 	if got.PromptTokens != 300 || got.CompletionTokens != 130 || got.Requests != 2 {
 		t.Fatalf("用量累计不符: %+v", got)
 	}
-	if err := s.AddUsage("bad-id", 1, 1); err == nil {
+	if err := s.AddUsage("bad-id", 1, 1, 1); err == nil {
 		t.Fatal("非法 ID 应报错")
 	}
 }
@@ -609,5 +609,59 @@ func TestSetTitle(t *testing.T) {
 	got3, _ := s.Get(sess2.ID)
 	if len([]rune(got3.Title)) != 32 {
 		t.Fatalf("标题应截断到 32 字符，got %d", len([]rune(got3.Title)))
+	}
+}
+
+// TestSearchUnicodeLowercaseOffset：ToLower 改变字节长度的字符（İ/ẞ）不能让片段错位。
+func TestSearchUnicodeLowercaseOffset(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := s.Create("t", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// İ (U+0130) 小写化为 i：字节 2→1，搜索位置在小写副本里更靠前
+	content := "开头 İstanbul 中间 KEYWORD 结尾"
+	if err := s.Append(sess.ID, Message{Role: "user", Content: content}); err != nil {
+		t.Fatal(err)
+	}
+	hits := s.SearchMessages("keyword", 10)
+	if len(hits) != 1 {
+		t.Fatalf("应命中 1 条: %+v", hits)
+	}
+	if !strings.Contains(hits[0].Snippet, "KEYWORD") {
+		t.Fatalf("片段应包含命中词本身，got %q", hits[0].Snippet)
+	}
+	// 命中词前的内容也应正确（İ 那段不该被截错位）
+	if !strings.Contains(hits[0].Snippet, "İstanbul") {
+		t.Fatalf("片段应包含前文 İstanbul，got %q", hits[0].Snippet)
+	}
+}
+
+// TestMapLowerOffsetToSource 直接测映射函数边界。
+func TestMapLowerOffsetToSource(t *testing.T) {
+	cases := []struct {
+		src     string
+		lower   int
+		wantOff int
+		wantOK  bool
+	}{
+		{"abc", 0, 0, true},
+		{"abc", 2, 2, true},
+		{"İx", 1, 2, true},  // İ(2字节) 小写为 i(1字节)：小写偏移 1 → 原文偏移 2
+		{"İx", 2, 3, true},  // 跳过 i 之后
+		{"İx", 3, 0, false}, // 越界
+		{"中文", 6, 6, true},  // 中文小写不变
+		{"", 1, 0, false},
+	}
+	for _, c := range cases {
+		off, ok := mapLowerOffsetToSource(c.src, c.lower)
+		if ok != c.wantOK || (ok && off != c.wantOff) {
+			t.Errorf("mapLowerOffsetToSource(%q, %d) = (%d, %v), want (%d, %v)",
+				c.src, c.lower, off, ok, c.wantOff, c.wantOK)
+		}
 	}
 }

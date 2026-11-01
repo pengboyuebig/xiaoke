@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // TruncateAfter 把会话截断到第 index 条消息（含该条）。之后的消息全部删除；
@@ -95,10 +96,10 @@ func (s *Store) CreateLocked(title, projectID string) (*Session, error) {
 
 // SearchHit 是一次跨会话全文搜索的命中。
 type SearchHit struct {
-	SessionID string `json:"sessionId"`
-	Title     string `json:"title"`
-	Role      string `json:"role"` // user | assistant
-	Snippet   string `json:"snippet"`
+	SessionID string    `json:"sessionId"`
+	Title     string    `json:"title"`
+	Role      string    `json:"role"` // user | assistant
+	Snippet   string    `json:"snippet"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
@@ -108,7 +109,7 @@ const searchScanLimit = 200 << 10
 
 // SearchMessages 跨会话搜索消息内容（大小写不敏感）。q 少于 2 个 rune 返回空。
 // 会话按最近更新排序，最多返回 maxHits 条命中；任何失败静默跳过该会话
-//（搜索不能因个别损坏会话而整体失败）。
+// （搜索不能因个别损坏会话而整体失败）。
 // 加锁策略：全局锁只用来取「会话清单」，随后逐会话加锁读取——
 // 全程占全局锁会让搜索期间的所有会话写入卡住。
 func (s *Store) SearchMessages(q string, maxHits int) []SearchHit {
@@ -157,21 +158,55 @@ func (s *Store) SearchMessages(q string, maxHits int) []SearchHit {
 			if scanned > searchScanLimit {
 				break
 			}
-			idx := strings.Index(strings.ToLower(m.Content), needle)
+			// 命中位置必须在「原文」坐标里取：ToLower 对少数 Unicode 字符
+			//（İ→i、ẞ→ß）会改变字节长度，用小写副本的偏移去切原文会错位。
+			// 这里先在小写副本里定位，再把该位置映射回原文（同前缀小写化后长度一致）。
+			low := strings.ToLower(m.Content)
+			idx := strings.Index(low, needle)
 			if idx < 0 {
+				continue
+			}
+			srcIdx, ok := mapLowerOffsetToSource(m.Content, idx)
+			if !ok {
 				continue
 			}
 			hits = append(hits, SearchHit{
 				SessionID: sm.id,
 				Title:     sm.title,
 				Role:      m.Role,
-				Snippet:   snippetAround(m.Content, idx, len(q)),
+				Snippet:   snippetAround(m.Content, srcIdx, len(q)),
 				UpdatedAt: sm.at,
 			})
 			break
 		}
 	}
 	return hits
+}
+
+// mapLowerOffsetToSource 把小写副本里的字节偏移映射回原文偏移。
+// 做法：逐 rune 小写化并累计字节数，直到累计值达到 lowerOff；
+// 若某个 rune 的小写形式跨越了该偏移（不应发生，但防御），返回 false。
+func mapLowerOffsetToSource(src string, lowerOff int) (int, bool) {
+	if lowerOff <= 0 {
+		return 0, true
+	}
+	acc := 0
+	for byteOff := 0; byteOff < len(src); {
+		r, size := utf8.DecodeRuneInString(src[byteOff:])
+		if r == utf8.RuneError && size == 1 {
+			return 0, false // 非法 UTF-8，放弃映射（宁可不命中也不错切）
+		}
+		lowLen := len(strings.ToLower(string(r)))
+		if acc+lowLen > lowerOff {
+			return 0, false
+		}
+		if acc+lowLen == lowerOff {
+			return byteOff + size, true
+		}
+		acc += lowLen
+		byteOff += size
+	}
+	return 0, false
 }
 
 // snippetAround 取命中位置前后的片段（前后各 ~60 rune，对齐到 rune 边界）。
