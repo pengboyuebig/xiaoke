@@ -71,16 +71,41 @@ func Open(path string) (*Store, error) {
 
 // EnsureDefault 确保至少有一个默认智能体（小柯），并标记为内置。
 // 旧数据里已存在同名智能体时只补上 Builtin 标记，保留用户改过的人格。
+//
+// 内置人格的人设由代码维护（persona.go），用户不能编辑它，
+// 所以每次启动都同步成最新的 seed 值——否则升级后改的人设永远不生效。
 func (s *Store) EnsureDefault(seed Agent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	seed.Builtin = true
 	for i, a := range s.items {
 		if a.Builtin {
+			// 内置人格：人设与描述跟随代码更新（用户无法编辑，不会覆盖用户改动）
+			changed := false
+			if seed.SystemPrompt != "" && s.items[i].SystemPrompt != seed.SystemPrompt {
+				s.items[i].SystemPrompt = seed.SystemPrompt
+				changed = true
+			}
+			if seed.Description != "" && s.items[i].Description != seed.Description {
+				s.items[i].Description = seed.Description
+				changed = true
+			}
+			if changed {
+				s.items[i].UpdatedAt = time.Now()
+				return s.saveLocked()
+			}
 			return nil
 		}
 		if a.Name == seed.Name {
+			// 旧数据里的同名小柯：补 Builtin 标记并同步人设
 			s.items[i].Builtin = true
+			if seed.SystemPrompt != "" {
+				s.items[i].SystemPrompt = seed.SystemPrompt
+			}
+			if seed.Description != "" {
+				s.items[i].Description = seed.Description
+			}
+			s.items[i].UpdatedAt = time.Now()
 			return s.saveLocked()
 		}
 	}

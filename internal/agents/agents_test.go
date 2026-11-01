@@ -173,3 +173,66 @@ func TestDuplicateName(t *testing.T) {
 		t.Fatalf("更新未生效: %+v", same)
 	}
 }
+
+// 内置人格的人设应跟随代码更新：升级后改 persona.go，重启要能生效。
+func TestEnsureDefaultSyncsBuiltinPersona(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agents.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 首次种入旧版人设
+	if err := s.EnsureDefault(Agent{
+		Name: "小柯", Description: "旧描述", SystemPrompt: "你是旧版小柯",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	builtin := s.List()[0]
+	if builtin.SystemPrompt != "你是旧版小柯" {
+		t.Fatalf("首次种入的人设不对: %q", builtin.SystemPrompt)
+	}
+
+	// 模拟升级后代码里人设变了，重启（再次 EnsureDefault）
+	if err := s.EnsureDefault(Agent{
+		Name: "小柯", Description: "新描述", SystemPrompt: "你是新版小柯，傲娇但靠谱",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := s.List()[0]
+	if got.SystemPrompt != "你是新版小柯，傲娇但靠谱" {
+		t.Errorf("内置人设未随代码更新，实际 %q", got.SystemPrompt)
+	}
+	if got.Description != "新描述" {
+		t.Errorf("内置描述未随代码更新，实际 %q", got.Description)
+	}
+	if len(s.List()) != 1 {
+		t.Errorf("不应重复创建，实际 %d 个", len(s.List()))
+	}
+}
+
+// 用户自建的人格不能被内置同步逻辑影响。
+func TestEnsureDefaultDoesNotTouchCustomAgents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agents.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureDefault(Agent{Name: "小柯", SystemPrompt: "内置人设"}); err != nil {
+		t.Fatal(err)
+	}
+	custom, err := s.Create(Agent{Name: "自定义", SystemPrompt: "我自己写的人设", Tools: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 再次 EnsureDefault（模拟重启）
+	if err := s.EnsureDefault(Agent{Name: "小柯", SystemPrompt: "内置人设v2"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(custom.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SystemPrompt != "我自己写的人设" {
+		t.Errorf("用户自建人格被改动了: %q", got.SystemPrompt)
+	}
+}

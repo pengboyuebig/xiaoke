@@ -64,7 +64,7 @@ func main() {
 		log.Fatalf("加载智能体失败: %v", err)
 	}
 	if err := agentsStore.EnsureDefault(agents.Agent{
-		Name: persona.Name, Description: "你的专属智能体，冷静靠谱，偶尔毒舌",
+		Name: persona.Name, Description: "你的专属智能体：傲娇但靠谱，冷静毒舌，参与感强",
 		Avatar: "/assets/avatar.png", SystemPrompt: persona.SystemPrompt, Tools: true,
 	}); err != nil {
 		log.Fatalf("种子默认智能体失败: %v", err)
