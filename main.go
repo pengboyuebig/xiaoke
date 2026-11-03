@@ -9,7 +9,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -30,6 +32,7 @@ import (
 	"xiaoke/internal/settings"
 	"xiaoke/internal/skills"
 	"xiaoke/internal/store"
+	"xiaoke/internal/tools"
 )
 
 func main() {
@@ -159,7 +162,7 @@ func main() {
 	// 不设 Read/Write 总超时——SSE 流式回答会持续几分钟。
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           securityHeaders(mux),
+		Handler:           securityHeaders(localGuard(addr)(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
@@ -182,6 +185,9 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+	// 后台任务是本进程拉起的真实子进程；不清理会变成占端口的孤儿，
+	// 重启后任务表里也看不到。先杀进程树，再收尾 MCP。
+	tools.KillAllBackgroundTasks()
 	mcpMgr.Close()
 }
 
@@ -233,6 +239,55 @@ func (n noDirList) Open(name string) (http.File, error) {
 		return nil, os.ErrNotExist
 	}
 	return f, nil
+}
+
+// localGuard 防止恶意网页通过 DNS rebinding / 跨站请求操作本地服务。
+// 默认绑定 127.0.0.1 时只接受 Host 为回环地址的请求；任何带 Origin 的请求
+// 还必须是同源或回环来源（外站表单提交会被拒）。
+func localGuard(addr string) func(http.Handler) http.Handler {
+	bindHost, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		bindHost = addr
+	}
+	loopbackOnly := isLoopbackHost(bindHost)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if loopbackOnly && !isLoopbackHost(hostOnly(r.Host)) {
+				http.Error(w, "forbidden host", http.StatusForbidden)
+				return
+			}
+			if origin := r.Header.Get("Origin"); origin != "" {
+				u, err := url.Parse(origin)
+				if err != nil || u.Host == "" {
+					http.Error(w, "forbidden origin", http.StatusForbidden)
+					return
+				}
+				originHost := strings.ToLower(u.Host)
+				if originHost != strings.ToLower(r.Host) && !isLoopbackHost(hostOnly(originHost)) {
+					http.Error(w, "forbidden origin", http.StatusForbidden)
+					return
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// hostOnly 去掉端口和 IPv6 方括号，返回小写主机名。
+func hostOnly(hostport string) string {
+	h := strings.TrimSpace(hostport)
+	if hp, _, err := net.SplitHostPort(h); err == nil {
+		h = hp
+	}
+	return strings.ToLower(strings.Trim(h, "[]"))
+}
+
+func isLoopbackHost(h string) bool {
+	switch strings.ToLower(strings.Trim(h, "[]")) {
+	case "127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1":
+		return true
+	}
+	return false
 }
 
 // securityHeaders 给所有响应加基本安全头。

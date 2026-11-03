@@ -1,7 +1,9 @@
 package tools
 
 import (
+	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"testing"
 	"time"
@@ -12,11 +14,17 @@ func TestKillTaskFreesPort(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("仅 Windows 需要验证进程树")
 	}
-	const port = "39123"
+	// 动态取一个空闲端口，避免固定端口与别的进程/并发测试冲突
+	ln0, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := fmt.Sprintf("%d", ln0.Addr().(*net.TCPAddr).Port)
+	ln0.Close()
 	// cmd /c 会再拉起 node：只杀 cmd 时 node 仍占着端口（这正是 npm 的问题）
 	id, err := startBackgroundCommand("cmd.exe",
 		[]string{"/c", "node", "-e", `require('http').createServer(function(q,s){s.end('ok')}).listen(` + port + `)`},
-		t.TempDir(), "s", nil)
+		os.TempDir(), "s", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

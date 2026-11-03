@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"os"
 	"os/exec"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ func TestBackgroundTaskListAndKill(t *testing.T) {
 
 	id, err := startBackgroundCommand(node,
 		[]string{"-e", "setTimeout(()=>{console.log('still-alive')},60000)"},
-		t.TempDir(), "sess-test", nil)
+		os.TempDir(), "sess-test", nil)
 	if err != nil {
 		t.Fatalf("启动后台任务失败: %v", err)
 	}
@@ -78,6 +79,47 @@ func TestBackgroundTaskMissing(t *testing.T) {
 	}
 }
 
+// 启动失败的命令不能留在注册表里：否则会永远显示运行中，且关不掉。
+func TestBackgroundStartFailureNoGhost(t *testing.T) {
+	const cmdline = "definitely-not-a-real-cmd-xyz"
+	id, err := startBackgroundCommand(cmdline, nil, os.TempDir(), "s", nil)
+	if err == nil {
+		t.Fatal("启动不存在的命令应报错")
+	}
+	if id != "" {
+		t.Fatalf("启动失败不应返回 task id: %q", id)
+	}
+	for _, ti := range ListBackgroundTasks() {
+		if ti.Cmdline == cmdline {
+			t.Fatalf("启动失败的任务不应留在注册表: %+v", ti)
+		}
+	}
+}
+
+// 退出清理：KillAllBackgroundTasks 必须把运行中的任务树收掉。
+func TestKillAllBackgroundTasks(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("需要 node 才能跑这个测试")
+	}
+	id, err := startBackgroundCommand(node, []string{"-e", "setTimeout(()=>{},60000)"}, os.TempDir(), "s-killall", nil)
+	if err != nil {
+		t.Fatalf("启动后台任务失败: %v", err)
+	}
+	KillAllBackgroundTasks()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		info, _, ok := TaskDetail(id)
+		if !ok || info.State != "running" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("KillAll 后任务仍在运行")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // 已完成任务的「运行时长」必须固定——用 time.Since(started) 会一直增长，
 // 界面上看着像任务还在跑。
 func TestTaskDurationFrozenAfterEnd(t *testing.T) {
@@ -85,7 +127,7 @@ func TestTaskDurationFrozenAfterEnd(t *testing.T) {
 	if err != nil {
 		t.Skip("需要 node 才能跑这个测试")
 	}
-	id, err := startBackgroundCommand(node, []string{"-e", "setTimeout(()=>{},300)"}, t.TempDir(), "s", nil)
+	id, err := startBackgroundCommand(node, []string{"-e", "setTimeout(()=>{},300)"}, os.TempDir(), "s", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

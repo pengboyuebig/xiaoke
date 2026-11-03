@@ -1510,23 +1510,18 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 	// 分页器必杀：git diff/log 在交互终端会起 pager 等输入，挂满 30s 超时。
 	// 子进程继承的环境里明确禁用分页，输出直落管道。
 	cmd.Env = append(os.Environ(), "GIT_PAGER=cat", "PAGER=cat", "GIT_TERMINAL_PROMPT=0")
+	// 超时按进程树终止：Windows 上 cmd.exe 派生的 node 子进程如果只杀父进程，
+	// 会留下继续占端口的孤儿；这里和后台任务的关闭路径保持一致。
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return killProcessTree(cmd.Process)
+	}
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	runErr := cmd.Run()
-	// 超时自动转后台（对标主流 agent 的 auto_on_timeout）：前台超时不杀掉任务
-	// 判定失败，而是把同一条命令转为后台任务继续跑，返回 task_id 让模型
-	// 用 task_output 追进度——长构建/长测试不再被超时腰斩。
-	if runErr != nil && cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-		bgID, bgErr := startBackgroundCommand(in.Command, in.Args, cwd, env.SessionID, env.OnTaskDone)
-		if bgErr == nil {
-			head := fmt.Sprintf("$ %s %s\n", in.Command, strings.Join(in.Args, " "))
-			timed := fmt.Sprintf("%s\n（前台等待 %s 超时，已自动转为后台继续运行：%s\n用 task_output 读取进度与结果）",
-				head, timeout, bgID)
-			return timed, nil
-		}
-		// 转后台失败：按普通超时失败处理
-	}
 	out := buf.String()
 	if len(out) > maxOutBytes {
 		out = truncateBytes(out, maxOutBytes) + "\n…(输出已按 8KB 截断)"
@@ -1537,6 +1532,12 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 		out += "\n…（注意：以上输出不是合法 UTF-8，可能是 GBK 编码的中文；据此判断时先确认编码）"
 	}
 	head := fmt.Sprintf("$ %s %s\n", in.Command, strings.Join(in.Args, " "))
+	if cctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+		// 不再「超时后重新起一遍」：同一条命令重跑会重复构建/重复写文件，
+		// 甚至和残留子进程抢端口。明确告诉模型换 timeout_sec 或后台模式。
+		return head + out, fmt.Errorf("前台等待 %s 超时（已终止进程树）；需要更长等待请用 timeout_sec（上限 %d 秒），常驻服务用 is_background",
+			timeout, maxCommandTimeoutSec)
+	}
 	if runErr != nil {
 		// 非 0 退出必须作为错误返回，否则前端/模型会把失败当成功
 		return head + out, fmt.Errorf("命令退出码非 0: %w", runErr)
@@ -1549,8 +1550,10 @@ func execRunCommand(ctx context.Context, env *Env, args json.RawMessage) (string
 
 // ---------- 后台命令任务（对标主流 agent 的 is_background + task_output/kill） ----------
 
-// backgroundTaskMaxDuration 是后台任务的硬超时：防「忘了杀」的任务永远挂着。
-const backgroundTaskMaxDuration = 10 * time.Minute
+// backgroundTaskMaxDuration 是后台任务的硬超时。它必须远大于常见的 dev server
+// 运行时长（npm run dev 往往要开一整天），否则到点会把正在用的服务杀掉。
+// 真正的兜底是：小柯退出时统一终止任务（KillAllBackgroundTasks）+ 面板手动关闭。
+const backgroundTaskMaxDuration = 24 * time.Hour
 
 // maxBackgroundTasks 是注册表里保留的任务数上限（含已完成）：超限清最旧的完成项。
 const maxBackgroundTasks = 32
@@ -1605,7 +1608,8 @@ var (
 )
 
 // startBackgroundCommand 启动后台任务。生命周期独立于 HTTP 请求：
-// 用独立的超时 context（10 分钟硬顶），请求结束/断开不影响任务运行。
+// 用独立的超时 context（24 小时硬顶，避免误杀常驻 dev server），
+// 请求结束/断开不影响任务运行。
 // onDone 在任务进程结束（含失败/被杀）时以 task_id 回调（nil = 不回调），
 // 供会话层做「任务完成自动唤醒」。
 func startBackgroundCommand(command string, args []string, cwd, sessionID string, onDone func(taskID string)) (string, error) {
@@ -1649,24 +1653,46 @@ func startBackgroundCommand(command string, args []string, cwd, sessionID string
 
 	// 显式建管道合并 stdout+stderr：StdoutPipe() 不会填充 cmd.Stdout 字段，
 	// 「cmd.Stderr = cmd.Stdout」实际等于把 stderr 设成 nil（输出漏到服务控制台）。
-	pr, pw, err := os.Pipe()
-	if err != nil {
+	//
+	// 启动失败时不能把任务留在注册表里：否则它会永远显示「运行中」，
+	// 32 条上限也清不掉（清理只删已结束任务），点关闭还会报「进程不存在」。
+	fail := func(err error) (string, error) {
+		bgMu.Lock()
+		delete(bgTasks, id)
+		bgMu.Unlock()
+		t.bufMu.Lock()
+		t.exitErr = err
+		t.ended = time.Now()
+		t.bufMu.Unlock()
+		close(t.wait)
 		cancel()
 		return "", err
 	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return fail(err)
+	}
 	cmd.Stdout = pw
 	cmd.Stderr = pw
+	// 必须在 Start 前设置：Start 会启动 context watcher 并可能并发读取 Cancel。
+	// 超时/取消时按进程树终止（Windows 上 cmd.exe → npm → node，
+	// 只杀父进程会留下继续占端口的子进程）。
+	cmd.Cancel = func() error { return killTaskTree(t) }
 	if err := cmd.Start(); err != nil {
 		pw.Close()
 		pr.Close()
-		cancel()
-		return "", fmt.Errorf("启动后台命令失败: %w", err)
+		return fail(fmt.Errorf("启动后台命令失败: %w", err))
 	}
 	// 父进程侧立即关掉写端：子进程退出时 reader 才能读到 EOF
 	pw.Close()
+
+	// 读输出与等进程必须解耦：某些命令（npm、cmd /c start）会让孙进程
+	// 继承 stdout/stderr，父进程退出后管道仍不 EOF。若先读后 Wait，
+	// 任务会永远停在「运行中」。这里 Wait 一返回就记结束状态，
+	// 最多再等 2 秒排空剩余输出，然后强制关掉读端。
+	outputDone := make(chan struct{})
 	go func() {
-		defer close(t.wait)
-		defer cancel()
+		defer close(outputDone)
 		defer pr.Close()
 		buf := make([]byte, 4096)
 		for {
@@ -1675,15 +1701,26 @@ func startBackgroundCommand(command string, args []string, cwd, sessionID string
 				t.appendOutput(buf[:n])
 			}
 			if rerr != nil {
-				break
+				return
 			}
 		}
-		t.exitErr = cmd.Wait()
-		// 先记结束时间再关闭 wait（defer 最后执行 close），
-		// 读到 wait 已关闭的一方一定能看到 ended
+	}()
+	go func() {
+		exitErr := cmd.Wait()
+		select {
+		case <-outputDone:
+		case <-time.After(2 * time.Second):
+			_ = pr.Close()
+			<-outputDone
+		}
+		// 先记结束时间再关闭 wait（close 在最后），
+		// 读到 wait 已关闭的一方一定能看到 ended/exitErr
 		t.bufMu.Lock()
+		t.exitErr = exitErr
 		t.ended = time.Now()
 		t.bufMu.Unlock()
+		close(t.wait)
+		cancel()
 		if onDone != nil {
 			onDone(t.id)
 		}
@@ -1800,14 +1837,14 @@ func TaskDetail(id string) (TaskInfo, string, bool) {
 	return info, t.output(), true
 }
 
-// killTaskTree 结束任务进程。Windows 上必须杀掉整棵进程树：
+// killProcessTree 结束进程。Windows 上必须杀掉整棵进程树：
 // npm.cmd 会派生出 node 子进程，只杀父进程时端口仍被占用。
-func killTaskTree(t *backgroundTask) error {
-	if t.cmd == nil || t.cmd.Process == nil {
+func killProcessTree(p *os.Process) error {
+	if p == nil {
 		return fmt.Errorf("任务进程不存在")
 	}
 	if runtime.GOOS == "windows" {
-		pid := fmt.Sprintf("%d", t.cmd.Process.Pid)
+		pid := fmt.Sprintf("%d", p.Pid)
 		// /T 连同子进程，/F 强制
 		out, err := exec.Command("taskkill", "/T", "/F", "/PID", pid).CombinedOutput()
 		if err != nil {
@@ -1819,10 +1856,18 @@ func killTaskTree(t *backgroundTask) error {
 		}
 		return nil
 	}
-	if err := t.cmd.Process.Kill(); err != nil && !strings.Contains(err.Error(), "process already finished") {
+	if err := p.Kill(); err != nil && !strings.Contains(err.Error(), "process already finished") {
 		return err
 	}
 	return nil
+}
+
+// killTaskTree 结束后台任务对应的进程树。
+func killTaskTree(t *backgroundTask) error {
+	if t.cmd == nil || t.cmd.Process == nil {
+		return fmt.Errorf("任务进程不存在")
+	}
+	return killProcessTree(t.cmd.Process)
 }
 
 // KillBackgroundTask 终止后台任务并等进程回收（页面上的「关闭」按钮用）。
@@ -1845,6 +1890,38 @@ func KillBackgroundTask(id string) error {
 		// 等不到回收也不阻塞页面，任务状态最终会由 Wait goroutine 更新
 	}
 	return nil
+}
+
+// KillAllBackgroundTasks 终止所有运行中的后台任务（小柯退出时调用）。
+// 每个任务都按进程树杀，且总等待时间有上限，避免退出流程被卡住。
+func KillAllBackgroundTasks() {
+	bgMu.Lock()
+	list := make([]*backgroundTask, 0, len(bgTasks))
+	for _, t := range bgTasks {
+		list = append(list, t)
+	}
+	bgMu.Unlock()
+
+	for _, t := range list {
+		select {
+		case <-t.wait: // 已结束
+			continue
+		default:
+		}
+		_ = killTaskTree(t)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for _, t := range list {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		select {
+		case <-t.wait:
+		case <-time.After(remaining):
+			return
+		}
+	}
 }
 
 // getBackgroundTask 查任务（不存在报错并列出当前任务）。

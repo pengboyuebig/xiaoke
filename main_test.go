@@ -52,3 +52,37 @@ func TestSecurityHeaders(t *testing.T) {
 		}
 	}
 }
+
+func TestLocalGuard(t *testing.T) {
+	h := localGuard("127.0.0.1:18790")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	cases := []struct {
+		name   string
+		host   string
+		origin string
+		want   int
+	}{
+		{"回环 Host", "127.0.0.1:18790", "", http.StatusNoContent},
+		{"localhost Host", "localhost:18790", "", http.StatusNoContent},
+		{"DNS rebinding", "evil.example:18790", "", http.StatusForbidden},
+		{"跨站 Origin", "127.0.0.1:18790", "http://evil.example", http.StatusForbidden},
+		{"同源 Origin", "127.0.0.1:18790", "http://127.0.0.1:18790", http.StatusNoContent},
+		{"回环 localhost Origin", "127.0.0.1:18790", "http://localhost:18790", http.StatusNoContent},
+		{"null Origin", "127.0.0.1:18790", "null", http.StatusForbidden},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Host = c.host
+			if c.origin != "" {
+				req.Header.Set("Origin", c.origin)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != c.want {
+				t.Fatalf("host=%q origin=%q: got %d, want %d", c.host, c.origin, rec.Code, c.want)
+			}
+		})
+	}
+}
