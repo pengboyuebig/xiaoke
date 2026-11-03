@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from '../lib/api'
 import type { TaskInfo } from '../types'
 import { askConfirm } from '../lib/confirm'
@@ -9,6 +9,9 @@ import Icon from './Icon.vue'
 // 页面上有个常驻标记，点开能看日志，也能直接关闭——关闭会按进程树终止，
 // 端口随之释放（Windows 上 npm.cmd 拉起的 node 子进程会被一起杀掉）。
 
+/** 当前会话 ID：只展示这个会话起的任务；不传则展示全部（兼容旧用法） */
+const props = defineProps<{ sessionId?: string }>()
+
 const tasks = ref<TaskInfo[]>([])
 const open = ref(false)
 const detailId = ref('')
@@ -16,17 +19,36 @@ const detailOutput = ref('')
 const detailLoading = ref(false)
 const killing = ref('')
 const err = ref('')
+const logEl = ref<HTMLElement | null>(null)
 let timer: number | undefined
+let detailSeq = 0
+let detailState = ''
+let logStick = true
 
-const running = computed(() => tasks.value.filter((t) => t.state === 'running'))
+const visibleTasks = computed(() => {
+  if (props.sessionId === undefined) return tasks.value
+  return tasks.value.filter((t) => t.sessionId === props.sessionId)
+})
+const running = computed(() => visibleTasks.value.filter((t) => t.state === 'running'))
 const sorted = computed(() =>
-  [...tasks.value].sort((a, b) => {
+  [...visibleTasks.value].sort((a, b) => {
     const ar = a.state === 'running'
     const br = b.state === 'running'
     if (ar !== br) return ar ? -1 : 1
     return (b.startedAt || '').localeCompare(a.startedAt || '')
   }),
 )
+
+function scrollLogToBottom() {
+  const el = logEl.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+function onLogScroll() {
+  const el = logEl.value
+  if (!el) return
+  logStick = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+}
 
 function fmtDur(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000))
@@ -48,22 +70,46 @@ async function refresh() {
   try {
     const r = await api.listTasks()
     tasks.value = r.tasks || []
-    if (open.value && detailId.value) await loadDetail(detailId.value, true)
+    const cur = visibleTasks.value.find((t) => t.id === detailId.value)
+    if (!cur) {
+      // 选中的任务已不在当前列表（切换会话/被清理）：清掉详情
+      detailSeq++
+      detailId.value = ''
+      detailOutput.value = ''
+      detailState = ''
+      return
+    }
+    // 运行中的任务才需要持续刷新；刚结束的那一刻补一次最终日志。
+    if (open.value && (cur.state === 'running' || detailState === 'running')) {
+      await loadDetail(cur.id, true)
+    }
   } catch {
     /* 轮询失败不打扰用户 */
   }
 }
 
 async function loadDetail(id: string, quiet = false) {
+  const seq = ++detailSeq
+  const switched = id !== detailId.value
   detailId.value = id
+  if (switched) {
+    logStick = true
+    detailState = ''
+    detailOutput.value = ''
+  }
   if (!quiet) detailLoading.value = true
   try {
     const r = await api.taskDetail(id)
+    if (seq !== detailSeq || detailId.value !== id) return
     detailOutput.value = r.output || '（暂无输出）'
+    detailState = r.task.state
+    await nextTick()
+    if (logStick) scrollLogToBottom()
   } catch (e) {
+    if (seq !== detailSeq || detailId.value !== id) return
     detailOutput.value = (e as Error).message
   } finally {
-    detailLoading.value = false
+    if (seq === detailSeq) detailLoading.value = false
   }
 }
 
@@ -71,14 +117,18 @@ async function openPanel() {
   open.value = true
   err.value = ''
   await refresh()
+  // 已选中的任务还在列表里就保留；否则默认看第一个（运行中优先）
+  if (detailId.value && sorted.value.some((t) => t.id === detailId.value)) return
   const first = sorted.value[0]
   if (first) await loadDetail(first.id)
 }
 
 function closePanel() {
+  detailSeq++
   open.value = false
   detailId.value = ''
   detailOutput.value = ''
+  detailState = ''
 }
 
 async function killTask(t: TaskInfo) {
@@ -101,6 +151,21 @@ async function killTask(t: TaskInfo) {
   }
 }
 
+// 切换会话时面板内容跟着切换，避免在 B 会话看到/关闭 A 会话的任务
+watch(
+  () => props.sessionId,
+  () => {
+    detailSeq++
+    detailId.value = ''
+    detailOutput.value = ''
+    detailState = ''
+    if (open.value) {
+      const first = sorted.value[0]
+      if (first) loadDetail(first.id)
+    }
+  },
+)
+
 onMounted(() => {
   refresh()
   timer = window.setInterval(refresh, 3000)
@@ -111,12 +176,12 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <!-- 运行中标记：只有存在运行中的任务才出现（面板打开时也保持可见） -->
+  <!-- 运行中标记：当前会话有任务（含已结束）就保留入口，否则关闭面板后再也打不开日志 -->
   <button
-    v-if="running.length || open"
+    v-if="visibleTasks.length || open"
     class="task-chip"
     :class="{ live: running.length > 0 }"
-    :title="running.length ? `${running.length} 个后台任务运行中，点击查看日志/关闭` : '后台任务'"
+    :title="running.length ? `${running.length} 个后台任务运行中，点击查看日志/关闭` : '后台任务（含已结束）'"
     @click="openPanel"
   >
     <span v-if="running.length" class="chip-dot" aria-hidden="true"></span>
@@ -175,7 +240,7 @@ onUnmounted(() => {
           </div>
           <div v-if="err" class="err">{{ err }}</div>
           <pre v-if="detailLoading" class="log">加载中…</pre>
-          <pre v-else class="log">{{ detailOutput || '（暂无输出）' }}</pre>
+          <pre v-else ref="logEl" class="log" @scroll.passive="onLogScroll">{{ detailOutput || '（暂无输出）' }}</pre>
         </div>
       </div>
     </div>

@@ -1030,7 +1030,7 @@ function onSettingsClosed() {
         <TodoPanel :todos="sessionTodos" />
       </div>
       <!-- 后台任务：运行中标记 + 日志/关闭面板 -->
-      <TaskPanel />
+      <TaskPanel :session-id="currentId" />
     </main>
 
     <SettingsView v-if="settingsOpen" @close="settingsOpen = false; onSettingsClosed()" />

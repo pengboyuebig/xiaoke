@@ -65,8 +65,11 @@ const filteredSessions = computed(() => {
 })
 
 // ---------- 按项目分组：项目下创建的会话嵌在项目下方 ----------
-/** 项目下的会话最多显示几条（超出的引导到下方「最近会话」） */
+/** 项目下的会话最多显示几条；超出的可通过「展开全部」查看 */
 const PROJECT_SESSIONS_LIMIT = 5
+
+/** 哪些项目展开了全部会话（按项目 ID 记录） */
+const showAllProjects = ref<Record<string, boolean>>({})
 
 /** 一次性算出分组结果：projectId → 该项目下的会话（按更新时间倒序） */
 const sessionsByProject = computed(() => {
@@ -84,9 +87,18 @@ const sessionsByProject = computed(() => {
   return map
 })
 
-/** 某项目下要展示的会话（截断到上限） */
+/** 某项目下要展示的会话（默认截断到上限，可展开全部） */
 function sessionsOfProject(projectId: string): SessionMeta[] {
-  return (sessionsByProject.value.get(projectId) || []).slice(0, PROJECT_SESSIONS_LIMIT)
+  const all = sessionsByProject.value.get(projectId) || []
+  return showAllProjects.value[projectId] ? all : all.slice(0, PROJECT_SESSIONS_LIMIT)
+}
+
+/** 展开/收起某个项目下被截断的会话 */
+function toggleShowAll(projectId: string) {
+  showAllProjects.value = {
+    ...showAllProjects.value,
+    [projectId]: !showAllProjects.value[projectId],
+  }
 }
 
 /** 某项目下会话总数 */
@@ -237,7 +249,11 @@ const currentAgent = computed<Agent | null>(
             @fork="emit('fork', $event)"
           />
           <div v-if="countSessionsOfProject(p.id) > PROJECT_SESSIONS_LIMIT" class="proj-more">
-            还有 {{ countSessionsOfProject(p.id) - PROJECT_SESSIONS_LIMIT }} 条，见下方「最近会话」
+            <button class="proj-more-btn" @click.stop="toggleShowAll(p.id)">
+              {{ showAllProjects[p.id]
+                ? '收起多余会话'
+                : `还有 ${countSessionsOfProject(p.id) - PROJECT_SESSIONS_LIMIT} 条，展开全部` }}
+            </button>
           </div>
         </div>
       </template>
@@ -701,9 +717,22 @@ const currentAgent = computed<Agent | null>(
 }
 
 .proj-more {
-  padding: 5px 10px;
+  padding: 3px 10px 5px;
   font-size: 10.5px;
   color: var(--text-faint);
+}
+
+.proj-more-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.proj-more-btn:hover {
+  color: var(--accent);
 }
 
 /* 项目行的会话条数 + 折叠开关 */
