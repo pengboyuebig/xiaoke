@@ -28,7 +28,7 @@ type Settings struct {
 	MaxToolSteps int         `json:"maxToolSteps"` // agent 单段工具循环轮数（撞顶后自动续跑）
 	// MaxTotalSteps 单次回复的总工具轮数预算（含所有续跑段）。
 	// 长任务（建项目、批量改文件）常需几十轮；这个值才是真正的天花板。
-	// <=0 = 用 maxToolSteps（即不续跑），上限见 normalize。
+	// <=0 = 用默认值 120（老配置缺字段时不会静默失去续跑能力），上限见 normalize。
 	MaxTotalSteps    int      `json:"maxTotalSteps"`
 	CommandAllowlist []string `json:"commandAllowlist"` // 允许执行的命令白名单
 

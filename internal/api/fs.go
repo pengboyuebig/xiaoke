@@ -160,10 +160,11 @@ const (
 	findDirWorkers     = 8                       // 并发扫描的 worker 数
 )
 
-// findDirSkipDirs 查找时跳过的依赖/构建目录（与 tools.SkipDirs 同一套约定）。
+// findDirSkipDirs 查找时跳过的依赖/缓存目录（与 tools.SkipDirs 同一套约定）。
+// 不跳过 build/dist：用户完全可能把项目命名成这两个名字，跳过会导致拖拽永远找不到。
 var findDirSkipDirs = map[string]bool{
-	"node_modules": true, ".git": true, ".svn": true, "dist": true,
-	"build": true, "__pycache__": true, ".venv": true, "venv": true, ".idea": true,
+	"node_modules": true, ".git": true, ".svn": true,
+	"__pycache__": true, ".venv": true, "venv": true, ".idea": true,
 }
 
 type findDirResp struct {

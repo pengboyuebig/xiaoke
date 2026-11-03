@@ -78,26 +78,12 @@ func (s *Store) EnsureDefault(seed Agent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	seed.Builtin = true
+	foundBuiltin := false
 	for i, a := range s.items {
-		if a.Builtin {
-			// 内置人格：人设与描述跟随代码更新（用户无法编辑，不会覆盖用户改动）
-			changed := false
-			if seed.SystemPrompt != "" && s.items[i].SystemPrompt != seed.SystemPrompt {
-				s.items[i].SystemPrompt = seed.SystemPrompt
-				changed = true
-			}
-			if seed.Description != "" && s.items[i].Description != seed.Description {
-				s.items[i].Description = seed.Description
-				changed = true
-			}
-			if changed {
-				s.items[i].UpdatedAt = time.Now()
-				return s.saveLocked()
-			}
-			return nil
-		}
 		if a.Name == seed.Name {
-			// 旧数据里的同名小柯：补 Builtin 标记并同步人设
+			// 同名小柯（内置或旧数据）：补 Builtin 标记并同步人设。
+			// 按名字匹配，不能拿「第一个 Builtin」硬套——将来加入其它内置人格时
+			// 会把别人的人设覆盖成小柯。
 			s.items[i].Builtin = true
 			if seed.SystemPrompt != "" {
 				s.items[i].SystemPrompt = seed.SystemPrompt
@@ -108,6 +94,13 @@ func (s *Store) EnsureDefault(seed Agent) error {
 			s.items[i].UpdatedAt = time.Now()
 			return s.saveLocked()
 		}
+		if a.Builtin {
+			foundBuiltin = true
+		}
+	}
+	if foundBuiltin {
+		// 已有其它内置人格，但没有同名小柯：不重复创建，也不改别人的人设。
+		return nil
 	}
 	seed.ID = genID()
 	now := time.Now()
