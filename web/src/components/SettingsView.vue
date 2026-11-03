@@ -76,6 +76,7 @@ const activeProfile = ref('')
 const profileTest = ref<Record<string, { ok: boolean; text: string }>>({})
 const profileModels = ref<Record<string, string[]>>({})
 const profileBusy = ref('')
+const profileSaving = ref('')
 const customLLM = ref(false) // 当前生效值与激活档案不一致（手动自定义过）
 /** 档案区串行队列：所有「改档案 + 保存 + 刷新」排队执行——
  *  并发 PUT 会乱序覆盖（后到的旧快照把新档案抹掉），loadSettings 的旧快照
@@ -173,6 +174,19 @@ function activateNow(id: string) {
   }).finally(() => {
     profileBusy.value = ''
   })
+}
+
+/** 显式保存单个档案：不收起卡片，方便改完继续调；编辑激活档案时同步生效值 */
+async function saveProfile(p: ProfileEdit) {
+  profileSaving.value = p.id
+  try {
+    await saveProfiles(p.id === activeProfile.value ? p.id : undefined)
+    showToast('已保存 ✓')
+  } catch (e) {
+    showToast(`保存失败：${(e as Error).message}`)
+  } finally {
+    profileSaving.value = ''
+  }
 }
 
 async function toggleProfileEdit(p: ProfileEdit) {
@@ -829,7 +843,12 @@ async function save() {
                   <input v-model="p.smallModel" class="inp" :list="'pm-' + p.id" placeholder="轻量模型（可选，留空 = 主模型）" />
                   <div v-if="profileTest[p.id]" class="test" :class="profileTest[p.id].ok ? 'ok' : 'bad'">{{ profileTest[p.id].text }}</div>
                 </template>
-                <div class="pe-foot hint">收起本档案（再点一次摘要行）即自动保存。</div>
+                <div class="pe-foot">
+                  <span class="hint">收起本档案（再点一次摘要行）也会自动保存。</span>
+                  <button class="btn primary tiny" :disabled="profileSaving === p.id" @click="saveProfile(p)">
+                    {{ profileSaving === p.id ? '保存中…' : '保存' }}
+                  </button>
+                </div>
               </div>
             </div>
             <button class="btn ghost tiny" :disabled="form.profiles.length >= 20" @click="addProfile">
@@ -1929,6 +1948,15 @@ textarea.inp {
 
 .pe-foot {
   margin-top: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.pe-foot .hint {
+  flex: 1;
+  min-width: 0;
 }
 
 /* ---------- 权限规则 & 斜杠命令 ---------- */
