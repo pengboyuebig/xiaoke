@@ -1203,7 +1203,10 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 	// 光说不做的催办计数：同一回合最多催 2 次，避免无限刷屏。
 	// 只在 build 模式生效——plan 模式「输出计划后就停」是设计意图。
 	nudgeRuns := 0
-	multiStep := stepHintPattern.MatchString(p.Content)
+	// 光说不做的判定需要「确实有活要干」：显式编号步骤，或用户在让 agent 做事。
+	// 后者覆盖「帮我改一下这个页面」这类单步短请求——否则模型回一句「我先看一下」
+	// 仍然会停住，用户只能再发一次「继续」。
+	multiStep := stepHintPattern.MatchString(p.Content) || looksLikeActionRequest(p.Content)
 	for step := 0; step < maxSteps; step++ {
 		content, calls, err := streamFn(ctx, effAsConfig(eff), convo, defs, hooks, reasoning)
 		if err != nil {
@@ -1475,6 +1478,23 @@ func todosText(todos []store.Todo) string {
 // stepHintPattern 匹配「显式编号步骤」（行首 1. / 1、/ 1) / 第一步 等）。
 var stepHintPattern = regexp.MustCompile(`(?m)^\s*(?:\d{1,2}[.、）)]|第[一二三四五六七八九十]+[步，,])`)
 
+// actionRequestPattern 判断用户是不是在让 agent 动手做事（不是纯知识问答）。
+// 用于「只说不做」判定：单步短请求也该催，否则模型回一句「我先看一下」就停住。
+var actionRequestPattern = regexp.MustCompile(`帮我|帮忙|麻烦|运行|执行|创建|新建|实现|修改|修复|安装|启动|部署|写|改|删|检查|测试|review|push|提交|处理|搞定|修|调整|选择|增加|支持|优化`)
+
+// looksLikeActionRequest 排除明显是提问的句子（问号/吗/呢结尾），避免对闲聊瞎催。
+func looksLikeActionRequest(content string) bool {
+	c := strings.TrimSpace(content)
+	if c == "" {
+		return false
+	}
+	if strings.HasSuffix(c, "?") || strings.HasSuffix(c, "？") ||
+		strings.HasSuffix(c, "吗") || strings.HasSuffix(c, "呢") {
+		return false
+	}
+	return actionRequestPattern.MatchString(strings.ToLower(c))
+}
+
 // stepConnectorWords 是口语化的步骤连接词，出现 ≥3 个视为多步任务。
 var stepConnectorWords = []string{"然后", "接着", "之后", "再帮我", "最后", "接下来", "第二步", "其次"}
 
@@ -1507,25 +1527,41 @@ var futureTensePattern = regexp.MustCompile(`我将会|我这就|接下来我|�
 	`先(?:把|去)(?:[^，。；\n]{0,12})(?:写|建|搭|做|装|改|配|创建|安装|配置|实现|开始|动手)|` +
 	`先(?:建|写|搭|创建|安装|配置|实现)`)
 
+// explicitPromisePattern 匹配第一人称的明确行动承诺：
+//   - 「我先看一下 / 我来查查」这类「先/来 + 看/查 + 一下」；
+//   - 「我来实现 / 我先创建」这类「先/来 + 动手动词」。
+//
+// 刻意不匹配「我先看结论」这种行文习惯（没有「一下/下/一眼」），避免误催。
+var explicitPromisePattern = regexp.MustCompile(`我(?:先|来|这就|现在)(?:去|来)?` +
+	`(?:看|查|读|确认|检查|分析|试)(?:一下|下|一眼|看)|` +
+	`我(?:先|来|这就|现在)(?:去|来)?` +
+	`(?:实现|创建|新建|写|改|跑|启动|打开|建|搭|装|处理|修复|测试|部署)`)
+
 // promiseButNoAction 判断这一轮的纯文本回复是不是「光说不做」：
 // 模型描述了接下来要做的动作，却没有发出任何工具调用。
 //
 // 判定条件（三者同时满足，宁缺毋滥，避免误催）：
 //  1. 文本里有未来时叙述（我先看一下 / 开工前先建待办 / 接下来我要…）
 //  2. 文本没有「已完成/已创建/已经…」这类完成时收尾信号
-//  3. 上下文里确实有未完成的工作（未完成待办，或多步请求）
+//  3. 上下文里确实有未完成的工作（未完成待办，或多步请求）；
+//     或文本本身就是明确的「我先/我来 + 动作」承诺（单步短请求也适用）
 func promiseButNoAction(content string, todos []store.Todo, multiStep bool) bool {
 	if strings.TrimSpace(content) == "" {
 		return false
 	}
-	if !futureTensePattern.MatchString(content) {
+	if !futureTensePattern.MatchString(content) && !explicitPromisePattern.MatchString(content) {
 		return false
 	}
 	// 已经明确说「做完了」就不催
 	if doneMarkPattern.MatchString(content) {
 		return false
 	}
-	// 有未完成待办，或这条请求本身是多步任务，才算「该动手却没动手」
+	// 第一人称的明确承诺（「我先看一下」「我来实现」）本身就是有活要干的信号：
+	// 即使没有未完成待办、用户请求也不是多步，也催一次，避免直接停住。
+	if explicitPromisePattern.MatchString(content) {
+		return true
+	}
+	// 没有明确第一人称承诺时，仍要求上下文里有未完成的工作，避免误催
 	return len(pendingTodos(todos)) > 0 || multiStep
 }
 
@@ -1533,6 +1569,7 @@ func promiseButNoAction(content string, todos []store.Todo, multiStep bool) bool
 // 覆盖「先看了…然后创建了…」这类先动作后完成的叙述。
 var doneMarkPattern = regexp.MustCompile(`已完成|已经(?:完成|创建|写好|做完|改好|建好|跑通|验证|安装好|确认|检查|核实|读过|看过)|` +
 	`全部完成|都做完了|写好了|改好了|建好了|跑通了|创建了|写入了|改了|装了|建了|搭了|配好了|` +
+	`看了|查了|读了|确认了|检查了|分析了|试了|实现了|启动了|打开了|处理了|修复了|测试了|部署了|跑了|` +
 	`已创建|已写入|已修改|已安装|已配置|` +
 	`已(?:确认|核实|检查|读|看|跑|测|验证|发现|查到)`)
 

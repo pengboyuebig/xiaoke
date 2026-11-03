@@ -67,10 +67,14 @@ func TestPromiseButNoActionNoFalsePositive(t *testing.T) {
 	}
 }
 
-// 没有未完成待办、且请求不是多步任务时，不该催（避免对闲聊瞎催）。
-func TestPromiseButNoActionNeedsWork(t *testing.T) {
-	if promiseButNoAction("我先看一下这个报错是什么意思。", nil, false) {
-		t.Error("没有待办也不是多步任务时不应催办")
+// 没有待办、也不是多步任务时：明确的「我先看一下」仍要催（否则直接停住）；
+// 纯闲聊/结论则不该催。
+func TestPromiseButNoActionExplicitPromise(t *testing.T) {
+	if !promiseButNoAction("我先看一下这个报错是什么意思。", nil, false) {
+		t.Error("明确的「我先看一下」应催办")
+	}
+	if promiseButNoAction("这个报错可能是空指针。", nil, false) {
+		t.Error("纯结论不应催办")
 	}
 }
 
@@ -81,5 +85,32 @@ func TestPromiseButNoActionPlanText(t *testing.T) {
 	// 计划文本里通常也有「先…」这类词，检测会命中；真正的豁免在调用处用 planMode 判断。
 	if !promiseButNoAction("1. 先读 src/app.ts\n2. 再改路由", pending, false) {
 		t.Log("计划式文本未命中未来时（也合理）")
+	}
+}
+
+// 用户让 agent 做事的短请求要算「有活干」，纯提问/闲聊不算。
+func TestLooksLikeActionRequest(t *testing.T) {
+	yes := []string{
+		"帮我改一下这个页面",
+		"运行项目",
+		"review 并 push",
+		"创建一个新会话",
+		"修一下这个报错",
+	}
+	for _, c := range yes {
+		if !looksLikeActionRequest(c) {
+			t.Errorf("应视为行动请求：%q", c)
+		}
+	}
+	no := []string{
+		"这个函数是做什么的？",
+		"今天天气怎么样",
+		"解释一下这段代码呢",
+		"",
+	}
+	for _, c := range no {
+		if looksLikeActionRequest(c) {
+			t.Errorf("不应视为行动请求：%q", c)
+		}
 	}
 }
