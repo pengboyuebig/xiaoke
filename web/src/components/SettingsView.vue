@@ -140,7 +140,7 @@ function addProfile() {
     const taken = new Set(form.profiles.map((x) => x.name))
     let name = `新配置 ${n}`
     while (taken.has(name)) name = `新配置 ${++n}`
-    const p: ProfileEdit = { id: newProfileID(), name, mode: 'openai', baseURL: '', apiKey: '', apiKeySet: false, apiKeyTail: '', model: '', smallModel: '' }
+    const p: ProfileEdit = { id: newProfileID(), name, mode: 'openai', baseURL: '', apiKey: '', apiKeySet: false, apiKeyTail: '', model: '', smallModel: '', contextWindow: 0 }
     form.profiles.push(p)
     expandedProfile.value = p.id
     await doSaveProfiles()
@@ -648,6 +648,7 @@ function buildPayload() {
           .map((p) => ({
             id: p.id, name: p.name.trim(), mode: p.mode, baseURL: p.baseURL.trim(),
             apiKey: p.apiKey, model: p.model.trim(), smallModel: p.smallModel?.trim() || '',
+            contextWindow: Math.max(0, Number(p.contextWindow) || 0),
           })),
         // 激活指向必须随请求体回传：后端 Update 是整字段替换，漏了就等于解绑
         activeProfile: activeProfile.value,
@@ -841,6 +842,8 @@ async function save() {
                     </button>
                   </div>
                   <input v-model="p.smallModel" class="inp" :list="'pm-' + p.id" placeholder="轻量模型（可选，留空 = 主模型）" />
+                  <input v-model.number="p.contextWindow" class="inp" type="number" min="0" max="10000000" placeholder="上下文窗口（token，0 = 沿用高级里的全局值）" />
+                  <div class="hint">按模型单独设置上下文窗口；用于输入框右侧的上下文用量百分比与自动压缩触发。</div>
                   <div v-if="profileTest[p.id]" class="test" :class="profileTest[p.id].ok ? 'ok' : 'bad'">{{ profileTest[p.id].text }}</div>
                 </template>
                 <div class="pe-foot">
@@ -984,7 +987,7 @@ async function save() {
             <div class="card">
               <div class="card-title">上下文窗口（token，可选）</div>
               <input v-model="form.contextWindow" class="inp" type="number" min="0" placeholder="留空或 0 = 未知（按字节水位触发压缩）" />
-              <div class="hint">填模型的真实上下文窗口（如 DeepSeek 128000），自动压缩会按 token 水位判断「什么时候该压缩」，比按字节数估算更准。</div>
+              <div class="hint">填模型的真实上下文窗口（如 DeepSeek 128000）。自动压缩按 token 水位触发，输入框右侧的上下文占用百分比也用它计算；模型档案里可以单独覆盖。0 = 未知。</div>
             </div>
             <div class="card">
               <div class="card-title">命令超时（秒，0 = 默认 30）</div>

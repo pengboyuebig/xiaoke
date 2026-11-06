@@ -102,14 +102,15 @@ type settingsView struct {
 
 // llmProfileView 是档案的前端视图：apiKey 永不明文下发，只给「是否已配置 + 尾 4 位」。
 type llmProfileView struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Mode       string `json:"mode"`
-	BaseURL    string `json:"baseURL"`
-	APIKeySet  bool   `json:"apiKeySet"`
-	APIKeyTail string `json:"apiKeyTail,omitempty"`
-	Model      string `json:"model"`
-	SmallModel string `json:"smallModel,omitempty"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Mode          string `json:"mode"`
+	BaseURL       string `json:"baseURL"`
+	APIKeySet     bool   `json:"apiKeySet"`
+	APIKeyTail    string `json:"apiKeyTail,omitempty"`
+	Model         string `json:"model"`
+	SmallModel    string `json:"smallModel,omitempty"`
+	ContextWindow int    `json:"contextWindow,omitempty"`
 }
 
 // profileViews 把档案列表转成脱敏视图。
@@ -120,6 +121,7 @@ func profileViews(profiles []settings.LLMProfile) []llmProfileView {
 		out = append(out, llmProfileView{
 			ID: p.ID, Name: p.Name, Mode: p.Mode, BaseURL: p.BaseURL,
 			APIKeySet: has, APIKeyTail: tail, Model: p.Model, SmallModel: p.SmallModel,
+			ContextWindow: p.ContextWindow,
 		})
 	}
 	return out

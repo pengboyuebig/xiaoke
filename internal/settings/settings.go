@@ -64,6 +64,9 @@ type LLMProfile struct {
 	APIKey     string `json:"apiKey,omitempty"` // 脱敏下发：前端只见 尾4位，空串=保持
 	Model      string `json:"model"`
 	SmallModel string `json:"smallModel,omitempty"`
+	// ContextWindow 该模型自己的上下文窗口（token，0 = 沿用全局「高级」设置）。
+	// 不同上游的窗口差异很大，档案级设置能让上下文用量百分比更准确。
+	ContextWindow int `json:"contextWindow,omitempty"`
 }
 
 // PermissionRule 一条工具权限规则。Tool 是工具名（内置精确名或 MCP 原始名），
@@ -221,16 +224,7 @@ func (s *Store) normalize() {
 	if s.data.LLM.MaxTokens < 0 {
 		s.data.LLM.MaxTokens = 0
 	}
-	if s.data.LLM.ContextWindow < 0 {
-		s.data.LLM.ContextWindow = 0
-	}
-	if s.data.LLM.ContextWindow > 0 && s.data.LLM.ContextWindow < 4096 {
-		// 有值但过小没有意义（比被动裁剪窗口还小），视为未配置
-		s.data.LLM.ContextWindow = 0
-	}
-	if s.data.LLM.ContextWindow > 10_000_000 {
-		s.data.LLM.ContextWindow = 10_000_000
-	}
+	s.data.LLM.ContextWindow = normalizeContextWindow(s.data.LLM.ContextWindow)
 	if s.data.CompactKeepCount < 0 {
 		s.data.CompactKeepCount = 0
 	}
@@ -298,6 +292,21 @@ func (s *Store) normalize() {
 	s.normalizeProfiles()
 }
 
+// normalizeContextWindow 校验上下文窗口：负值/过小视为未配置，上限封顶。
+func normalizeContextWindow(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > 0 && v < 4096 {
+		// 有值但过小没有意义（比被动裁剪窗口还小），视为未配置
+		return 0
+	}
+	if v > 10_000_000 {
+		return 10_000_000
+	}
+	return v
+}
+
 // maxProfiles 档案数量上限（防配置膨胀；个人使用远用不到 20 套）。
 const maxProfiles = 20
 
@@ -311,6 +320,7 @@ func (s *Store) normalizeProfiles() {
 		p.Model = strings.TrimSpace(p.Model)
 		p.BaseURL = strings.TrimSpace(p.BaseURL)
 		p.Mode = strings.ToLower(strings.TrimSpace(p.Mode))
+		p.ContextWindow = normalizeContextWindow(p.ContextWindow)
 		// 模式合法值；未填按 openai（绝大多数档案是真实上游）
 		if p.Mode != "mock" {
 			p.Mode = "openai"
@@ -366,13 +376,14 @@ func (s *Store) AdoptCurrentAsProfile(id, name string) (Settings, error) {
 			return s.snapshot(), fmt.Errorf("档案已满（%d 个）：请先删除不需要的配置", maxProfiles)
 		}
 		p := LLMProfile{
-			ID:         newProfileID(),
-			Name:       strings.TrimSpace(name),
-			Mode:       s.data.LLM.Mode,
-			BaseURL:    s.data.LLM.BaseURL,
-			APIKey:     s.data.LLM.APIKey,
-			Model:      s.data.LLM.Model,
-			SmallModel: s.data.LLM.SmallModel,
+			ID:            newProfileID(),
+			Name:          strings.TrimSpace(name),
+			Mode:          s.data.LLM.Mode,
+			BaseURL:       s.data.LLM.BaseURL,
+			APIKey:        s.data.LLM.APIKey,
+			Model:         s.data.LLM.Model,
+			SmallModel:    s.data.LLM.SmallModel,
+			ContextWindow: s.data.LLM.ContextWindow,
 		}
 		if p.Name == "" {
 			p.Name = "当前配置"
@@ -397,6 +408,7 @@ func (s *Store) AdoptCurrentAsProfile(id, name string) (Settings, error) {
 		p.APIKey = s.data.LLM.APIKey
 		p.Model = s.data.LLM.Model
 		p.SmallModel = s.data.LLM.SmallModel
+		p.ContextWindow = s.data.LLM.ContextWindow
 		if strings.TrimSpace(name) != "" {
 			p.Name = strings.TrimSpace(name)
 		}
@@ -430,6 +442,10 @@ func (s *Store) ActivateProfile(id string) (Settings, error) {
 	s.data.LLM.APIKey = p.APIKey
 	s.data.LLM.Model = p.Model
 	s.data.LLM.SmallModel = p.SmallModel
+	// 档案没填（0）时沿用「高级」里的全局值，避免切换旧档案把窗口清空。
+	if p.ContextWindow > 0 {
+		s.data.LLM.ContextWindow = p.ContextWindow
+	}
 	s.data.ActiveProfile = id
 	if err := s.save(); err != nil {
 		return s.snapshot(), err

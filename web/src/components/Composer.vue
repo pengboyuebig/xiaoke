@@ -26,6 +26,10 @@ const props = defineProps<{
   commands?: CustomCommand[]
   /** 本会话累计 token 用量（服务端会话快照累计，切会话随会话还原） */
   sessionUsage?: { prompt: number; completion: number; requests: number } | null
+  /** 上一次请求的 prompt tokens（上下文实际占用） */
+  contextTokens?: number
+  /** 当前生效模型的上下文窗口（0 = 未配置，只显示占用绝对值） */
+  contextWindow?: number
   /** 模型配置档案：输入框左下角快捷切换 */
   profiles?: LLMProfileView[]
   activeProfile?: string
@@ -140,6 +144,38 @@ function fmtTokens(n: number): string {
 const totalTokens = computed(() => {
   const u = props.sessionUsage
   return u ? (u.prompt || 0) + (u.completion || 0) : 0
+})
+
+// 上下文占用：用「上一次请求的 prompt tokens」代表当前上下文大小；
+// 配置了窗口时显示百分比，未配置时只显示绝对值。
+const contextPct = computed(() => {
+  const used = props.contextTokens || 0
+  const win = props.contextWindow || 0
+  if (used <= 0 || win <= 0) return null
+  return Math.min(100, Math.round((used / win) * 100))
+})
+const contextValue = computed(() => {
+  const used = props.contextTokens || 0
+  if (used <= 0) return ''
+  return contextPct.value === null ? fmtTokens(used) : `${contextPct.value}%`
+})
+const contextTone = computed(() => {
+  const p = contextPct.value
+  if (p === null) return ''
+  if (p >= 95) return 'danger'
+  if (p >= 80) return 'warn'
+  return ''
+})
+const contextTitle = computed(() => {
+  const used = props.contextTokens || 0
+  if (used <= 0) return ''
+  const win = props.contextWindow || 0
+  const base = `上下文占用：上一次请求 prompt ${used.toLocaleString()} tokens`
+  if (win > 0) {
+    const pct = Math.min(100, Math.round((used / win) * 100))
+    return `${base} / 窗口 ${win.toLocaleString()} tokens（${pct}%）。可在 设置 → 高级 → 上下文窗口，或模型档案里单独设置。`
+  }
+  return `${base}。尚未设置上下文窗口，可在 设置 → 高级 → 上下文窗口，或模型档案里单独设置。`
 })
 
 // 思考程度选项（none 不注入请求体；其余映射为 reasoning_effort）
@@ -370,6 +406,16 @@ function pickLevel(v: string) {
       <button v-else class="btn send" title="发送" :disabled="!text.trim()" @click="submit">
         <Icon name="arrow-up" :size="17" :stroke="2.2" />
       </button>
+      <!-- 上下文占用：上一次请求的 prompt tokens / 当前模型窗口 -->
+      <div
+        v-if="(props.contextTokens || 0) > 0"
+        class="context-meter"
+        :class="contextTone"
+        :title="contextTitle"
+      >
+        <span class="cm-value">{{ contextValue }}</span>
+        <span class="cm-label">上下文</span>
+      </div>
     </div>
     <div class="hint-row">
       <div class="hint-left">
@@ -724,6 +770,54 @@ textarea::placeholder {
   height: 10px;
   background: var(--danger);
   border-radius: 2px;
+}
+
+/* ---------- 上下文占用（上一次请求 prompt / 模型窗口） ---------- */
+.context-meter {
+  flex: none;
+  width: 54px;
+  height: 42px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.025);
+  cursor: default;
+  user-select: none;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.cm-value {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.cm-label {
+  font-size: 9px;
+  line-height: 1.1;
+  color: var(--text-faint);
+}
+
+.context-meter.warn {
+  border-color: rgba(234, 179, 8, 0.45);
+}
+
+.context-meter.warn .cm-value {
+  color: #eab308;
+}
+
+.context-meter.danger {
+  border-color: rgba(239, 68, 68, 0.5);
+}
+
+.context-meter.danger .cm-value {
+  color: var(--danger);
 }
 
 /* ---------- 斜杠命令补全 ---------- */

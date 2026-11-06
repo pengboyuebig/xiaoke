@@ -1190,7 +1190,7 @@ func (h *Handler) converse(ctx context.Context, p converseParams, send func(map[
 	finish := func() {
 		send(map[string]any{
 			"type":  "done",
-			"usage": map[string]any{"prompt": usagePrompt.Load(), "completion": usageCompletion.Load()},
+			"usage": map[string]any{"prompt": usagePrompt.Load(), "completion": usageCompletion.Load(), "lastPrompt": lastPrompt.Load()},
 		})
 		// 首轮对话结束：尝试用 smallModel 生成本会话标题（失败静默，默认标题兜底）
 		go h.maybeAutoTitle(sess.ID, sess.Title, p.Content)

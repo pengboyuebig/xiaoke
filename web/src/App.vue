@@ -54,6 +54,9 @@ const model = ref('')
 const sessionTodos = ref<Todo[]>([])
 // 本会话累计用量（服务端会话快照累计；切会话/每次请求结束后刷新）
 const sessionUsage = ref<{ prompt: number; completion: number; requests: number } | null>(null)
+// 上下文占用：上一次请求的 prompt tokens / 当前生效模型的上下文窗口
+const contextTokens = ref(0)
+const contextWindow = ref(0)
 
 // 后端 AskWait 的超时是 5 分钟（questions.go: questionTimeout）；
 // 前端留 30 秒余量，保证弹窗总在后端失效前收起。
@@ -138,16 +141,29 @@ async function refreshCommands() {
     slashCommands.value = s.commands || []
     modelProfiles.value = s.profiles || []
     activeProfile.value = s.activeProfile || ''
+    contextWindow.value = s.llm.contextWindow || 0
   } catch {
     /* 忽略 */
   }
 }
 
-/** 从会话快照取累计用量（promptTokens/completionTokens/requests） */
-function setSessionUsage(s: { promptTokens?: number; completionTokens?: number; requests?: number }) {
+/** 从会话快照取累计用量与上下文占用（promptTokens/completionTokens/requests/lastPromptTokens） */
+function setSessionUsage(s: {
+  promptTokens?: number
+  completionTokens?: number
+  requests?: number
+  lastPromptTokens?: number
+}) {
   const p = s.promptTokens || 0
   const c = s.completionTokens || 0
   sessionUsage.value = p || c ? { prompt: p, completion: c, requests: s.requests || 0 } : null
+  contextTokens.value = s.lastPromptTokens || 0
+}
+
+/** 新会话/切空会话：累计用量和上下文占用一起清空 */
+function clearSessionUsage() {
+  sessionUsage.value = null
+  contextTokens.value = 0
 }
 
 /** 一键切换模型档案：值拷入生效配置热生效，刷新健康状态与档案高亮 */
@@ -156,6 +172,7 @@ async function activateModel(id: string) {
     const s = await api.activateModel(id)
     modelProfiles.value = s.profiles || []
     activeProfile.value = s.activeProfile || ''
+    contextWindow.value = s.llm.contextWindow || 0
     await refreshHealth()
     const name = modelProfiles.value.find((p) => p.id === id)?.name || id
     flashNotice(`已切换到「${name}」，下一条消息生效`)
@@ -395,7 +412,7 @@ function handleSelectAgent(id: string) {
   rememberSession('')
   messages.value = []
   sessionTodos.value = []
-  sessionUsage.value = null
+  clearSessionUsage()
   error.value = ''
 }
 
@@ -578,6 +595,10 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
       signal: controller.signal,
       onDelta: (t) => {
         streamingText.value += t
+      },
+      onDone: (usage) => {
+        // 上下文占用随本轮最后一次模型调用立即更新；切走的会话不覆盖当前视图
+        if (usage?.lastPrompt && currentId.value === sessionId) contextTokens.value = usage.lastPrompt
       },
       onCompact: (covered) => {
         compactNotice.value = `上下文已自动压缩：较早的 ${covered} 条消息已总结为摘要（完整历史仍在本地，可在设置关闭自动压缩）`
@@ -769,7 +790,7 @@ function reuseEmptySession(sess: SessionMeta) {
   rememberSession(sess.id)
   messages.value = []
   sessionTodos.value = []
-  sessionUsage.value = null
+  clearSessionUsage()
   liveTools.value = []
   error.value = ''
   syncDetachedUrl(sess.id)
@@ -790,7 +811,7 @@ async function handleNewChat() {
   rememberSession('')
   messages.value = []
   sessionTodos.value = []
-  sessionUsage.value = null
+  clearSessionUsage()
   liveTools.value = []
   error.value = ''
   syncDetachedUrl('', currentProjectId.value)
@@ -843,7 +864,7 @@ async function handleRemove(id: string) {
     currentId.value = ''
     messages.value = []
     sessionTodos.value = []
-    sessionUsage.value = null
+    clearSessionUsage()
     try {
       localStorage.removeItem(CURRENT_SESSION_KEY)
     } catch {
@@ -862,7 +883,7 @@ function handleSelectProject(id: string) {
   currentId.value = ''
   messages.value = []
   sessionTodos.value = []
-  sessionUsage.value = null
+  clearSessionUsage()
   error.value = ''
   syncDetachedUrl('', id)
 }
@@ -889,7 +910,7 @@ async function handleNewSessionInProject(projectId: string) {
     currentId.value = s.id
     messages.value = []
     sessionTodos.value = []
-    sessionUsage.value = null
+    clearSessionUsage()
     error.value = ''
     rememberSession(s.id)
     syncDetachedUrl(s.id)
@@ -906,7 +927,7 @@ function unbindProject() {
   currentId.value = ''
   messages.value = []
   sessionTodos.value = []
-  sessionUsage.value = null
+  clearSessionUsage()
   error.value = ''
 }
 
@@ -933,6 +954,7 @@ async function handleDeleteProject(id: string) {
 function onSettingsClosed() {
   refreshHealth()
   refreshAgents()
+  refreshCommands() // 上下文窗口/模型档案可能刚被改过
 }
 </script>
 
@@ -1018,6 +1040,8 @@ function onSettingsClosed() {
             :active-profile="activeProfile"
             :model-name="model"
             :session-usage="sessionUsage"
+            :context-tokens="contextTokens"
+            :context-window="contextWindow"
             :agent-name="currentAgent?.name"
             @activate-model="activateModel"
             @send="handleSend"

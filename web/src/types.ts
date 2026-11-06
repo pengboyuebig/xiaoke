@@ -144,6 +144,8 @@ export interface Session {
   promptTokens?: number
   completionTokens?: number
   requests?: number
+  /** 上一次请求的 prompt tokens（上下文实际占用，用于上下文用量提示） */
+  lastPromptTokens?: number
 }
 
 export interface ListResponse {
@@ -297,6 +299,8 @@ export interface LLMProfileView {
   apiKeyTail?: string
   model: string
   smallModel?: string
+  /** 该模型自己的上下文窗口（token，0/缺省 = 沿用全局高级设置） */
+  contextWindow?: number
 }
 
 /** 保存/编辑档案时的提交形态（apiKey 空 = 保持原值） */
@@ -308,6 +312,8 @@ export interface LLMProfilePayload {
   apiKey: string
   model: string
   smallModel?: string
+  /** 该模型自己的上下文窗口（token，0 = 沿用全局高级设置） */
+  contextWindow?: number
 }
 
 /** 一条权限规则：工具名与资源模式支持 * ? 通配，按书写顺序取最后命中 */

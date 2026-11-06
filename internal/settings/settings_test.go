@@ -146,6 +146,44 @@ func TestNormalizeNewFields(t *testing.T) {
 	}
 }
 
+// 档案级上下文窗口：切换时覆盖全局；档案为 0 时沿用全局值。
+func TestProfileContextWindow(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "settings.json"), config.LLMConfig{Mode: "mock"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := s.Get()
+	next.LLMProfiles = []LLMProfile{
+		{ID: "p1", Name: "A", Mode: "openai", Model: "m1", ContextWindow: 128_000},
+		{ID: "p2", Name: "B", Mode: "openai", Model: "m2", ContextWindow: 0},
+		{ID: "p3", Name: "C", Mode: "openai", Model: "m3", ContextWindow: 100},
+	}
+	if err := s.Update(next, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Get().LLMProfiles[2].ContextWindow; got != 0 {
+		t.Fatalf("过小的档案窗口应归零，got %d", got)
+	}
+	if _, err := s.ActivateProfile("p1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Get().LLM.ContextWindow; got != 128_000 {
+		t.Fatalf("激活 p1 后全局窗口应为 128000，got %d", got)
+	}
+	next = s.Get()
+	next.LLM.ContextWindow = 64_000
+	if err := s.Update(next, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ActivateProfile("p2"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Get().LLM.ContextWindow; got != 64_000 {
+		t.Fatalf("档案 0 应沿用全局窗口 64000，got %d", got)
+	}
+}
+
 // ContextWindow 钳制：负值/过小视为未配置（回退字节水位），上限封顶。
 func TestNormalizeContextWindow(t *testing.T) {
 	dir := t.TempDir()

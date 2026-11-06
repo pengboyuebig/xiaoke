@@ -27,14 +27,12 @@ const props = defineProps<{
   streaming?: boolean
   /** 用户中途停止生成 */
   stopped?: boolean
-  agentName?: string
   avatar?: string
 }>()
 
 const AVATAR_FALLBACK = '/assets/avatar.png'
 const isImg = (v?: string) => !!v && (v.startsWith('/assets/') || v.startsWith('http'))
 const agentAvatar = () => props.avatar || AVATAR_FALLBACK
-const agentNameLabel = () => props.agentName || '小柯'
 
 // 展开状态：流式中默认展开（看实时进度），完成后自动收起为一行时长
 const expanded = ref(props.streaming === true)
@@ -172,10 +170,8 @@ const hasSections = computed(() =>
   allGroups.value.some((g) => (g.sections || []).some((s) => s.trim() !== '')),
 )
 
-// 流式中且没有工具/错误时显示状态胶囊：
-// 首 token 前显示「正在思考」，文本开始输出后显示「正在输入」。
-const showStatus = computed(() => props.streaming && !hasWork.value && !turnError.value)
-const statusText = computed(() => (hasSections.value ? '正在输入' : '正在思考'))
+// 流式状态统一由输入框上方的常驻胶囊显示（Composer），
+// 这里不再渲染第二份「正在输入」，避免同屏出现两个指示器。
 
 // 流式结束但既没有正文也没有工具（模型空回复 / 首 token 前停止）
 // 用户主动停止时不算「空回复」，改由下面的 stoppedEmpty 提示
@@ -411,13 +407,6 @@ onUpdated(highlight)
       </div>
     </div>
 
-    <!-- 流式状态：首 token 前「正在思考」，出字后「正在输入」 -->
-    <div v-if="showStatus" class="turn-status" role="status" aria-live="polite">
-      <span class="ts-agent">{{ agentNameLabel() }}</span>
-      <span>{{ statusText }}</span>
-      <span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-    </div>
-
     <!-- 空回复兜底：模型没返回内容 -->
     <div v-if="isEmptyReply" class="turn-empty">没有收到内容，请重试</div>
     <!-- 用户停止：没有内容时明确说是「已停止」，而不是让用户以为模型坏了 -->
@@ -437,63 +426,6 @@ onUpdated(highlight)
 
 .turn-answer:not(:first-child) {
   margin-top: 10px;
-}
-
-/* ---------- 流式状态 ---------- */
-.turn-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 10px;
-  padding: 7px 12px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.035);
-  color: var(--text-muted);
-  font-size: 12px;
-  line-height: 1.4;
-  box-shadow: var(--shadow-sm);
-}
-
-.ts-agent {
-  color: var(--accent);
-  font-weight: 600;
-}
-
-.typing-dots {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-}
-
-.typing-dots i {
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: var(--accent);
-  opacity: 0.3;
-  animation: typingBounce 1.2s infinite ease-in-out;
-}
-
-.typing-dots i:nth-child(2) {
-  animation-delay: 0.15s;
-}
-
-.typing-dots i:nth-child(3) {
-  animation-delay: 0.3s;
-}
-
-@keyframes typingBounce {
-  0%,
-  80%,
-  100% {
-    opacity: 0.25;
-    transform: translateY(0);
-  }
-  40% {
-    opacity: 1;
-    transform: translateY(-2px);
-  }
 }
 
 .turn-empty {

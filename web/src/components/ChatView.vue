@@ -270,7 +270,6 @@ const isEmpty = computed(() => !props.turns.length && !props.streaming)
           :end-time="t.endTime"
           :streaming="t.streaming"
           :stopped="t.stopped"
-          :agent-name="agentName()"
           :avatar="agentAvatar()"
         />
         <!-- 本回合用量：跟在该回合下方，而不是固定在整条会话底部 -->

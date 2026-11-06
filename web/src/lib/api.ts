@@ -32,6 +32,8 @@ export interface VersionInfo {
 export interface UsageInfo {
   prompt: number
   completion: number
+  /** 本次请求最后一条模型调用的 prompt tokens（上下文实际占用） */
+  lastPrompt?: number
 }
 
 async function jfetch<T>(input: string, init?: RequestInit): Promise<T> {
@@ -385,8 +387,12 @@ export const api = {
                   case 'error':
                     throw new Error((evt.error as string) || '未知错误')
                   case 'done': {
-                    const u = evt.usage as { prompt?: number; completion?: number } | undefined
-                    opts.onDone?.(u ? { prompt: u.prompt || 0, completion: u.completion || 0 } : undefined)
+                    const u = evt.usage as { prompt?: number; completion?: number; lastPrompt?: number } | undefined
+                    opts.onDone?.(u ? {
+                      prompt: u.prompt || 0,
+                      completion: u.completion || 0,
+                      lastPrompt: u.lastPrompt || 0,
+                    } : undefined)
                     resolve({ sessionId })
                     return
                   }
