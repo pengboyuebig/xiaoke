@@ -110,6 +110,44 @@ async function remove() {
   }
 }
 
+async function toggleCallable(ev: Event) {
+  const e = editing.value
+  if (!e || creating.value || busy.value) return
+  const input = ev.target as HTMLInputElement
+  busy.value = true
+  err.value = ''
+  try {
+    // 乐观更新：先把 UI 状态切过去，失败再回滚
+    e.callable = input.checked
+    const saved = await api.toggleAgentCallable(e.id)
+    editing.value = { ...editing.value, ...saved }
+    emit('changed')
+  } catch (ex) {
+    e.callable = !input.checked
+    err.value = (ex as Error).message
+  } finally {
+    busy.value = false
+  }
+}
+
+// 除自己之外的智能体（白名单只对「别人」有意义）
+const otherAgents = computed(() => {
+  const cur = editing.value
+  return userAgents.value.filter((a) => !cur || a.id !== cur.id)
+})
+
+function toggleCaller(id: string) {
+  const e = editing.value
+  if (!e || busy.value) return
+  const list = e.allowedCallers ? [...e.allowedCallers] : []
+  const idx = list.indexOf(id)
+  if (idx >= 0) list.splice(idx, 1)
+  else list.push(id)
+  e.allowedCallers = list
+  // 走正常保存路径（与人格提示词等字段一致）
+  save()
+}
+
 async function onPickFile(ev: Event) {
   const input = ev.target as HTMLInputElement
   const file = input.files?.[0]
@@ -209,6 +247,47 @@ async function onPickFile(ev: Event) {
           <input type="checkbox" v-model="current.tools" />
           <span>允许使用工具（读写文件 / 执行命令 / MCP）</span>
         </label>
+
+        <label class="switch">
+          <input
+            type="checkbox"
+            :checked="!!current.callable"
+            :disabled="busy"
+            @change="toggleCallable"
+          />
+          <span>
+            允许被其它智能体调用
+            <span class="dim">（开启后，别的智能体可以用 agent_call 找你协作）</span>
+          </span>
+        </label>
+
+        <!-- 调用白名单：仅当开启「可被调用」时有意义。
+             留空 = 团队内所有智能体都能调；勾选后只有选中的能调。 -->
+        <div v-if="current.callable" class="field caller-field">
+          <label>
+            允许调用我的智能体
+            <span class="dim">（不选 = 所有智能体都能调）</span>
+          </label>
+          <div class="caller-list">
+            <label
+              v-for="a in otherAgents"
+              :key="a.id"
+              class="caller-item"
+              :class="{ on: (current.allowedCallers || []).includes(a.id) }"
+            >
+              <input
+                type="checkbox"
+                :checked="(current.allowedCallers || []).includes(a.id)"
+                :disabled="busy"
+                @change="toggleCaller(a.id)"
+              />
+              <span class="caller-name">{{ a.name }}</span>
+            </label>
+            <div v-if="otherAgents.length === 0" class="dim" style="font-size: 12px">
+              没有其它智能体可调
+            </div>
+          </div>
+        </div>
 
         <div v-if="err" class="err">{{ err }}</div>
 
@@ -443,6 +522,44 @@ async function onPickFile(ev: Event) {
   accent-color: var(--accent);
   width: 15px;
   height: 15px;
+}
+
+/* 调用白名单 */
+.caller-field {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.02);
+  border-radius: 8px;
+}
+
+.caller-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.caller-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.caller-item:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+.caller-item.on {
+  color: var(--accent);
+  font-weight: 600;
+}
+.caller-item input {
+  accent-color: var(--accent);
+  width: 14px;
+  height: 14px;
 }
 
 .err {

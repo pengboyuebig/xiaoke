@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, onUpdated, ref, watch } from 'vue'
 import hljs from 'highlight.js/lib/common'
-import type { MsgGroup, ToolPair } from '../types'
+import type { HandoffRecord, MsgGroup, ToolPair } from '../types'
 import Icon from './Icon.vue'
+import HandoffChain from './HandoffChain.vue'
 import { renderMarkdownCollapsed } from '../lib/markdown'
 
 // ---------- 编辑 diff 渲染 ----------
@@ -28,6 +29,8 @@ const props = defineProps<{
   /** 用户中途停止生成 */
   stopped?: boolean
   avatar?: string
+  /** 本回合的 agent 互调记录（调用链回放） */
+  handoffs?: HandoffRecord[]
 }>()
 
 const AVATAR_FALLBACK = '/assets/avatar.png'
@@ -58,6 +61,14 @@ function toggle() {
 }
 
 const allGroups = computed<MsgGroup[]>(() => props.groups || [])
+
+// 调用链来源：落库记录（props.handoffs）优先，其次流式期间收到的实时记录。
+// 同一回合里两者可能都有——落库是权威版本，实时记录只是让提示在流式时就可见。
+const handoffList = computed<HandoffRecord[]>(() => {
+  if (props.handoffs?.length) return props.handoffs
+  const live = allGroups.value.flatMap((g) => g.handoffs || [])
+  return live
+})
 
 // 出错时顶栏常显错误（否则错误藏在收起的明细里，用户只看到「已工作 0 秒」）
 const turnError = computed(() => allGroups.value.find((g) => g.error)?.error || '')
@@ -345,6 +356,14 @@ onUpdated(highlight)
       <Icon name="warning" :size="14" />
       <span>{{ turnError }}</span>
     </div>
+
+    <!-- 智能体协作链：谁调了谁、任务是什么、汇报如何。独立于工具时间线，
+         因为它是「角色之间的协作」而不是「工具调用」。
+         props.handoffs 是落库记录（完整），groups 里的 handoffs 是流式期间的实时记录。 -->
+    <HandoffChain
+      v-if="handoffList.length"
+      :handoffs="handoffList"
+    />
 
     <!-- 工作过程（可折叠）：工具时间线 + 完整参数结果 + 错误；没有内容时不渲染空框 -->
     <div

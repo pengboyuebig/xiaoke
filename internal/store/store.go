@@ -37,8 +37,33 @@ var logCompactBytes int64 = 1 << 20
 
 const maxLogLine = 1 << 20
 
+// HandoffRecord 是一次 agent 互调的记录（谁调谁、第几层、结果如何）。
+// 作为 role=handoff 的特殊消息追加到会话日志，前端据此渲染调用链回放。
+//
+// 为什么不做成独立表：调用链必须和会话消息同序回放（「先看到 A 说要做 X，
+// 再看到它调用了 B」），混在消息流里天然有序，不需要额外排序字段。
+//
+// 关键：这类消息带 Hidden=true，不参与模型上下文——上游只认
+// user/assistant/tool/system，多一个 role 会被严格的上游 400。
+// 它只是「给人看的回放数据」。
+type HandoffRecord struct {
+	From      string    `json:"from"`
+	FromName  string    `json:"fromName"`
+	To        string    `json:"to"`
+	ToName    string    `json:"toName"`
+	Depth     int       `json:"depth"`
+	Prompt    string    `json:"prompt"`
+	Report    string    `json:"report,omitempty"`
+	Ok        bool      `json:"ok"`
+	Error     string    `json:"error,omitempty"`
+	Ms        int64     `json:"ms"`
+	ToolCalls int       `json:"toolCalls"`
+	Trace     []string  `json:"trace,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
 type Message struct {
-	Role      string    `json:"role"` // "user" | "assistant" | "tool"
+	Role      string    `json:"role"` // "user" | "assistant" | "tool" | "handoff"
 	Content   string    `json:"content"`
 	CreatedAt time.Time `json:"createdAt"`
 	// 隐藏消息：仍参与模型上下文，但前端不渲染（如「批准计划」的自动指令）
@@ -51,6 +76,8 @@ type Message struct {
 	// Usage 这条 assistant 回复消耗的 token（来自上游 usage，随消息持久化）。
 	// 只写在每轮最后一条答复上，供前端在每个回合下方显示用量。
 	Usage *MessageUsage `json:"usage,omitempty"`
+	// role=handoff 时：这次 agent 互调的完整记录。
+	Handoff *HandoffRecord `json:"handoff,omitempty"`
 }
 
 // MessageUsage 是一次回复的 token 用量。

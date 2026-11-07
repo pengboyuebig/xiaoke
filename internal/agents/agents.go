@@ -39,6 +39,28 @@ type Agent struct {
 	Builtin   bool      `json:"builtin,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+
+	// Callable 表示这个智能体可以被其他智能体通过 agent_call 调用。
+	// 默认 false：避免把私人格（比如「小柯」）暴露成公共工具。
+	Callable bool `json:"callable,omitempty"`
+	// AllowedCallers 限制谁能调用自己（agent ID 列表）。空 = 团队内所有智能体都能调。
+	AllowedCallers []string `json:"allowedCallers,omitempty"`
+}
+
+// CanBeCalledBy 判断调用方是否被允许调用该 agent。
+func (a Agent) CanBeCalledBy(callerID string) bool {
+	if !a.Callable {
+		return false
+	}
+	if len(a.AllowedCallers) == 0 {
+		return true
+	}
+	for _, id := range a.AllowedCallers {
+		if id == callerID {
+			return true
+		}
+	}
+	return false
 }
 
 type indexFile struct {

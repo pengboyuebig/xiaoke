@@ -91,7 +91,7 @@ func TestExecToolPermissionRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := &Handler{set: set}
-	defs := tools.Defs(tools.Builtin())
+	defs := tools.Defs(tools.Builtin(), nil)
 	env := &tools.Env{Workspace: dir, Files: tools.NewFileStateTracker()}
 	asked := false
 	env.PermissionAsk = func(string, string) bool {
@@ -184,6 +184,7 @@ func TestRetryableUpstream(t *testing.T) {
 	}{
 		{&upstreamErr{kind: "network"}, true},
 		{&upstreamErr{kind: "midstream"}, true},
+		{&upstreamErr{kind: "empty"}, true},
 		{&upstreamErr{kind: "status", status: 429}, true},
 		{&upstreamErr{kind: "status", status: 503}, true},
 		{&upstreamErr{kind: "status", status: 401}, false},

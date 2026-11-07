@@ -324,7 +324,7 @@ func TestSearchFiles(t *testing.T) {
 
 // ToolDef 必须只序列化 OpenAI 协议字段（Exec 函数不能进请求体，否则 json.Marshal 会失败）。
 func TestToolDefMarshalOnlyWireFields(t *testing.T) {
-	defs := Defs(Builtin())
+	defs := Defs(Builtin(), nil)
 	if len(defs) == 0 {
 		t.Fatal("内置工具为空")
 	}
@@ -691,14 +691,26 @@ func TestTaskTool(t *testing.T) {
 	}
 }
 
-// SubagentDefs：explore 只留只读、general 全量、task 永远剔除（防递归）。
+// SubagentDefs：explore 只留只读；递归入口（task/agent_call）按深度剔除。
 func TestSubagentDefs(t *testing.T) {
-	defs := Defs(Builtin())
-	explore := SubagentDefs(defs, "explore")
-	for _, d := range explore {
-		if d.Function.Name == "task" {
-			t.Fatal("子代理工具集不应包含 task（防递归）")
+	defs := Defs(Builtin(), nil)
+
+	// 深度 0（顶层）：递归入口还在，agent 互调可用。
+	top := SubagentDefs(defs, "general-purpose", 0)
+	if !hasToolName(top, "task") || !hasToolName(top, "agent_call") {
+		t.Fatalf("顶层应保留递归入口 task/agent_call: %v", toolNames(top))
+	}
+
+	// 深度达到上限：递归入口被剔除，防止无限派生。
+	deep := SubagentDefs(defs, "general-purpose", MaxAgentDepth)
+	for _, d := range deep {
+		if d.Function.Name == "task" || d.Function.Name == "agent_call" {
+			t.Fatalf("深度 %d 应剔除递归入口，仍存在: %s", MaxAgentDepth, d.Function.Name)
 		}
+	}
+
+	explore := SubagentDefs(defs, "explore", 0)
+	for _, d := range explore {
 		if IsWriteCapable(d.Function.Name) {
 			t.Fatalf("explore 工具集混入写类工具: %s", d.Function.Name)
 		}
@@ -710,19 +722,28 @@ func TestSubagentDefs(t *testing.T) {
 	if !names["list_files"] || !names["read_file"] || !names["search_files"] {
 		t.Fatalf("explore 应保留只读工具: %v", names)
 	}
-	general := SubagentDefs(defs, "general-purpose")
-	haveTask := false
-	for _, d := range general {
-		if d.Function.Name == "task" {
-			haveTask = true
-		}
-	}
-	if haveTask {
-		t.Fatal("general 子代理也不应包含 task")
-	}
+
+	general := SubagentDefs(defs, "general-purpose", 0)
 	if len(general) <= len(explore) {
 		t.Fatalf("general 工具集应多于 explore: %d vs %d", len(general), len(explore))
 	}
+}
+
+func hasToolName(defs []ToolDef, name string) bool {
+	for _, d := range defs {
+		if d.Function.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func toolNames(defs []ToolDef) []string {
+	out := make([]string, 0, len(defs))
+	for _, d := range defs {
+		out = append(out, d.Function.Name)
+	}
+	return out
 }
 
 // memory 工具依赖 Env 注入的回调：回调缺失要明确报错，存在则透传 scope。
@@ -812,5 +833,84 @@ func TestSafeJoinRejectsSymlinkEscape(t *testing.T) {
 	}
 	if _, err := env.resolveWrite("alias/ok.txt"); err != nil {
 		t.Fatalf("指向工作区内部的符号链接应允许: %v", err)
+	}
+}
+
+// ---------- agent_call ----------
+
+func TestAgentCallRequiresCallbacks(t *testing.T) {
+	env := &Env{}
+	args, _ := json.Marshal(map[string]string{"agent_id": "x", "prompt": "干活"})
+	if _, err := execAgentCall(context.Background(), env, args); err == nil {
+		t.Fatal("回调缺失时应报错")
+	}
+}
+
+func TestAgentCallRejectsUnknownAgent(t *testing.T) {
+	env := &Env{
+		CallAgent:    func(target AgentRef, prompt string, opts CallOpts) (string, error) { return "ok", nil },
+		AgentCatalog: func(callerID string) []AgentRef { return []AgentRef{{ID: "fe01", Name: "前端"}} },
+		CallerID:     "pm01",
+	}
+	args, _ := json.Marshal(map[string]string{"agent_id": "notexist", "prompt": "干活"})
+	_, err := execAgentCall(context.Background(), env, args)
+	if err == nil {
+		t.Fatal("未知 agent 应被拒绝")
+	}
+	if !strings.Contains(err.Error(), "不在可调用列表") {
+		t.Fatalf("错误信息应说明不在列表: %v", err)
+	}
+}
+
+func TestAgentCallDelegates(t *testing.T) {
+	var got AgentRef
+	var gotPrompt string
+	env := &Env{
+		CallAgent: func(target AgentRef, prompt string, opts CallOpts) (string, error) {
+			got = target
+			gotPrompt = prompt
+			return "前端已完成登录页", nil
+		},
+		AgentCatalog: func(callerID string) []AgentRef {
+			return []AgentRef{{ID: "fe01", Name: "前端", Description: "写页面"}}
+		},
+		CallerID: "pm01",
+	}
+	args, _ := json.Marshal(map[string]string{"agent_id": "fe01", "prompt": "写个登录页"})
+	out, err := execAgentCall(context.Background(), env, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "fe01" || gotPrompt != "写个登录页" {
+		t.Fatalf("回调参数不正确: %+v / %q", got, gotPrompt)
+	}
+	if !strings.Contains(out, "登录页") {
+		t.Fatalf("应返回智能体输出: %q", out)
+	}
+}
+
+func TestAgentCallEmptyPromptRejected(t *testing.T) {
+	env := &Env{
+		CallAgent:    func(target AgentRef, prompt string, opts CallOpts) (string, error) { return "ok", nil },
+		AgentCatalog: func(callerID string) []AgentRef { return []AgentRef{{ID: "fe01", Name: "前端"}} },
+	}
+	args, _ := json.Marshal(map[string]string{"agent_id": "fe01", "prompt": "  "})
+	if _, err := execAgentCall(context.Background(), env, args); err == nil {
+		t.Fatal("空 prompt 应被拒绝")
+	}
+}
+
+func TestAgentCallDescription(t *testing.T) {
+	desc := AgentCallDescription("pm01", []AgentRef{
+		{ID: "fe01", Name: "前端", Description: "写页面"},
+		{ID: "qa01", Name: "测试", Description: "跑测试"},
+	})
+	for _, want := range []string{"前端", "fe01", "测试", "qa01", "深度上限"} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("描述应包含 %q: %s", want, desc)
+		}
+	}
+	if empty := AgentCallDescription("pm01", nil); !strings.Contains(empty, "无") {
+		t.Fatalf("空列表应明确说明: %s", empty)
 	}
 }

@@ -32,7 +32,8 @@ func (h *Handler) RegisterResources(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/skills", h.createSkill)
 	mux.HandleFunc("PUT /api/skills/{id}", h.updateSkill)
 	mux.HandleFunc("DELETE /api/skills/{id}", h.deleteSkill)
-	mux.HandleFunc("POST /api/agents/{id}/toggle", h.toggleAgentTools) // 智能体：开关工具
+	mux.HandleFunc("POST /api/agents/{id}/toggle", h.toggleAgentTools)      // 智能体：开关工具
+	mux.HandleFunc("POST /api/agents/{id}/callable", h.toggleAgentCallable) // 智能体：开关「可被调用」
 	mux.HandleFunc("POST /api/skills/{id}/toggle", h.toggleSkill)      // 技能：开关启用
 	mux.HandleFunc("POST /api/upload/avatar", h.uploadAvatar)
 }
@@ -119,6 +120,29 @@ func (h *Handler) toggleAgentTools(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.Tools = !a.Tools
+	out, err := h.Res.Agents.Update(id, a)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// toggleAgentCallable 智能体的「可被其它智能体调用」开关。
+// 与 toggleAgentTools 分开：Tools 是「我自己用不用工具」，
+// Callable 是「别人能不能调我」——后者是 agent 互调的权限面。
+func (h *Handler) toggleAgentCallable(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	a, err := h.Res.Agents.Get(id)
+	if errors.Is(err, agents.ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "智能体不存在"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	a.Callable = !a.Callable
 	out, err := h.Res.Agents.Update(id, a)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})

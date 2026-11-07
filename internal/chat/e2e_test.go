@@ -36,6 +36,7 @@ type e2eFixture struct {
 	st      *store.Store
 	set     *settings.Store
 	pm      *projects.Manager
+	ag      *agents.Store
 	project projects.Project
 	rootDir string
 	dataDir string
@@ -97,7 +98,7 @@ func newE2E(t *testing.T) *e2eFixture {
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return &e2eFixture{srv: srv, st: st, set: set, pm: pm, project: proj, rootDir: rootDir, dataDir: dataDir}
+	return &e2eFixture{srv: srv, st: st, set: set, pm: pm, ag: ag, project: proj, rootDir: rootDir, dataDir: dataDir}
 }
 
 // postChat 发一条消息并收集全部 SSE 事件。
@@ -378,7 +379,7 @@ func TestE2EQuestionSingleUse(t *testing.T) {
 // ask 权限模式：写工具执行前走 PermissionAsk；拒绝 → 工具结果为「用户拒绝」。
 func TestExecToolPermissionGate(t *testing.T) {
 	h := &Handler{}
-	defs := tools.Defs(tools.Builtin())
+	defs := tools.Defs(tools.Builtin(), nil)
 	env := &tools.Env{Workspace: t.TempDir(), Files: tools.NewFileStateTracker()}
 	calls := 0
 	env.PermissionAsk = func(toolName, summary string) bool {

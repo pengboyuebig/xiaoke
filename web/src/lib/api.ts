@@ -74,6 +74,17 @@ export interface ChatOptions {
   onRetry?: (info: { attempt: number; maxAttempts: number; delayMs: number; reason: string }) => void
   /** 待办清单更新（todo_write 工具执行成功后推送） */
   onTodo?: (todos: Todo[]) => void
+  /** 智能体之间发生调用：from → to（agent_call 工具触发） */
+  onAgentHandoff?: (info: {
+    from: string
+    fromName: string
+    to: string
+    toName: string
+    depth: number
+    description: string
+  }) => void
+  /** 被调用的智能体返回（无论成功失败） */
+  onAgentReturn?: (info: { from: string; fromName: string; to: string; ok: boolean }) => void
   /** ask_user 提问 / ask 模式审批：返回的 Promise 在用户作答后 resolve */
   onAsk?: (req: { id: string; kind: 'question' | 'permission'; question?: string; options?: string[]; multiSelect?: boolean; tool?: string; summary?: string }) => Promise<string>
   /** 对话结束：携带本次累计的 token 用量 */
@@ -186,6 +197,9 @@ export const api = {
   },
   toggleAgentTools(id: string): Promise<Agent> {
     return jfetch(`/api/agents/${id}/toggle`, { method: 'POST' })
+  },
+  toggleAgentCallable(id: string): Promise<Agent> {
+    return jfetch(`/api/agents/${id}/callable`, { method: 'POST' })
   },
 
   // ---------- 技能 ----------
@@ -358,6 +372,24 @@ export const api = {
                     break
                   case 'todo':
                     opts.onTodo?.((evt.todos as Todo[]) || [])
+                    break
+                  case 'agent_handoff':
+                    opts.onAgentHandoff?.({
+                      from: (evt.from as string) || '',
+                      fromName: (evt.fromName as string) || '',
+                      to: (evt.to as string) || '',
+                      toName: (evt.toName as string) || '',
+                      depth: (evt.depth as number) || 0,
+                      description: (evt.description as string) || '',
+                    })
+                    break
+                  case 'agent_return':
+                    opts.onAgentReturn?.({
+                      from: (evt.from as string) || '',
+                      fromName: (evt.fromName as string) || '',
+                      to: (evt.to as string) || '',
+                      ok: !!evt.ok,
+                    })
                     break
                   case 'ask': {
                     if (opts.onAsk) {

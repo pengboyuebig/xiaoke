@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api } from './lib/api'
-import type { Agent, CustomCommand, LLMProfileView, Message, MsgGroup, Project, SessionMeta, Skill, Todo, ToolActivity, ToolPair, Turn } from './types'
+import type { Agent, CustomCommand, HandoffRecord, LLMProfileView, Message, MsgGroup, Project, SessionMeta, Skill, Todo, ToolActivity, ToolPair, Turn } from './types'
 import SideBar from './components/SideBar.vue'
 import ChatView from './components/ChatView.vue'
 import Composer from './components/Composer.vue'
@@ -45,6 +45,11 @@ const liveTools = ref<ToolActivity[]>([])
 // 上下文压缩提示：压缩发生后短暂显示，让「模型为什么记得概括版历史」有解释
 const compactNotice = ref('')
 let compactTimer: number | undefined
+// 智能体互调：实时提示条 + 挂到当前回合的调用链（落库后由服务端消息接管）。
+// 只更新提示条是不够的——提示条 6 秒就消失，而调用链要能一直回看。
+const handoffNotice = ref('')
+const liveHandoffs = ref<HandoffRecord[]>([])
+let handoffTimer: number | undefined
 const error = ref('')
 const mode = ref('')
 const model = ref('')
@@ -507,6 +512,11 @@ const turns = computed<Turn[]>(() => {
       } else {
         round.tools.push({ id: m.toolCallId || '', name: m.name || 'tool', arguments: '', result: m.content, ok: true })
       }
+    } else if (m.role === 'handoff' && m.handoff) {
+      // agent 互调记录：挂在回合上，交给 TurnView 渲染调用链。
+      // 不参与正文分组——它是「过程」而不是「内容」。
+      if (!cur.handoffs) cur.handoffs = []
+      cur.handoffs.push(m.handoff)
     }
   }
   flushRound()
@@ -537,6 +547,8 @@ const turns = computed<Turn[]>(() => {
       round: roundNo,
       streaming: liveHere,
       error: liveHere ? undefined : error.value || undefined,
+      // 流式期间的调用链：与已落库的记录合并显示（落库记录在后，会覆盖）
+      handoffs: liveHandoffs.value.length ? [...liveHandoffs.value, ...(cur.handoffs || [])] : cur.handoffs,
     })
   }
   return out
@@ -565,6 +577,7 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
   streamingText.value = ''
   liveSplits.value = []
   liveTools.value = []
+  liveHandoffs.value = []
   controller = new AbortController()
   abortedByUser = false
   try {
@@ -646,6 +659,38 @@ async function handleSend(content: string, opts?: { hidden?: boolean }) {
       onTodo: (todos) => {
         // 待办属于这个会话：用户切走了就别覆盖另一个会话的清单
         if (currentId.value === streamSessionId.value) sessionTodos.value = todos
+      },
+      onAgentHandoff: (info) => {
+        // 智能体互调：把「谁在调谁」显示出来，否则 A→B→C 对用户完全是黑盒。
+        handoffNotice.value =
+          `${info.fromName} → ${info.toName}（第 ${info.depth + 1} 层）` +
+          (info.description ? `：${info.description}` : '')
+        // 同时挂到当前回合的调用链上：提示条会消失，调用链要能一直回看。
+        // 失败时后端只发 agent_return，所以这里先建占位、由 return 补齐结果。
+        liveHandoffs.value.push({
+          from: info.from,
+          fromName: info.fromName,
+          to: info.to,
+          toName: info.toName,
+          depth: info.depth,
+          prompt: info.description || '',
+          ok: true,
+          ms: 0,
+          toolCalls: 0,
+          createdAt: new Date().toISOString(),
+        })
+        if (handoffTimer) window.clearTimeout(handoffTimer)
+        handoffTimer = window.setTimeout(() => (handoffNotice.value = ''), 6000)
+      },
+      onAgentReturn: (info) => {
+        // 补齐占位记录的成败与耗时
+        const rec = [...liveHandoffs.value].reverse().find((h) => h.to === info.from)
+        if (rec) rec.ok = info.ok
+        if (!info.ok) {
+          handoffNotice.value = `${info.fromName} 调用失败，已把错误回灌给 ${info.to}`
+          if (handoffTimer) window.clearTimeout(handoffTimer)
+          handoffTimer = window.setTimeout(() => (handoffNotice.value = ''), 6000)
+        }
       },
       onAsk: (req) => {
         // SSE ask 事件：挂起等待用户操作（返回的 promise 由按钮点击 resolve）。
@@ -1001,6 +1046,12 @@ function onSettingsClosed() {
       <transition name="toast">
         <div v-if="retryNotice" class="compact-notice retry-notice">{{ retryNotice }}</div>
       </transition>
+      <transition name="toast">
+        <div v-if="handoffNotice" class="compact-notice handoff-notice">
+          <Icon name="share" :size="13" :stroke="2" />
+          <span>{{ handoffNotice }}</span>
+        </div>
+      </transition>
       <!-- 排队中的消息（当前轮结束后自动逐条发送，点击移除） -->
       <div v-if="sendQueue.length" class="queue-strip">
         <span v-for="(q, i) in sendQueue" :key="i" class="queue-chip" :title="q.content + '\n（点击移除）'" @click="cancelQueued(i)">
@@ -1178,6 +1229,16 @@ function onSettingsClosed() {
   top: 122px;
   background: rgba(250, 204, 21, 0.1);
   border-color: rgba(250, 204, 21, 0.35);
+}
+
+/* 智能体互调提示：用绿色区分于压缩/重试提示 */
+.handoff-notice {
+  top: 166px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(16, 185, 129, 0.1);
+  border-color: rgba(16, 185, 129, 0.35);
 }
 
 .queue-strip {

@@ -21,6 +21,34 @@ type TodoItem struct {
 	Status  string `json:"status"` // pending | in_progress | completed
 }
 
+// AgentRef 是 agent_call 工具的调用目标。只暴露 handler 认为模型需要的字段，
+// 避免 tools 包反向依赖 agents 包。
+type AgentRef struct {
+	ID          string
+	Name        string
+	Description string
+	// SystemPrompt 为该 agent 的人格提示词（空则用默认人设）。
+	SystemPrompt string
+	// WriteCapable 表示这个 agent 会拿到写类工具（决定调用方是否要持写锁）。
+	WriteCapable bool
+}
+
+// CallOpts 是一次 agent 互调的上下文，由 chat 层的调用图生成。
+type CallOpts struct {
+	// CallerID/CallerName 是谁在调（写进被调 agent 的 system 消息，让它知道来源）。
+	CallerID   string
+	CallerName string
+	// Depth 是当前调用链深度（顶层对话 = 0，被调 agent 内部再调 = 1…）。
+	Depth int
+	// BudgetLeft 是剩余可派子代理/调 agent 的次数，逐层递减。
+	BudgetLeft int
+	// WriteLockHeld 表示调用方已持有该 workspace 的写锁：被调方必须继承，
+	// 不能重新获取（否则会把父的锁绕过，形成并发写）。
+	WriteLockHeld bool
+	// Trace 是调用链（从顶层到当前），用于防环与 SSE 展示。
+	Trace []string
+}
+
 // Env 是一次工具执行的环境（每次请求按当前设置/项目构造）。
 type Env struct {
 	Workspace string   // 可读写的工作区根（项目目录）；为空表示未选择项目
@@ -38,6 +66,17 @@ type Env struct {
 	// RunSubagent 派一个子代理执行子任务：kind 为 "explore"（只读）或
 	// "general-purpose"（完整工具），prompt 必须自包含。返回子代理的最终汇报。
 	RunSubagent func(kind, prompt string) (string, error)
+	// CallAgent 调用一个具名智能体（agent_call 工具）。与 RunSubagent 的区别：
+	// 目标是 data/agents.json 里注册过的 agent，带独立人格、可调用白名单和深度预算；
+	// RunSubagent 派的是匿名临时工。opts 携带调用链上下文（谁调的、第几层、剩多少预算）。
+	//
+	// opts 必须由 Env 注入（Env.CallOpts）：工具执行层不构造它。
+	// 如果这里拿到零值，子 agent 会以为「没有调用方、深度 0」，
+	// 导致嵌套调用被白名单/自身检查误拦，且 handoff 事件丢失。
+	CallAgent func(target AgentRef, prompt string, opts CallOpts) (string, error)
+	// AgentCatalog 返回「当前会话可调用」的智能体清单。做成回调而不是全局变量：
+	// 不同会话的可调用集合不同（按调用方过滤白名单），全局变量会串味。
+	AgentCatalog func(callerID string) []AgentRef
 	// SkillRead 读取一个已启用技能的完整正文（系统提示词只注入技能清单）。
 	SkillRead func(name string) (string, error)
 	// AskUser 阻塞式向用户提问（ask_user 工具回调）：问题 + 选项（可空 = 自由输入）
@@ -55,6 +94,9 @@ type Env struct {
 	OnFileChange func(abs, before string, existed bool)
 	// SessionID 是当前会话 ID（后台任务完成唤醒时定位回写会话用；空 = 未知）。
 	SessionID string
+	// CallerID 是当前正在执行对话的智能体 ID（顶层对话 = 用户选定的 agent）。
+	// AgentCatalog 回调用它过滤「谁能调谁」的白名单。
+	CallerID string
 	// OnTaskDone 由 chat 层注入：后台命令任务结束时回调（会话唤醒）。
 	// 任务 goroutine 中调用，实现方需自行保证并发安全。
 	OnTaskDone func(taskID string)
@@ -67,9 +109,14 @@ type Env struct {
 	// Files 是会话级「已读文件」状态表（nil = 未启用新鲜度护栏）。
 	// read_file 登记、edit_file/write_file 修改已有文件前校验，防盲写覆盖。
 	Files *FileStateTracker
+
+	// CallOpts 是当前这层调用的上下文（由 chat 层在 runAgent 里设置）。
+	// agent_call 工具必须用它在 Env.CallAgent 时回传，否则子层拿不到
+	// 「谁在调我、第几层」，嵌套调用会被误拦。
+	CallOpts CallOpts
 }
 
-func (e *Env) clone() *Env {
+func (e *Env) Clone() *Env {
 	cp := *e
 	cp.ReadDirs = append([]string(nil), e.ReadDirs...)
 	cp.Allowlist = append([]string(nil), e.Allowlist...)
@@ -96,7 +143,7 @@ func Builtin() []Tool {
 	return []Tool{
 		toolListFiles, toolReadFile, toolEditFile, toolWriteFile,
 		toolSearchFiles, toolFindFiles, toolTodoWrite, toolMemoryAppend,
-		toolMemoryRead, toolSkillRead, toolWebFetch, toolTask,
+		toolMemoryRead, toolSkillRead, toolWebFetch, toolTask, toolAgentCall,
 		toolAskUser, toolCronCreate, toolCronList, toolCronUpdate,
 		toolCronDelete, toolRunCommand, toolTaskOutput, toolTaskKill,
 	}
@@ -104,16 +151,19 @@ func Builtin() []Tool {
 
 // SubagentDefs 按子代理类型筛选工具集：
 //   - explore：只保留只读工具（复用 IsWriteCapable 过滤，含只读 MCP）
-//   - general-purpose：全量，但剔除 task 本身（防止子代理再派子代理的无限递归；
-//     深度上限在最外层控制，这里直接从源头去掉递归入口）
-func SubagentDefs(defs []ToolDef, kind string) []ToolDef {
+//   - general-purpose：全量
+//
+// depth 是当前调用链深度（顶层对话传 0）。深度达到 maxAgentDepth 时，
+// 递归入口（task / agent_call）被剔除——不是无条件剔除，否则 agent 互调
+// 只能有一层，做不出「产品经理 → 前端 → 测试」这种链。
+func SubagentDefs(defs []ToolDef, kind string, depth int) []ToolDef {
 	out := make([]ToolDef, 0, len(defs))
 	for _, d := range defs {
 		name := d.Function.Name
 		if d.FromMCP != "" {
 			name = d.MCPTool
 		}
-		if name == "task" {
+		if depth >= MaxAgentDepth && (name == "task" || name == "agent_call") {
 			continue
 		}
 		if kind == "explore" && IsWriteCapable(name) {
@@ -123,6 +173,10 @@ func SubagentDefs(defs []ToolDef, kind string) []ToolDef {
 	}
 	return out
 }
+
+// MaxAgentDepth 是 agent 互调的全局深度硬上限（顶层对话 = 0）。
+// 取 2 是业界共识的 Depth-2 ceiling：再深可观测性会崩，且模型容易绕圈。
+const MaxAgentDepth = 2
 
 // ToolDef 是发给上游 OpenAI 接口的 tools 数组元素。
 type ToolDef struct {
@@ -149,14 +203,21 @@ type ToolFunction struct {
 }
 
 // Defs 把工具列表转成上游请求形态（内置工具可直接执行）。
-func Defs(all []Tool) []ToolDef {
+// Defs 把内置 Tool 转成发给上游的 ToolDef。
+// descOverride 允许按请求覆盖某个工具的描述（agent_call 需要把当前会话
+// 可调用哪些智能体写进描述，模型才知道有哪些专家可调）。
+func Defs(all []Tool, descOverride map[string]string) []ToolDef {
 	defs := make([]ToolDef, 0, len(all))
 	for _, t := range all {
+		desc := t.Description
+		if override, ok := descOverride[t.Name]; ok && override != "" {
+			desc = override
+		}
 		defs = append(defs, ToolDef{
 			Type: "function",
 			Function: ToolFunction{
 				Name:        t.Name,
-				Description: t.Description,
+				Description: desc,
 				Parameters:  t.Parameters,
 			},
 			Exec: t.Execute,

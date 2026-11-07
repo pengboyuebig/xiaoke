@@ -1,6 +1,6 @@
 // 与后端共享的类型定义
 
-export type Role = 'user' | 'assistant' | 'tool'
+export type Role = 'user' | 'assistant' | 'tool' | 'handoff'
 
 export interface ToolCallInfo {
   id: string
@@ -23,6 +23,31 @@ export interface Message {
   name?: string
   /** 本条回复的 token 用量（仅每轮最后一条 assistant 有） */
   usage?: { prompt: number; completion: number }
+  /** role=handoff 时：这次 agent 互调的完整记录 */
+  handoff?: HandoffRecord
+}
+
+/** 一次 agent 互调的记录（role=handoff 消息携带） */
+export interface HandoffRecord {
+  from: string
+  fromName: string
+  to: string
+  toName: string
+  /** 调用链深度（顶层对话 = 0，被调 agent 内部再调 = 1…） */
+  depth: number
+  /** 交给目标智能体的任务说明 */
+  prompt: string
+  /** 目标智能体的汇报（成功时） */
+  report?: string
+  ok: boolean
+  error?: string
+  /** 耗时（毫秒） */
+  ms: number
+  /** 目标智能体发起的工具调用次数 */
+  toolCalls: number
+  /** 调用路径（从顶层到当前目标） */
+  trace?: string[]
+  createdAt: string
 }
 
 /** 流式过程中的工具活动（live 状态，落库后由服务端消息接管） */
@@ -65,6 +90,8 @@ export interface MsgGroup {
   streaming?: boolean
   /** user 内容 */
   content?: string
+  /** 流式期间收到的 agent 互调记录（落库后由 Turn.handoffs 接管） */
+  handoffs?: HandoffRecord[]
 }
 
 /** 一个「回合」：从用户提问到本轮答复结束的工作过程（TurnView 渲染） */
@@ -84,6 +111,8 @@ export interface Turn {
   msgIndex?: number
   /** 本回合消耗的 token（来自该回合最后一条 assistant 消息） */
   usage?: { prompt: number; completion: number }
+  /** 本回合发生的 agent 互调（按发生顺序，用于回放调用链） */
+  handoffs?: HandoffRecord[]
 }
 
 /** 后台任务（run_command is_background 起的真实进程） */
@@ -209,6 +238,12 @@ export interface Agent {
   tools: boolean
   /** 内置人格（小柯）：对用户隐藏，不可编辑或删除 */
   builtin?: boolean
+  /** 允许被其它智能体通过 agent_call 调用 */
+  callable?: boolean
+  /** 允许调用自己的智能体 ID 列表；空 = 团队内都能调 */
+  allowedCallers?: string[]
+  /** 该智能体自己还能往下派几层（0 = 不能再派） */
+
   createdAt: string
   updatedAt: string
 }

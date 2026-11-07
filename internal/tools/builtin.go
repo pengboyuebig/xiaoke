@@ -199,6 +199,100 @@ var toolTask = Tool{
 	Execute: execTask,
 }
 
+var toolAgentCall = Tool{
+	Name:        "agent_call",
+	Description: "调用一个具名智能体来协作完成任务（agent 之间可以互相调用）。与 task 的区别：task 派的是匿名临时工，agent_call 找的是有独立人格、有专长的注册智能体。\n何时用：需要另一个视角/专长（产品、架构、前端、测试、写作），或需要把子任务交给更合适的人。\n注意：\n- 只能调用 agent_id 在下方「可调用智能体」列表里的目标；不在列表里的会被拒绝\n- 目标看不到你的会话历史，prompt 必须自包含（背景 + 目标 + 汇报要求）\n- 你最多能往下再派 1 层（深度上限 2），再深会被系统拦下\n- 调用前确认目标确实是这件事的合适人选，不要为了调而调",
+	Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "agent_id": {"type": "string", "description": "要调用的智能体 ID（见工具描述里列出的可调用智能体）"},
+    "prompt": {"type": "string", "description": "给目标智能体的完整任务说明（自包含：背景 + 目标 + 汇报要求）"},
+    "description": {"type": "string", "description": "一句话说明这次调用要干什么（给自己和用户看）"}
+  },
+  "required": ["agent_id", "prompt"]
+}`),
+	Execute: execAgentCall,
+}
+
+// AgentCatalog 是 agent_call 工具描述里动态注入的「可调用智能体」清单。
+// 由 handler 在构造工具集时设置（tools 包不持有 agents 仓库）。
+//
+// 注意：这是给工具描述用的全局快照，实际校验以 Env.AgentCatalog 回调为准。
+// 两个都保留是为了兼容旧调用点；新代码应通过 Env.AgentCatalog 取列表。
+var AgentCatalog []AgentRef
+
+// AgentCallDescription 生成 agent_call 的工具描述：固定说明 + 当前可调用清单。
+// 清单为空时明确告诉模型「没有可调用的智能体」，避免它瞎猜 ID。
+func AgentCallDescription(callerID string, catalog []AgentRef) string {
+	base := "调用一个具名智能体来协作完成任务（agent 之间可以互相调用）。与 task 的区别：task 派的是匿名临时工，agent_call 找的是有独立人格、有专长的注册智能体。\n何时用：需要另一个视角/专长（产品、架构、前端、测试、写作），或需要把子任务交给更合适的人。\n注意：\n- 只能调用下方「可调用智能体」列表里的目标；不在列表里的会被拒绝\n- 目标看不到你的会话历史，prompt 必须自包含（背景 + 目标 + 汇报要求）\n- 你最多能往下再派 " + fmt.Sprint(MaxAgentDepth-1) + " 层（深度上限 " + fmt.Sprint(MaxAgentDepth) + "），再深会被系统拦下\n- 调用前确认目标确实是这件事的合适人选，不要为了调而调"
+	if len(catalog) == 0 {
+		return base + "\n\n可调用智能体：无（当前没有其它智能体例为可调用）"
+	}
+	lines := make([]string, 0, len(catalog))
+	for _, a := range catalog {
+		desc := a.Description
+		if desc == "" {
+			desc = "（无描述）"
+		}
+		lines = append(lines, fmt.Sprintf("- %s（ID: %s）：%s", a.Name, a.ID, desc))
+	}
+	return base + "\n\n可调用智能体：\n" + strings.Join(lines, "\n")
+}
+
+// execAgentCall 调用一个具名智能体。目标合法性、白名单、深度、预算、防环
+// 都由 chat 层的调用图校验，这里只负责参数解析与回调触发。
+func execAgentCall(ctx context.Context, env *Env, args json.RawMessage) (string, error) {
+	var in struct {
+		AgentID     string `json:"agent_id"`
+		Prompt      string `json:"prompt"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(in.AgentID) == "" {
+		return "", fmt.Errorf("需要 agent_id 参数")
+	}
+	if strings.TrimSpace(in.Prompt) == "" {
+		return "", fmt.Errorf("需要 prompt 参数（目标智能体看不到你的会话历史，任务说明必须自包含）")
+	}
+	if len(in.Prompt) > maxSubagentPromptBytes {
+		return "", fmt.Errorf("prompt 过大（%dKB，上限 %dKB）：把任务拆小", len(in.Prompt)/1024, maxSubagentPromptBytes/1024)
+	}
+	if env.CallAgent == nil {
+		return "", fmt.Errorf("智能体互调功能当前不可用")
+	}
+
+	catalog := AgentCatalog
+	if env.AgentCatalog != nil {
+		catalog = env.AgentCatalog(env.CallerID)
+	}
+	var target *AgentRef
+	for i := range catalog {
+		if catalog[i].ID == in.AgentID {
+			target = &catalog[i]
+			break
+		}
+	}
+	if target == nil {
+		names := make([]string, 0, len(catalog))
+		for _, a := range catalog {
+			names = append(names, a.Name)
+		}
+		return "", fmt.Errorf("智能体 %q 不在可调用列表里（可调用：%s）。不要凭名字猜 ID。",
+			in.AgentID, strings.Join(names, "、"))
+	}
+
+	out, err := env.CallAgent(*target, in.Prompt, env.CallOpts)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(out) == "" {
+		return "", fmt.Errorf("智能体 %s 没有返回任何内容，请换更具体的任务说明重试", target.Name)
+	}
+	return out, nil
+}
+
 var toolSkillRead = Tool{
 	Name:        "skill_read",
 	Description: "读取一个已启用技能的完整方法论（系统提示词里只有技能清单）。当清单里有技能与当前任务相关时，先读它的正文再动手；与任务无关的技能不要读。",

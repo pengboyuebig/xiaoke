@@ -23,6 +23,7 @@ const paths: Record<string, string[]> = {
   ],
   'chevron-down': ['M6 9l6 6 6-6'],
   'chevron-up': ['M6 15l6-6 6 6'],
+  'chevron-right': ['M9 6l6 6-6 6'],
   check: ['M20 6L9 17l-5-5'],
   x: ['M18 6L6 18', 'M6 6l12 12'],
   brain: [
@@ -79,6 +80,8 @@ const paths: Record<string, string[]> = {
   clock: ['M12 8v5l3 2', 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z'],
   lock: ['M7 11V8a5 5 0 0 1 10 0v3', 'M5 11h14v10H5z'],
   'circle-dot': ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z', 'M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z'],
+  // 智能体互调：一个节点把箭头指向另一个节点
+  share: ['M18 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M6 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M18 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', 'M8.6 10.5l6.8 4', 'M8.6 13.5l6.8-4'],
 }
 
 const d = (name: string) => paths[name] || []
