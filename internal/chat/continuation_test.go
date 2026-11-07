@@ -272,3 +272,75 @@ func TestContinuationRoundsFromBudget(t *testing.T) {
 		}
 	}
 }
+
+// 假上游返回「仅推理、无正文无工具调用」：应正常收尾，而不是发 error 事件。
+// 这对应推理模型偶发只吐 reasoning_content 的场景（上游层已把它与「完全空响应」区分）。
+func TestConverseReasoningOnlyDoesNotError(t *testing.T) {
+	h, st, proj := newContinuationFixture(t, 4, 0)
+	sess, err := st.Create("", proj.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.streamFnOverride = func(ctx context.Context, llm config.LLMConfig, msgs []ChatMessage,
+		defs []tools.ToolDef, hooks Hooks, reasoning string) (string, []ToolCall, error) {
+		return "", nil, nil // 仅推理：上游层返回空内容、无错误
+	}
+
+	var events []map[string]any
+	done := false
+	err = h.converse(context.Background(), converseParams{
+		SessionID: sess.ID, Content: "分析一下", ProjectID: proj.ID,
+	}, func(evt map[string]any) {
+		events = append(events, evt)
+		if evt["type"] == "done" {
+			done = true
+		}
+	})
+	if err != nil {
+		t.Fatalf("converse 不应返回错误: %v", err)
+	}
+	if !done {
+		t.Fatalf("应正常结束（收到 done 事件），事件数=%d", len(events))
+	}
+	for _, evt := range events {
+		if evt["type"] == "error" {
+			t.Fatalf("仅推理不应发 error 事件: %v", evt)
+		}
+	}
+}
+
+// 空内容（仅推理）收尾时应发出 done 事件，且回复落库，不留半截会话。
+func TestConverseReasoningOnlyPersistsReply(t *testing.T) {
+	h, st, proj := newContinuationFixture(t, 4, 0)
+	sess, err := st.Create("", proj.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.streamFnOverride = func(ctx context.Context, llm config.LLMConfig, msgs []ChatMessage,
+		defs []tools.ToolDef, hooks Hooks, reasoning string) (string, []ToolCall, error) {
+		return "", nil, nil
+	}
+
+	var done bool
+	err = h.converse(context.Background(), converseParams{
+		SessionID: sess.ID, Content: "分析一下", ProjectID: proj.ID,
+	}, func(evt map[string]any) {
+		if evt["type"] == "done" {
+			done = true
+		}
+	})
+	if err != nil {
+		t.Fatalf("converse 出错: %v", err)
+	}
+	if !done {
+		t.Fatal("应发出 done 事件")
+	}
+	got, err := st.Get(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := got.Messages[len(got.Messages)-1]
+	if last.Role != "assistant" {
+		t.Fatalf("最后一条应是 assistant，实际 %q", last.Role)
+	}
+}

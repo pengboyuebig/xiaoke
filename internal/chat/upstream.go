@@ -132,7 +132,7 @@ var (
 
 // upstreamErr 带类别的上游错误：重试策略按 kind 决定。
 type upstreamErr struct {
-	kind       string // network | status | midstream | breaker
+	kind       string // network | status | midstream | breaker | empty
 	status     int
 	retryAfter time.Duration // 429/503 响应头给的建议等待（0 = 未知）
 	msg        string
@@ -158,14 +158,16 @@ func parseRetryAfter(v string) time.Duration {
 }
 
 // retryableUpstream 判断一次失败是否值得重试。
-// 熔断跳闸（快速失败的本意就是别再打了）、内容为空、本地参数错误都不重试。
+// 熔断跳闸（快速失败的本意就是别再打了）、本地参数错误都不重试。
+// 「空响应」要重试：推理模型偶发只回思考不回正文，或网关瞬时抖动，
+// 都属于重试一次就能恢复的故障；sent 守卫保证已输出增量时不会重复输出。
 func retryableUpstream(err error) bool {
 	var ue *upstreamErr
 	if !errors.As(err, &ue) {
 		return false
 	}
 	switch ue.kind {
-	case "network", "midstream":
+	case "network", "midstream", "empty":
 		return true
 	case "status":
 		return ue.status == http.StatusTooManyRequests || ue.status >= 500
@@ -321,6 +323,11 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 	order := []int{}
 	reqBytes := len(payload) // 请求体字节（usage 缺失时的估算基数）
 	var gotUsage bool
+	// reasoningLen 累计推理内容长度：推理模型把思考放在 delta.reasoning_content，
+	// 不展示给用户，但必须计入「这一轮到底有没有返回东西」——否则整轮只有思考时
+	// 会被误判成空响应（见下方 empty 判定）。
+	var reasoningLen int
+	var finishReason string
 	reader := bufio.NewReaderSize(resp.Body, 64*1024)
 	for {
 		line, rerr := reader.ReadString('\n')
@@ -330,7 +337,7 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 			if payload == "[DONE]" {
 				break
 			}
-			content, deltas, stop, usage := parseChunk(payload)
+			content, deltas, reasoning, stop, usage := parseChunk(payload)
 			if usage != nil {
 				gotUsage = true
 				hooks.reportUsage(usage.promptTokens, usage.completionTokens)
@@ -340,6 +347,14 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 				if hooks.OnDelta != nil {
 					hooks.OnDelta(content)
 				}
+			}
+			// 推理内容只计数、不外发：用户不需要看思考过程，但它是「上游确实回了内容」
+			// 的证据，也是判断「是不是只思考没干活」的依据。
+			if reasoning != "" {
+				reasoningLen += len(reasoning)
+			}
+			if stop != "" {
+				finishReason = stop
 			}
 			for _, d := range deltas {
 				tc, ok := acc[d.Index]
@@ -358,10 +373,6 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 				if hooks.OnToolCall != nil {
 					hooks.OnToolCall(d)
 				}
-			}
-			if stop == "tool_calls" || stop == "stop" {
-				// 仍继续读到 [DONE]，保证统计完整
-				_ = stop
 			}
 		}
 		if rerr != nil {
@@ -382,8 +393,15 @@ func streamOpenAI(ctx context.Context, cfg config.LLMConfig, messages []ChatMess
 		}
 		calls = append(calls, *tc)
 	}
+	if full.Len() == 0 && len(calls) == 0 && reasoningLen == 0 {
+		// 完全空响应（连推理都没有）：多半是网关瞬时抖动或模型抽风，值得重试一次。
+		return "", nil, &upstreamErr{kind: "empty", msg: "上游没有返回任何内容（空响应）"}
+	}
 	if full.Len() == 0 && len(calls) == 0 {
-		return "", nil, fmt.Errorf("上游没有返回任何内容")
+		// 只有推理、没有正文也没有工具调用：这不是「上游没回应」，而是模型这一轮
+		// 只思考了没干活。当作空内容返回，交给上层走「光说不做」催办/正常收尾，
+		// 不要报成上游故障（否则用户看到的是「出错了」而不是被催一次）。
+		log.Printf("上游仅返回推理内容（%d 字符，finish=%s），无正文与工具调用", reasoningLen, finishReason)
 	}
 	success = true // HTTP 200 + 流完整读完 = 上游可用（空回复是模型行为，不算基础设施故障）
 	if !gotUsage {
@@ -410,14 +428,19 @@ func estimateTokens(n int) int64 {
 	return int64(n) / 4
 }
 
-// parseChunk 从一条 SSE 数据里取文本增量、tool_calls 增量、finish_reason
+// parseChunk 从一条 SSE 数据里取文本增量、tool_calls 增量、推理增量、finish_reason
 // 与（可能存在的）usage——usage 通常出现在 choices 为空的最后一个 chunk。
-func parseChunk(payload string) (content string, deltas []ToolDelta, stop string, usage *chunkUsage) {
+//
+// 推理内容（reasoning_content / reasoning）单独返回：推理模型把思考放在这里，
+// 不并入正文、也不外发给前端，只用于判断「这一轮上游到底有没有回应」。
+func parseChunk(payload string) (content string, deltas []ToolDelta, reasoning string, stop string, usage *chunkUsage) {
 	var chunk struct {
 		Choices []struct {
 			Delta struct {
-				Content   string `json:"content"`
-				ToolCalls []struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				Reasoning        string `json:"reasoning"`
+				ToolCalls        []struct {
 					Index    int    `json:"index"`
 					ID       string `json:"id"`
 					Function struct {
@@ -434,24 +457,30 @@ func parseChunk(payload string) (content string, deltas []ToolDelta, stop string
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-		return "", nil, "", nil
+		return "", nil, "", "", nil
 	}
 	if chunk.Usage != nil && (chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0) {
 		usage = &chunkUsage{promptTokens: chunk.Usage.PromptTokens, completionTokens: chunk.Usage.CompletionTokens}
 	}
 	if len(chunk.Choices) == 0 {
-		return "", nil, "", usage
+		return "", nil, "", "", usage
 	}
 	c := chunk.Choices[0]
 	if c.FinishReason != "" {
 		stop = c.FinishReason
+	}
+	// 两种字段名都见过：DeepSeek 系用 reasoning_content，部分网关用 reasoning。
+	if c.Delta.ReasoningContent != "" {
+		reasoning = c.Delta.ReasoningContent
+	} else {
+		reasoning = c.Delta.Reasoning
 	}
 	for _, tc := range c.Delta.ToolCalls {
 		deltas = append(deltas, ToolDelta{
 			Index: tc.Index, ID: tc.ID, Name: tc.Function.Name, ArgDelta: tc.Function.Arguments,
 		})
 	}
-	return c.Delta.Content, deltas, stop, usage
+	return c.Delta.Content, deltas, reasoning, stop, usage
 }
 
 // ---------- mock 上游（免 Key 演示，可模拟一次工具调用闭环） ----------
